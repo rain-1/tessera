@@ -9,7 +9,9 @@
 //!
 //! The journal is the authoritative record; the audit log is a derived,
 //! human-oriented view written as JSON lines (flushed, not fsynced) plus a
-//! bounded in-memory ring for the admin endpoint.
+//! bounded in-memory ring for the admin endpoint. (No field is skipped when
+//! serializing: the admin protocol uses postcard, which is not
+//! self-describing.)
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -31,50 +33,37 @@ pub struct AuditEvent {
     /// Trusted tick (milliseconds since the epoch began).
     pub tick: u64,
     /// Journal sequence of the committing record, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_seq: Option<u64>,
     /// `operator`, `agent:e<epoch>.s<serial>` or `broker`.
     pub principal: String,
     /// Event kind (`consume`, `delegate`, `mint`, `effect`, ...).
     pub kind: String,
     /// Client request id (hex), if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     /// SHA-256 of the canonical request bytes (hex), if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_digest: Option<String>,
     /// Capability id.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub capability: Option<u128>,
     /// Root id.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<u128>,
     /// Parent capability id.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<u128>,
     /// Child / new capability id.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub child: Option<u128>,
     /// Reservation id.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reservation: Option<u64>,
     /// Scope summary (ids and rights only).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     /// Budget before.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_before: Option<String>,
     /// Budget after.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_after: Option<String>,
     /// Outcome: `ok` or `denied:<reason>` or `error:<reason>`.
     pub outcome: String,
     /// Adapter effect status: `reserved`, `dispatched`, `completed`,
     /// `failed`, `unknown`, `abandoned-not-dispatched`.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub effect: Option<String>,
     /// Non-sensitive detail (sizes, digests, ids).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 

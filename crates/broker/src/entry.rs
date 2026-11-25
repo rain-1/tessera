@@ -133,6 +133,9 @@ pub struct EndpointSpec {
     pub ca_der: Option<Vec<Vec<u8>>>,
 }
 
+/// A configured endpoint: `(id, spec, secret header (name, value))`.
+pub type ConfiguredEndpoint = (u64, EndpointSpec, Option<(String, Vec<u8>)>);
+
 /// One broker journal record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Entry {

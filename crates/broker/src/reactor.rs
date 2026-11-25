@@ -95,7 +95,7 @@ pub struct BrokerConfig {
     /// Adapter worker threads.
     pub dispatch_workers: usize,
     /// Endpoints from the daemon configuration `(id, spec, secret header)`.
-    pub endpoints: Vec<(u64, EndpointSpec, Option<(String, Vec<u8>)>)>,
+    pub endpoints: Vec<crate::entry::ConfiguredEndpoint>,
 }
 
 impl std::fmt::Debug for BrokerConfig {

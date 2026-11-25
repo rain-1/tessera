@@ -107,7 +107,7 @@ impl DaemonConfig {
     /// Resolve endpoints (reads secrets and CA files).
     pub fn resolved_endpoints(
         &self,
-    ) -> Result<Vec<(u64, EndpointSpec, Option<(String, Vec<u8>)>)>, String> {
+    ) -> Result<Vec<crate::entry::ConfiguredEndpoint>, String> {
         let mut out = Vec::new();
         for e in &self.endpoints {
             let mut spec = e.spec.clone();

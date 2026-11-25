@@ -360,7 +360,7 @@ fn repeated_grant_request_attaches_and_returns_the_same_capability() {
     let AdminResponse::Capability(cap) = h.approve(&b) else {
         panic!()
     };
-    let mut got = vec![a.recv().unwrap(), a.recv().unwrap()];
+    let mut got = [a.recv().unwrap(), a.recv().unwrap()];
     got.sort_by_key(|m| m.correlation_id);
     assert_eq!(got[0].correlation_id, c1);
     assert_eq!(got[1].correlation_id, c2);

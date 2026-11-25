@@ -64,13 +64,16 @@ pub struct ProfileSpec {
     pub piped_stdio: bool,
 }
 
+/// Hook run after each launch (e.g. a test taking the sandbox's stdio).
+pub type OnSpawn = Box<dyn FnMut(AgentId, &mut SandboxHandle) + Send>;
+
 /// Spawner backed by `tessera-launcher`.
 pub struct LauncherSpawner {
     launcher: Launcher,
     profiles: HashMap<String, ProfileSpec>,
     running: HashMap<AgentId, SandboxHandle>,
     /// Handles whose stdio a test wants (only with `piped_stdio`).
-    pub on_spawn: Option<Box<dyn FnMut(AgentId, &mut SandboxHandle) + Send>>,
+    pub on_spawn: Option<OnSpawn>,
 }
 
 impl LauncherSpawner {
