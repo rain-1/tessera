@@ -1682,3 +1682,201 @@ fn swarm_example_12_2() {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0031: compaction at the epoch boundary (security review finding 3)
+// ---------------------------------------------------------------------------
+
+/// An attacker that fills the record capacity in one epoch cannot deny
+/// service in the next: `CompactEpoch` prunes the dead epoch, frees every
+/// bounded table, keeps the spent nonces and accounts for the pruned pools.
+#[test]
+fn compaction_frees_capacity_filled_by_a_previous_epoch() {
+    let limits = Limits {
+        max_capabilities: 6,
+        max_principals: 3,
+        max_roots: 2,
+        max_reservations: 2,
+        max_lineage_length: 8,
+    };
+    let mut h = H::new(limits);
+    let attacker = h.principal();
+    let wide = terms(
+        get_scope(1),
+        Budget::Finite(20),
+        Depth::Unlimited,
+        Expiry::Never,
+    );
+    let root = h.mint(attacker, wide);
+    let second = h.approval(attacker, wide);
+    assert!(matches!(
+        h.admin(AdminCommand::Mint { approval: second }),
+        Ok(Effect::RootCreated { .. })
+    ));
+    let piece = terms(
+        get_scope(1),
+        Budget::Finite(1),
+        Depth::Unlimited,
+        Expiry::Never,
+    );
+    while h.split(attacker, root, piece).is_ok() {}
+    h.consume_ok(attacker, root, get(1));
+    h.consume_ok(attacker, root, get(1));
+    let _ = h.principal();
+    let _ = h.principal();
+    assert_eq!(
+        h.split(attacker, root, piece),
+        Err(Denial::CapacityExceeded(Resource::Capabilities))
+    );
+    assert_eq!(
+        h.admin(AdminCommand::CreatePrincipal),
+        Err(Denial::CapacityExceeded(Resource::Principals))
+    );
+
+    // Restart: the epoch bump alone frees nothing.
+    h.now = 0;
+    h.admin(AdminCommand::BumpEpoch).unwrap();
+    assert_eq!(
+        h.admin(AdminCommand::CreatePrincipal),
+        Err(Denial::CapacityExceeded(Resource::Principals))
+    );
+    let (initial_before, consumed_before) =
+        h.s.accounts()
+            .unwrap()
+            .iter()
+            .fold((0u128, 0u128), |(i, c), a| {
+                (i + a.initial as u128, c + a.consumed as u128)
+            });
+    let Ok(Effect::EpochCompacted {
+        principals,
+        capabilities,
+        roots,
+        pools,
+        reservations,
+        initial,
+        consumed,
+        discarded,
+    }) = h.admin(AdminCommand::CompactEpoch)
+    else {
+        panic!("compaction failed")
+    };
+    assert_eq!(
+        (principals, capabilities, roots, pools, reservations),
+        (3, 6, 2, 2, 2)
+    );
+    assert_eq!((initial, consumed), (initial_before, consumed_before));
+    assert_eq!(initial, consumed + discarded);
+    assert_eq!(h.s.retired().initial, initial);
+    assert_eq!(h.s.capabilities().count(), 0);
+    assert_eq!(h.s.reservations().count(), 0);
+    assert_eq!(h.s.capability(root), None);
+
+    // A fresh principal is served again.
+    let victim = h.principal();
+    let cap = h.mint(victim, one_read(1));
+    h.consume_ok(victim, cap, read(1));
+    // Ids are never reused, and every earlier nonce stays spent.
+    assert!(cap > root);
+    assert!(h.s.is_nonce_spent(&Nonce::from_bytes([1; 32])));
+    assert!(h.s.is_nonce_spent(&Nonce::from_bytes([2; 32])));
+    let stale = VerifiedApproval::new(
+        Nonce::from_bytes([1; 32]),
+        GrantRequest {
+            epoch: h.s.epoch(),
+            recipient: victim,
+            terms: one_read(1),
+            request_expires: Tick::from_raw(h.now + 10),
+        },
+    );
+    assert_eq!(
+        h.admin(AdminCommand::Mint { approval: stale }),
+        Err(Denial::NonceReused)
+    );
+    // A pruned capability id is simply unknown now.
+    assert_eq!(
+        h.consume(victim, root, get(1)),
+        Err(Denial::UnknownCapability)
+    );
+}
+
+/// Compaction only removes earlier epochs and is idempotent; current
+/// records, their liveness and their request-id bindings are untouched.
+#[test]
+fn compaction_keeps_the_current_epoch() {
+    let mut h = H::default();
+    let old = h.principal();
+    let _ = h.mint(old, one_read(1));
+    h.now = 0;
+    h.admin(AdminCommand::BumpEpoch).unwrap();
+    let a = h.principal();
+    let b = h.principal();
+    let cap = h.mint(
+        a,
+        terms(
+            file(1, FileRights::READ),
+            Budget::Finite(4),
+            Depth::Finite(1),
+            Expiry::Never,
+        ),
+    );
+    let child = h.delegate(a, cap, b, one_read(1)).unwrap();
+    let rid = h.consume(a, cap, read(1)).unwrap();
+    let before_caps: Vec<CapabilityId> = h.s.capabilities().map(|c| c.id()).collect();
+    assert!(matches!(
+        h.admin(AdminCommand::CompactEpoch),
+        Ok(Effect::EpochCompacted {
+            capabilities: 1,
+            roots: 1,
+            principals: 1,
+            ..
+        })
+    ));
+    let after_caps: Vec<CapabilityId> = h.s.capabilities().map(|c| c.id()).collect();
+    assert_eq!(after_caps, before_caps[1..].to_vec());
+    assert!(h.s.is_live(child, h.t()));
+    let Effect::Reserved(r) = rid else { panic!() };
+    // The same request id is still recognised as a duplicate.
+    assert!(matches!(
+        h.agent_cmd(
+            a,
+            AgentCommand::Consume {
+                request_id: r.request_id(),
+                capability: cap,
+                operation: read(1)
+            }
+        ),
+        Ok(Effect::AlreadyReserved { .. })
+    ));
+    // Nothing left to prune: a second compaction changes no record.
+    assert!(matches!(
+        h.admin(AdminCommand::CompactEpoch),
+        Ok(Effect::EpochCompacted {
+            capabilities: 0,
+            roots: 0,
+            principals: 0,
+            pools: 0,
+            reservations: 0,
+            ..
+        })
+    ));
+}
+
+/// A compacted ledger round-trips through a snapshot, and a snapshot whose
+/// retired totals or pruned-root floor were tampered with is rejected.
+#[test]
+fn compacted_snapshot_is_checked() {
+    let mut h = H::default();
+    let a = h.principal();
+    let _ = h.mint(a, one_read(1));
+    h.now = 0;
+    h.admin(AdminCommand::BumpEpoch).unwrap();
+    h.admin(AdminCommand::CompactEpoch).unwrap();
+    let good = serde_json::to_string(&h.s).unwrap();
+    let back: State = serde_json::from_str(&good).unwrap();
+    assert_eq!(back, h.s);
+    // The nonce now names a pruned root: lowering the floor exposes it.
+    assert!(serde_json::from_str::<State>(&patch_json(&h.s, "retired_roots_below", "0")).is_err());
+    let inflated = good.replace("\"initial\":1,", "\"initial\":2,");
+    assert_ne!(inflated, good);
+    assert!(serde_json::from_str::<State>(&inflated).is_err());
+}
