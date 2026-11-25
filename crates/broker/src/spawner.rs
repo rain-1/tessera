@@ -56,15 +56,68 @@ pub struct ProfileSpec {
     /// Extra environment.
     #[serde(default)]
     pub env: Vec<(String, String)>,
-    /// cgroup memory limit. Omitted or null uses the launcher default.
+    /// cgroup memory limit in bytes, or `"unlimited"`. Omitted or null uses
+    /// the launcher default.
     #[serde(default)]
-    pub memory_max_bytes: Option<u64>,
-    /// cgroup pids limit. Omitted or null uses the launcher default.
+    pub memory_max_bytes: Option<CgroupLimit>,
+    /// cgroup pids limit, or `"unlimited"`. Omitted or null uses the
+    /// launcher default.
     #[serde(default)]
-    pub pids_max: Option<u64>,
+    pub pids_max: Option<CgroupLimit>,
     /// Pipe stdio to the spawner (tests) instead of inheriting `/dev/null`.
     #[serde(default)]
     pub piped_stdio: bool,
+}
+
+/// A cgroup limit in a launch profile (security review finding 2): a
+/// number, or the explicit string `"unlimited"`. An omitted limit is never
+/// unlimited; it keeps the launcher default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgroupLimit {
+    /// This many bytes or processes.
+    Max(u64),
+    /// No limit (the operator said so explicitly).
+    Unlimited,
+}
+
+const UNLIMITED: &str = "unlimited";
+
+impl serde::Serialize for CgroupLimit {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CgroupLimit::Max(n) => s.serialize_u64(*n),
+            CgroupLimit::Unlimited => s.serialize_str(UNLIMITED),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CgroupLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Number(u64),
+            Word(String),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Number(n) => Ok(CgroupLimit::Max(n)),
+            Repr::Word(w) if w == UNLIMITED => Ok(CgroupLimit::Unlimited),
+            Repr::Word(w) => Err(serde::de::Error::custom(format!(
+                "expected a number or \"{UNLIMITED}\", got {w:?}"
+            ))),
+        }
+    }
+}
+
+impl CgroupLimit {
+    /// The launcher setting: `None` means no limit.
+    fn resolve(limit: Option<CgroupLimit>, default: Option<u64>) -> Option<u64> {
+        match limit {
+            None => default,
+            Some(CgroupLimit::Max(n)) => Some(n),
+            Some(CgroupLimit::Unlimited) => None,
+        }
+    }
 }
 
 /// One operator baseline grant installed for a principal at creation
@@ -200,8 +253,11 @@ impl ProfileSpec {
     fn limits(&self) -> ResourceLimits {
         let defaults = ResourceLimits::default();
         ResourceLimits {
-            memory_max_bytes: self.memory_max_bytes.or(defaults.memory_max_bytes),
-            pids_max: self.pids_max.or(defaults.pids_max),
+            memory_max_bytes: CgroupLimit::resolve(
+                self.memory_max_bytes,
+                defaults.memory_max_bytes,
+            ),
+            pids_max: CgroupLimit::resolve(self.pids_max, defaults.pids_max),
             ..defaults
         }
     }
@@ -338,12 +394,48 @@ mod tests {
     fn omitted_limits_inherit_launcher_defaults() {
         let mut p = profile();
         assert_eq!(p.limits(), ResourceLimits::default());
-        p.pids_max = Some(64);
+        p.pids_max = Some(CgroupLimit::Max(64));
         assert_eq!(p.limits().pids_max, Some(64));
         assert_eq!(
             p.limits().memory_max_bytes,
             ResourceLimits::default().memory_max_bytes
         );
+    }
+
+    /// Security review finding 2 (proof of concept `limits`): a profile
+    /// without limits keeps the launcher's memory and pid limits; only the
+    /// explicit word "unlimited" removes one.
+    #[test]
+    fn only_an_explicit_unlimited_removes_a_limit() {
+        let defaults = ResourceLimits::default();
+        assert!(defaults.memory_max_bytes.is_some() && defaults.pids_max.is_some());
+        for json in [
+            r#"{"program":"/bin/sleep","args":["5"]}"#,
+            r#"{"program":"/bin/sleep","memory_max_bytes":null,"pids_max":null}"#,
+        ] {
+            let p: ProfileSpec = serde_json::from_str(json).unwrap();
+            assert_eq!(p.limits(), defaults, "{json}");
+        }
+        let p: ProfileSpec = serde_json::from_str(
+            r#"{"program":"/bin/sleep","memory_max_bytes":"unlimited","pids_max":100}"#,
+        )
+        .unwrap();
+        assert_eq!(p.limits().memory_max_bytes, None);
+        assert_eq!(p.limits().pids_max, Some(100));
+        assert_eq!(p.limits().swap_max_bytes, defaults.swap_max_bytes);
+        for bad in ["\"none\"", "\"\"", "-1", "1.5", "\"Unlimited\"", "true"] {
+            let json = format!(r#"{{"program":"/bin/sleep","pids_max":{bad}}}"#);
+            assert!(
+                serde_json::from_str::<ProfileSpec>(&json).is_err(),
+                "{json}"
+            );
+        }
+        let round = serde_json::to_string(&p).unwrap();
+        assert!(
+            round.contains(r#""memory_max_bytes":"unlimited""#),
+            "{round}"
+        );
+        assert!(round.contains(r#""pids_max":100"#), "{round}");
     }
 
     #[test]

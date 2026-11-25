@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use common::*;
 use tessera_broker::{
     AdapterExecutor, AdminRequest, AdminResponse, AgentSpawnProfile, AuditLog, Broker,
-    BrokerConfig, LauncherSpawner, MonotonicClock, ProfileSpec, Services,
+    BrokerConfig, CgroupLimit, LauncherSpawner, MonotonicClock, ProfileSpec, Services,
 };
 use tessera_capability_core::AgentId;
 use tessera_journal::{Journal, JournalOptions};
@@ -203,8 +203,8 @@ fn two_real_sandboxes_read_delegate_revoke_via_tessera_cli() {
         workspace: Some(workspaces.path().to_path_buf()),
         ro_binds: vec![(bin.join("tessera"), "/opt/tessera/tessera".into())],
         env: vec![],
-        memory_max_bytes: Some(256 << 20),
-        pids_max: Some(64),
+        memory_max_bytes: Some(CgroupLimit::Max(256 << 20)),
+        pids_max: Some(CgroupLimit::Max(64)),
         piped_stdio: true,
     };
     let mut spawner = match LauncherSpawner::new(lc, HashMap::from([("agent".into(), profile)])) {
@@ -387,10 +387,10 @@ fn two_real_sandboxes_read_delegate_revoke_via_tessera_cli() {
     assert_eq!((code, j["error"]["code"].as_str()), (1, Some("Revoked")));
 
     // ---- Isolation: admin socket and the other sandbox's channel --------
-    assert_eq!(a.sh("printf first > /workspace/marker").0, 0);
+    assert_eq!(a.sh("echo first > /workspace/marker").0, 0);
     assert_eq!(bb.sh("test ! -e /workspace/marker").0, 0);
     assert_eq!(c.sh("test ! -e /workspace/marker").0, 0);
-    assert_eq!(bb.sh("printf second > /workspace/marker").0, 0);
+    assert_eq!(bb.sh("echo second > /workspace/marker").0, 0);
     assert_eq!(a.sh("cat /workspace/marker").1.trim(), "first");
     assert_eq!(bb.sh("cat /workspace/marker").1.trim(), "second");
     let sock = admin_sock.display().to_string();

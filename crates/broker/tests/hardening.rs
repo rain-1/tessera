@@ -177,27 +177,37 @@ fn revoke_vs_consume_race_matches_a_serial_order() {
         // (1) No consume was authorized after the revoke's commit.
         assert!(t.consumes.values().all(|s| *s < r), "consume after revoke");
         // (2) Nothing was handed to an adapter after the revoke's commit.
+        // A reservation journaled before the revoke but still waiting for a
+        // dispatch slot (per-principal dispatch cap) is resolved as failed,
+        // never dispatched.
         assert!(t.dispatched.iter().all(|s| *s < r), "dispatch after revoke");
-        assert_eq!(t.dispatched.len(), t.consumes.len());
-        // (3) The adapter ran exactly the journaled reservations.
-        assert_eq!(calls, t.consumes.len());
+        assert!(t.dispatched.len() <= t.consumes.len());
+        // (3) The adapter ran exactly the dispatched reservations.
+        assert_eq!(calls, t.dispatched.len());
         // (4) Every answer matches that serial order: request ids are
         // decided in send order, so the outcomes are a run of successes
-        // (each journaled before the revoke) followed only by `Revoked`
-        // (none journaled).
+        // (each journaled and dispatched before the revoke) followed only
+        // by `Revoked` (not journaled, or journaled and never dispatched).
         let mut seen_revoked = false;
+        let mut successes = 0;
+        let mut revoked_reserved = 0;
         for (rid, resp) in &results {
             match resp {
                 Response::Consumed { .. } => {
                     assert!(!seen_revoked, "success after a revoked answer (rid {rid})");
                     assert!(t.consumes.contains_key(rid), "success not journaled");
+                    successes += 1;
                 }
                 _ => {
                     seen_revoked = true;
-                    assert!(!t.consumes.contains_key(rid), "denied but journaled");
+                    if t.consumes.contains_key(rid) {
+                        revoked_reserved += 1;
+                    }
                 }
             }
         }
+        assert_eq!(successes, t.dispatched.len());
+        assert_eq!(t.consumes.len(), successes + revoked_reserved);
         assert!(seen_revoked);
         assert!(!t.consumes.is_empty());
     }

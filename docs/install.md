@@ -187,7 +187,9 @@ be outside workspace trees. Sandbox mounts cannot overlap `state_dir`,
 `file_root` or `admin_socket`.
 
 Omitting `memory_max_bytes` or `pids_max`, or setting either to `null`, uses
-the launcher default of 2 GiB or 512 processes, respectively.
+the launcher default of 2 GiB or 512 processes, respectively. Only the
+explicit string `"unlimited"` removes a limit; any other non-numeric value is
+a configuration error.
 
 The optional `limits.ledger_quotas` object sets how many records agent
 commands can allocate in an epoch. Each key is optional.
