@@ -1,6 +1,8 @@
 # ADR-0004: Peer authentication: a dedicated socketpair per sandbox and a SO_PEERCRED check
 
-- Status: Accepted (design). Not implemented. The kernel behaviour must be
+- Status: Accepted; implemented with amendments in ADR-0022 (the
+  `SO_PEERCRED` cross-check is not meaningful on launcher-created pairs).
+  The kernel behaviour must be
   confirmed on the pinned kernel (kernel feature report).
 - Spec: §9.1, §9.2, R7, T3. Resolves the open question "peer authentication
   and channel transfer model".
