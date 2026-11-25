@@ -46,13 +46,48 @@ fn duration(ctx: &RenderContext, from: Tick, to: Tick) -> String {
     }
 }
 
-/// Escapes everything that could alter terminal state or mislead visually.
+/// Escapes everything that could alter terminal state or mislead visually,
+/// collapses runs of spaces to one, and truncates.
 pub fn escape_untrusted(s: &str) -> String {
     untrusted_tokens(s).collect()
 }
 
+/// Characters that are invisible, zero-width, reorder or join text, or
+/// otherwise render differently from what they are (security review
+/// finding 5). Listed explicitly so that coverage does not depend on the
+/// standard library's notion of "printable"; that is applied as well.
+fn must_escape(c: char) -> bool {
+    if c.is_control() || (c.is_whitespace() && c != ' ') {
+        // Cc, and every space other than U+0020 (Zs, Zl U+2028, Zp U+2029,
+        // tab and newline): no padding, no line or paragraph breaks.
+        return true;
+    }
+    let explicit = matches!(u32::from(c),
+        // Unicode general category Cf (format), Unicode 16.
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891
+        | 0x08E2 | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+        | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD
+        | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001
+        | 0xE0020..=0xE007F
+        // Hangul fillers and other blank-looking letters.
+        | 0x115F | 0x1160 | 0x3164 | 0xFFA0 | 0x2800 | 0x17B4 | 0x17B5
+        // Combining grapheme joiner, variation selectors (incl. Mongolian
+        // free variation selectors), the rest of the tag/supplement plane.
+        | 0x034F | 0x180B..=0x180F | 0xFE00..=0xFE0F | 0xE0000..=0xE0FFF
+        // Interlinear annotation and object replacement characters.
+        | 0xFFF0..=0xFFF8 | 0xFFFC);
+    explicit || (!matches!(c, '\'' | '"') && c.escape_debug().next() == Some('\\'))
+}
+
 fn untrusted_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
+    let mut prev_space = true; // also drops leading spaces
     s.chars()
+        .filter(move |c| {
+            let space = *c == ' ';
+            let keep = !(space && prev_space);
+            prev_space = space;
+            keep
+        })
         .take(MAX_UNTRUSTED_CHARS + 1)
         .enumerate()
         .map(|(i, c)| {
@@ -61,16 +96,15 @@ fn untrusted_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
             }
             match c {
                 '\\' => "\\\\".into(),
-                // Rust's debug escaping covers Unicode format and separator
-                // characters, including bidi marks and supplementary-plane tags.
-                c if !matches!(c, '\'' | '"') && c.escape_debug().next() == Some('\\') => {
-                    format!("\\u{{{:04x}}}", u32::from(c))
-                }
+                c if must_escape(c) => format!("\\u{{{:04x}}}", u32::from(c)),
                 c => c.to_string(),
             }
         })
 }
 
+/// Every line of the untrusted block starts with `  | ` and is at most
+/// [`DESCRIPTION_LINE_WIDTH`] cells wide, so no agent text can start a
+/// screen line or pad itself onto one.
 fn write_description(out: &mut String, description: &str) {
     let mut width = 0;
     out.push_str("  | ");
@@ -83,6 +117,9 @@ fn write_description(out: &mut String, description: &str) {
         if width + columns > DESCRIPTION_LINE_WIDTH {
             out.push_str("\n  | ");
             width = 0;
+            if token == " " {
+                continue;
+            }
         }
         out.push_str(&token);
         width += columns;
