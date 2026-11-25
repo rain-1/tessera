@@ -30,6 +30,13 @@ CASES = [
     ("io_uring_setup", 425, (1, 0), EPERM, True),
     ("io_uring_enter", 426, (-1, 0, 0, 0, 0, 0), EPERM, True),
     ("io_uring_register", 427, (-1, 0, 0, 0), EPERM, True),
+    # Linux AIO (unfiltered: EFAULT / EINVAL).
+    ("io_setup", 206, (1, 0), EPERM, True),
+    ("io_destroy", 207, (0,), EPERM, True),
+    ("io_getevents", 208, (0, 0, 0, 0, 0), EPERM, True),
+    ("io_submit", 209, (0, 0, 0), EPERM, True),
+    ("io_cancel", 210, (0, 0, 0), EPERM, True),
+    ("io_pgetevents", 333, (0, 0, 0, 0, 0, 0), EPERM, True),
     ("bpf", 321, (0, 0, 0), EPERM, False),
     ("perf_event_open", 298, (0, 0, -1, -1, 0), EPERM, True),
     ("keyctl(GET_KEYRING_ID)", 250, (0, -3, 0), EPERM, True),

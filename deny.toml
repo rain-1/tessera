@@ -18,16 +18,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
-ignore = [
-    # crypto-bigint 0.5.5 (via p256 0.13 -> elliptic-curve 0.13): secret-
-    # dependent branches in "constant-time" arithmetic. No 0.5.x fix; the
-    # fixed line (0.7.6+) requires the p256/elliptic-curve 0.14 series.
-    # Exposure: production brokers only *verify* ES256 signatures (public
-    # inputs). Secret-key operations happen only in the development software
-    # authenticator (softkey.rs, FileAuthenticator), which must not be used
-    # in production. Remove this entry when p256 is upgraded.
-    { id = "RUSTSEC-2026-0387", reason = "verify-only use in production; tracked for p256 0.14 upgrade" },
-]
+ignore = []
 
 [licenses]
 # Permissive licenses compatible with Apache-2.0 distribution.
@@ -53,12 +44,10 @@ ignore = true
 
 [bans]
 multiple-versions = "warn"
-# Workspace crates use `path = ...` dependencies without versions. cargo-deny
-# treats those as wildcards unless the crate is `publish = false`; the crate
-# manifests do not set that yet (owned by the crate work packages), so this
-# is a warning, not an error. Registry wildcards are still visible here.
-# TODO: set `publish = false` in every workspace crate and change to "deny".
-wildcards = "warn"
+# Workspace crates use `path = ...` dependencies without versions; every
+# workspace crate is `publish = false`, so with allow-wildcard-paths those
+# are accepted and any registry wildcard is an error.
+wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 # Crates we never want in the trusted computing base.

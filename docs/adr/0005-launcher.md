@@ -25,7 +25,8 @@ built.
   `/run`, no sockets.
 - seccomp: the launcher generates a BPF filter (allow-list, default
   `EPERM`/`KILL_PROCESS`) and passes it with `--seccomp FD`. The filter
-  checks the architecture first. It denies io_uring, ptrace, process_vm_*,
+  checks the architecture first. It denies io_uring, Linux AIO
+  (io_setup/io_submit/io_getevents/io_pgetevents/io_cancel/io_destroy), ptrace, process_vm_*,
   bpf, perf_event_open, userfaultfd, keyctl/add_key, mount/umount/pivot_root,
   unshare/setns/clone with namespace flags, kexec, init/finit_module,
   open_by_handle_at, name_to_handle_at, and the 32-bit/x32 syscall ABIs.

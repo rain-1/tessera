@@ -33,6 +33,18 @@ pub fn denied_syscalls() -> Vec<(&'static str, i64)> {
         ("io_uring_setup", libc::SYS_io_uring_setup),
         ("io_uring_enter", libc::SYS_io_uring_enter),
         ("io_uring_register", libc::SYS_io_uring_register),
+        // Linux AIO: another unaudited asynchronous I/O interface (found by
+        // the BPF review); nothing in the sandbox needs it.
+        ("io_setup", libc::SYS_io_setup),
+        ("io_destroy", libc::SYS_io_destroy),
+        ("io_submit", libc::SYS_io_submit),
+        ("io_cancel", libc::SYS_io_cancel),
+        ("io_getevents", libc::SYS_io_getevents),
+        // Not exported by the `libc` crate: x86_64 333, aarch64 292.
+        #[cfg(target_arch = "x86_64")]
+        ("io_pgetevents", 333),
+        #[cfg(target_arch = "aarch64")]
+        ("io_pgetevents", 292),
         ("ptrace", libc::SYS_ptrace),
         ("bpf", libc::SYS_bpf),
         ("perf_event_open", libc::SYS_perf_event_open),
@@ -269,6 +281,12 @@ mod tests {
             "io_uring_setup",
             "io_uring_enter",
             "io_uring_register",
+            "io_setup",
+            "io_destroy",
+            "io_submit",
+            "io_cancel",
+            "io_getevents",
+            "io_pgetevents",
             "ptrace",
             "bpf",
             "perf_event_open",

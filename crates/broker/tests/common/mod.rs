@@ -11,7 +11,7 @@ use tessera_approval as ap;
 use tessera_approval::Authenticator;
 use tessera_broker::{
     AdapterExecutor, AdminRequest, AdminResponse, AuditLog, Broker, BrokerConfig, DispatchJob,
-    EndpointSpec, ExecResult, Executor, FaultHook, MonotonicClock, Services,
+    EndpointSpec, ExecResult, Executor, FaultHook, MonotonicClock, SandboxSpawner, Services,
     entry::FileIdentityRec,
 };
 use tessera_capability_core::{AgentId, EndpointId, ObjectId};
@@ -97,6 +97,17 @@ impl Harness {
     }
 
     pub fn start_on(&self, storage: MemStorage, fault: Option<FaultHook>) -> Broker {
+        self.start_full(storage, fault, None, AuditLog::memory())
+    }
+
+    /// Start with a sandbox spawner and an audit sink of the test's choice.
+    pub fn start_full(
+        &self,
+        storage: MemStorage,
+        fault: Option<FaultHook>,
+        spawner: Option<Box<dyn SandboxSpawner>>,
+        audit: AuditLog,
+    ) -> Broker {
         let journal = Journal::open_storage(storage, JournalOptions::default()).unwrap();
         let exec = Counting {
             inner: AdapterExecutor::new(Some(self.root.path())).unwrap(),
@@ -107,8 +118,8 @@ impl Harness {
             self.config.clone(),
             Services {
                 executor: Arc::new(exec),
-                spawner: None,
-                audit: AuditLog::memory(),
+                spawner,
+                audit,
                 clock: Arc::new(MonotonicClock::default()),
                 fault,
             },
@@ -227,6 +238,11 @@ pub fn limits() -> FrameLimits {
 impl Agent {
     pub fn attach(b: &Broker) -> Agent {
         let (id, fd) = b.attach_principal().unwrap();
+        Agent::from_fd(id, fd)
+    }
+
+    /// Wrap the client end of a channel bound to `id`.
+    pub fn from_fd(id: AgentId, fd: OwnedFd) -> Agent {
         rustix::net::sockopt::set_socket_timeout(
             &fd,
             rustix::net::sockopt::Timeout::Recv,
@@ -254,7 +270,18 @@ impl Agent {
         c
     }
 
+    /// Next final message (interim `GrantPending` notices are skipped).
     pub fn recv(&self) -> Option<ServerMessage> {
+        loop {
+            let m = self.recv_any()?;
+            if !matches!(m.response, Response::GrantPending { .. }) {
+                return Some(m);
+            }
+        }
+    }
+
+    /// Next message of any kind.
+    pub fn recv_any(&self) -> Option<ServerMessage> {
         let p = recv_packet(self.fd.as_fd(), limits()).ok()??;
         Some(decode_server(&p, limits().max_frame()).unwrap())
     }
@@ -301,6 +328,7 @@ impl Agent {
             budget: WireBudget::Finite(budget),
             depth: WireDepth::Finite(depth),
             expiry: WireExpiry::Inherit,
+            untrusted_description: None,
         })
     }
 }

@@ -120,17 +120,24 @@ fn operation() -> impl Strategy<Value = WireOperation> {
 fn request() -> impl Strategy<Value = Request> {
     let id = any::<u128>();
     prop_oneof![
-        (id, scope(), budget(), depth(), expiry()).prop_map(
-            |(request_id, requested_scope, budget, depth, expiry)| {
+        (
+            id,
+            scope(),
+            budget(),
+            depth(),
+            expiry(),
+            proptest::option::of("\\PC{0,60}")
+        )
+            .prop_map(|(request_id, requested_scope, budget, depth, expiry, d)| {
                 Request::RequestGrant {
                     request_id,
                     requested_scope,
                     budget,
                     depth,
                     expiry,
+                    untrusted_description: d.map(|d| BoundedString::new(d).unwrap()),
                 }
-            }
-        ),
+            }),
         (id, any::<u128>(), operation()).prop_map(|(request_id, cap_id, operation)| {
             Request::Consume {
                 request_id,
@@ -192,6 +199,7 @@ fn request() -> impl Strategy<Value = Request> {
             launch_profile
         }),
         (id, any::<u128>()).prop_map(|(request_id, cap_id)| Request::Revoke { request_id, cap_id }),
+        proptest::option::of(any::<u128>()).prop_map(|after| Request::ListCapabilities { after }),
     ]
 }
 
@@ -250,28 +258,19 @@ fn response() -> impl Strategy<Value = Response> {
             }
         ),
     ];
-    let view = (
-        any::<u128>(),
-        any::<u128>(),
-        proptest::option::of(any::<u128>()),
-        agent(),
-        scope(),
-        budget(),
-        depth(),
-        proptest::option::of(any::<u64>()),
-    )
-        .prop_map(
-            |(
-                cap_id,
-                root_id,
-                parent,
-                owner,
-                scope,
-                budget_remaining,
-                depth,
-                expires_in_millis,
-            )| {
-                WireCapabilityView {
+    let view = || {
+        (
+            any::<u128>(),
+            any::<u128>(),
+            proptest::option::of(any::<u128>()),
+            agent(),
+            scope(),
+            budget(),
+            depth(),
+            proptest::option::of(any::<u64>()),
+        )
+            .prop_map(
+                |(
                     cap_id,
                     root_id,
                     parent,
@@ -280,10 +279,21 @@ fn response() -> impl Strategy<Value = Response> {
                     budget_remaining,
                     depth,
                     expires_in_millis,
-                    status: WireCapStatus::Live,
-                }
-            },
-        );
+                )| {
+                    WireCapabilityView {
+                        cap_id,
+                        root_id,
+                        parent,
+                        owner,
+                        scope,
+                        budget_remaining,
+                        depth,
+                        expires_in_millis,
+                        status: WireCapStatus::Live,
+                    }
+                },
+            )
+    };
     prop_oneof![
         (id, any::<u128>())
             .prop_map(|(request_id, cap_id)| Response::GrantIssued { request_id, cap_id }),
@@ -310,7 +320,17 @@ fn response() -> impl Strategy<Value = Response> {
         (id, any::<u128>())
             .prop_map(|(request_id, cap_id)| Response::Transferred { request_id, cap_id }),
         id.prop_map(|request_id| Response::Dropped { request_id }),
-        view.prop_map(Response::Inspected),
+        view().prop_map(Response::Inspected),
+        (id, any::<u64>()).prop_map(|(request_id, expires_in_millis)| Response::GrantPending {
+            request_id,
+            expires_in_millis
+        }),
+        (proptest::collection::vec(view(), 0..5), any::<bool>()).prop_map(|(caps, more)| {
+            Response::Capabilities {
+                caps: BoundedVec::new(caps).unwrap(),
+                more,
+            }
+        }),
         (id, agent()).prop_map(|(request_id, agent)| Response::Spawned { request_id, agent }),
         id.prop_map(|request_id| Response::Revoked { request_id }),
         (
@@ -413,7 +433,7 @@ fn unknown_version_rejected_before_body() {
         request: Request::Inspect { cap_id: 9 },
     };
     let mut p = encode_client(&msg).unwrap();
-    for v in [0u16, 2, 0xffff] {
+    for v in [0u16, 1, 3, 0xffff] {
         p[..2].copy_from_slice(&v.to_be_bytes());
         assert_eq!(
             decode_client(&p, MAX),
@@ -422,8 +442,8 @@ fn unknown_version_rejected_before_body() {
     }
     // Body need not even be parseable.
     assert_eq!(
-        decode_client(&[0, 2, 0xff, 0xff], MAX),
-        Err(DecodeError::UnsupportedVersion(2))
+        decode_client(&[0, 1, 0xff, 0xff], MAX),
+        Err(DecodeError::UnsupportedVersion(1))
     );
     assert_eq!(decode_client(&[0], MAX), Err(DecodeError::Truncated));
     assert_eq!(decode_client(&[], MAX), Err(DecodeError::Truncated));
@@ -437,7 +457,7 @@ fn trailing_bytes_and_overlong_varints_rejected() {
     };
     let p = encode_client(&msg).unwrap();
     // version, corr=0, variant Inspect=6, cap_id=0
-    assert_eq!(p, vec![0, 1, 0x00, 0x06, 0x00]);
+    assert_eq!(p, vec![0, 2, 0x00, 0x06, 0x00]);
     let mut trailing = p.clone();
     trailing.push(0);
     assert_eq!(
@@ -445,7 +465,7 @@ fn trailing_bytes_and_overlong_varints_rejected() {
         Err(DecodeError::NonCanonical)
     );
     // Overlong encoding of correlation_id 0.
-    let overlong = vec![0, 1, 0x80, 0x00, 0x06, 0x00];
+    let overlong = vec![0, 2, 0x80, 0x00, 0x06, 0x00];
     assert!(decode_client(&overlong, MAX).is_err());
 }
 
@@ -453,19 +473,19 @@ fn trailing_bytes_and_overlong_varints_rejected() {
 fn invalid_bool_and_enum_tag_rejected() {
     // RequestGrant(0), request_id 0, scope File(0), object 0, rights read=2(!), ...
     let bad_bool = vec![
-        0, 1, 0, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x01, 0x00,
+        0, 2, 0, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x01, 0x00,
     ];
     assert_eq!(decode_client(&bad_bool, MAX), Err(DecodeError::Malformed));
-    // Unknown Request variant 9.
+    // Unknown Request variant 10 (9 is ListCapabilities).
     assert_eq!(
-        decode_client(&[0, 1, 0, 0x09, 0x00], MAX),
+        decode_client(&[0, 2, 0, 0x0a, 0x00], MAX),
         Err(DecodeError::Malformed)
     );
 }
 
 /// Hand-assemble a Consume/Https request with `n_headers` headers.
 fn https_with_headers(count_varint: &[u8], n_headers: usize) -> Vec<u8> {
-    let mut p = vec![0, 1]; // version
+    let mut p = vec![0, 2]; // version
     p.push(0x00); // correlation_id
     p.push(0x01); // Request::Consume
     p.push(0x00); // request_id
@@ -507,7 +527,7 @@ fn header_count_limit_enforced() {
 fn field_length_limit_enforced() {
     let long = "x".repeat(wire::MAX_HTTP_PATH + 1);
     // Build a message the encoder would refuse to construct, via bytes.
-    let mut p = vec![0, 1, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00];
+    let mut p = vec![0, 2, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00];
     let mut n = long.len();
     while n >= 0x80 {
         p.push((n as u8) | 0x80);
@@ -520,7 +540,7 @@ fn field_length_limit_enforced() {
     assert!(BoundedString::<{ wire::MAX_HTTP_PATH }>::new(long).is_err());
     // Declared byte length larger than input.
     let p = vec![
-        0, 1, 0x00, 0x01, 0x00, 0x00, 0x01, 0xff, 0xff, 0x03, 1, 2, 3,
+        0, 2, 0x00, 0x01, 0x00, 0x00, 0x01, 0xff, 0xff, 0x03, 1, 2, 3,
     ];
     assert_eq!(decode_client(&p, MAX), Err(DecodeError::Malformed));
 }
@@ -634,4 +654,81 @@ fn canonical_request_bytes_ignore_correlation() {
 fn debug_does_not_print_content() {
     let b = BoundedBytes::<16>::new(b"secret".to_vec()).unwrap();
     assert!(!format!("{b:?}").contains("secret"));
+}
+
+#[test]
+fn v2_additions_are_bounded_and_canonical() {
+    // ListCapabilities { after: None }: version 2, corr 0, variant 9, None.
+    let msg = ClientMessage {
+        correlation_id: 0,
+        request: Request::ListCapabilities { after: None },
+    };
+    let p = encode_client(&msg).unwrap();
+    assert_eq!(p, vec![0, 2, 0x00, 0x09, 0x00]);
+    assert_eq!(decode_client(&p, MAX).unwrap(), msg);
+    // Option tag other than 0/1 is malformed.
+    assert_eq!(
+        decode_client(&[0, 2, 0x00, 0x09, 0x02], MAX),
+        Err(DecodeError::Malformed)
+    );
+    // The same body under version 1 is refused before parsing.
+    assert_eq!(
+        decode_client(&[0, 1, 0x00, 0x09, 0x00], MAX),
+        Err(DecodeError::UnsupportedVersion(1))
+    );
+
+    // A description longer than MAX_DESCRIPTION cannot be built ...
+    assert!(BoundedString::<MAX_DESCRIPTION>::new("x".repeat(MAX_DESCRIPTION + 1)).is_err());
+    // ... nor decoded: hand-encode one byte too long.
+    let ok = ClientMessage {
+        correlation_id: 0,
+        request: Request::RequestGrant {
+            request_id: 0,
+            requested_scope: WireScope::File {
+                object_id: 0,
+                rights: WireFileRights {
+                    read_snapshot: true,
+                    replace_content: false,
+                },
+            },
+            budget: WireBudget::Finite(1),
+            depth: WireDepth::Finite(0),
+            expiry: WireExpiry::Inherit,
+            untrusted_description: Some(BoundedString::new("y".repeat(MAX_DESCRIPTION)).unwrap()),
+        },
+    };
+    let good = encode_client(&ok).unwrap();
+    assert_eq!(decode_client(&good, MAX).unwrap(), ok);
+    // The description is the last field: [.. 0x01 (Some), varint len, bytes].
+    let len_at = good.len() - MAX_DESCRIPTION - 2;
+    assert_eq!(good[len_at - 1], 0x01);
+    let mut bad = good[..len_at].to_vec();
+    bad.extend_from_slice(&[0x81, 0x04]); // 513 as a varint
+    bad.extend(std::iter::repeat_n(b'y', MAX_DESCRIPTION + 1));
+    assert_eq!(decode_client(&bad, MAX), Err(DecodeError::Malformed));
+
+    // Capabilities: more than MAX_LIST views are refused by the bound.
+    assert!(
+        BoundedVec::<WireCapabilityView, MAX_LIST>::new(vec![
+            WireCapabilityView {
+                cap_id: 1,
+                root_id: 1,
+                parent: None,
+                owner: WireAgentId {
+                    epoch: 1,
+                    serial: 1
+                },
+                scope: WireScope::File {
+                    object_id: 1,
+                    rights: WireFileRights::default(),
+                },
+                budget_remaining: WireBudget::Unlimited,
+                depth: WireDepth::Unlimited,
+                expires_in_millis: None,
+                status: WireCapStatus::Live,
+            };
+            MAX_LIST + 1
+        ])
+        .is_err()
+    );
 }

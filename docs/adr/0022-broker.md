@@ -123,6 +123,10 @@ summary, budget before/after, outcome, effect status, content-free detail
 never recorded.
 
 ## Consequences / known gaps
+
+*Update:* ADR-0024 closes the spawn, description/pending, denied-binding,
+audit-chain/fsync, startup-sweep and rate-limit gaps below; the list is
+kept as the record of the WP3 state.
 - Agent `Spawn` is denied (`InvalidProfile`); principals are created by the
   operator only. Spawn idempotency is therefore trivially satisfied.
 - `RequestGrant` has no untrusted-description field and no "pending"

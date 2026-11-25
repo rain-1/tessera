@@ -56,4 +56,4 @@ these is *worse than documented* are welcome.
 
 | Advisory | Status |
 |---|---|
-| RUSTSEC-2026-0387 (`crypto-bigint 0.5`, via `p256 0.13`) | Ignored with justification in `deny.toml`: production only verifies signatures over public inputs; the secret-key path is in the development software authenticator. Fix: upgrade p256 |
+| RUSTSEC-2026-0387 (`crypto-bigint 0.5`, via `p256 0.13`) | Fixed: upgraded to `p256` 0.14 (`crypto-bigint` ≥ 0.7.6); no ignore entries remain |

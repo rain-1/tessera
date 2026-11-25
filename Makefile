@@ -64,7 +64,7 @@ deny: ## cargo-deny: advisories, licenses, bans, sources
 	$(CARGO) deny check
 
 audit: ## cargo-audit against the RustSec database
-	$(CARGO) audit --ignore RUSTSEC-2026-0387 # see deny.toml
+	$(CARGO) audit
 
 sbom: ## Regenerate CycloneDX SBOMs in docs/sbom/
 	scripts/sbom.sh

@@ -109,6 +109,10 @@ fn ok(req: &Request) -> Response {
             },
         },
         Request::Revoke { request_id, .. } => Response::Revoked { request_id },
+        Request::ListCapabilities { .. } => Response::Capabilities {
+            caps: BoundedVec::new(vec![view(CAP), view(CAP + 1)]).unwrap(),
+            more: false,
+        },
     }
 }
 
@@ -154,6 +158,8 @@ fn exact_wire_messages() {
     assert_eq!(c.inspect(CAP).unwrap(), view(CAP));
     assert_eq!(c.spawn_with_id(9, 3).unwrap(), AgentId::new(1, 2));
     c.revoke_with_id(10, CAP).unwrap();
+    let listed = c.list_capabilities().unwrap();
+    assert_eq!(listed, vec![view(CAP), view(CAP + 1)]);
 
     let expected = vec![
         Request::RequestGrant {
@@ -162,6 +168,7 @@ fn exact_wire_messages() {
             budget: WireBudget::Finite(100),
             depth: WireDepth::Finite(2),
             expiry: WireExpiry::WithinMillis(60_000),
+            untrusted_description: Some(BoundedString::new("ignored").unwrap()),
         },
         Request::Consume {
             request_id: 2,
@@ -224,6 +231,7 @@ fn exact_wire_messages() {
             request_id: 10,
             cap_id: CAP,
         },
+        Request::ListCapabilities { after: None },
     ];
     let got = mock.received();
     assert_eq!(got.len(), expected.len());
@@ -501,24 +509,168 @@ fn timeout_then_idempotent_retry_discards_late_response() {
 }
 
 #[test]
-fn grant_uses_approval_timeout_not_call_timeout() {
+fn grant_pending_switches_to_approval_timeout() {
     let config = ClientConfig {
         call_timeout: Duration::from_millis(50),
         approval_timeout: Duration::from_secs(5),
         ..ClientConfig::default()
     };
     let mock = start_kind(Kind::Seqpacket, config, |m: &ClientMessage| {
-        if matches!(m.request, Request::RequestGrant { .. }) {
-            std::thread::sleep(Duration::from_millis(300)); // "operator touching key"
-        }
-        vec![Reply::Respond(ok(&m.request))]
+        let Request::RequestGrant { request_id, .. } = m.request else {
+            return vec![Reply::Respond(ok(&m.request))];
+        };
+        vec![
+            Reply::Respond(Response::GrantPending {
+                request_id,
+                expires_in_millis: 120_000,
+            }),
+            Reply::Sleep(Duration::from_millis(300)), // "operator touching key"
+            Reply::Respond(ok(&m.request)),
+        ]
     });
+    let mut seen = Vec::new();
     assert_eq!(
         mock.client
-            .request_grant(Terms::new(file_scope(), 1), None)
+            .request_grant_with_progress(7, Terms::new(file_scope(), 1), None, &mut |d| seen
+                .push(d))
             .unwrap(),
         CAP
     );
+    assert_eq!(seen, vec![Duration::from_secs(120)]);
+    // The channel stays in step: the next call works.
+    assert_eq!(mock.client.inspect(CAP).unwrap(), view(CAP));
+}
+
+#[test]
+fn silent_broker_is_a_timeout_pending_broker_is_approval_pending() {
+    let config = ClientConfig {
+        call_timeout: Duration::from_millis(100),
+        approval_timeout: Duration::from_millis(400),
+        ..ClientConfig::default()
+    };
+    // No answer at all: the short call timeout applies (broker hung).
+    let silent = start_kind(Kind::Seqpacket, config, |_| vec![]);
+    let t = std::time::Instant::now();
+    let e = silent
+        .client
+        .request_grant_with_id(1, Terms::new(file_scope(), 1), None)
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Timeout {
+                request_id: Some(1)
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(t.elapsed() < Duration::from_millis(350));
+
+    // Acknowledged but undecided: ApprovalPending, uncertain, same id.
+    let pending = start_kind(Kind::Seqpacket, config, |m: &ClientMessage| {
+        if let Request::RequestGrant { request_id: 2, .. } = m.request {
+            let request_id = 2;
+            vec![Reply::Respond(Response::GrantPending {
+                request_id,
+                expires_in_millis: 60_000,
+            })]
+        } else {
+            vec![Reply::Respond(ok(&m.request))]
+        }
+    });
+    let e = pending
+        .client
+        .request_grant_with_id(2, Terms::new(file_scope(), 1), None)
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::ApprovalPending { request_id: 2 }),
+        "{e:?}"
+    );
+    assert!(e.outcome_uncertain());
+    assert_eq!(e.request_id(), Some(2));
+    // The client is still usable.
+    assert_eq!(pending.client.inspect(CAP).unwrap(), view(CAP));
+}
+
+#[test]
+fn raw_interim_response_abandons_the_correlation() {
+    // call_raw returns GrantPending; the final answer arriving later is
+    // discarded instead of confusing the next call.
+    let mock = start(|m: &ClientMessage| match &m.request {
+        Request::RequestGrant { request_id, .. } => vec![
+            Reply::Respond(Response::GrantPending {
+                request_id: *request_id,
+                expires_in_millis: 1,
+            }),
+            Reply::Respond(ok(&m.request)),
+        ],
+        other => vec![Reply::Respond(ok(other))],
+    });
+    let r = mock
+        .client
+        .call_raw(
+            Request::RequestGrant {
+                request_id: 3,
+                requested_scope: file_scope(),
+                budget: WireBudget::Finite(1),
+                depth: WireDepth::Finite(0),
+                expiry: WireExpiry::Inherit,
+                untrusted_description: None,
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(matches!(r, Response::GrantPending { request_id: 3, .. }));
+    assert_eq!(mock.client.inspect(CAP).unwrap(), view(CAP));
+}
+
+#[test]
+fn description_is_bounded_and_list_is_validated() {
+    let mock = echo();
+    let long = "x".repeat(tessera_protocol::MAX_DESCRIPTION + 1);
+    assert!(matches!(
+        mock.client
+            .request_grant(Terms::new(file_scope(), 1), Some(&long)),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(mock.received().is_empty(), "nothing sent");
+
+    // A broker listing ids out of order (or looping) is a protocol error.
+    let bad = start(|m: &ClientMessage| {
+        vec![Reply::Respond(match &m.request {
+            Request::ListCapabilities { .. } => Response::Capabilities {
+                caps: BoundedVec::new(vec![view(5), view(5)]).unwrap(),
+                more: true,
+            },
+            other => ok(other),
+        })]
+    });
+    assert!(matches!(
+        bad.client.list_capabilities(),
+        Err(Error::Protocol(_))
+    ));
+    // Pagination follows the cursor.
+    let paged = start(|m: &ClientMessage| {
+        vec![Reply::Respond(match &m.request {
+            Request::ListCapabilities { after: None } => Response::Capabilities {
+                caps: BoundedVec::new(vec![view(1), view(2)]).unwrap(),
+                more: true,
+            },
+            Request::ListCapabilities { after: Some(2) } => Response::Capabilities {
+                caps: BoundedVec::new(vec![view(9)]).unwrap(),
+                more: false,
+            },
+            other => panic!("unexpected {other:?}"),
+        })]
+    });
+    let ids: Vec<u128> = paged
+        .client
+        .list_capabilities()
+        .unwrap()
+        .iter()
+        .map(|v| v.cap_id)
+        .collect();
+    assert_eq!(ids, vec![1, 2, 9]);
 }
 
 #[test]
