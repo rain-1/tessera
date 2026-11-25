@@ -2,5 +2,28 @@
 name = "tessera-approval"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+rust-version.workspace = true
+description = "Human (FIDO2) approval binding for Tessera root grants"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes `SoftwareAuthenticator` outside of this crate's own tests. NEVER
+# enable in a production broker build: its keys live in process memory.
+software-authenticator = []
+# `Fido2CliAuthenticator`: shells out to Yubico's libfido2 command-line tools
+# (`fido2-cred`, `fido2-assert`). UNTESTED against real hardware.
+fido2-cli = ["dep:base64ct"]
 
 [dependencies]
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+getrandom = "0.2"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2 = "0.10"
+base64ct = { version = "1", features = ["alloc"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
