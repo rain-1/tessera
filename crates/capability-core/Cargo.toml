@@ -1,6 +1,7 @@
 [package]
 name = "tessera-capability-core"
 version = "0.1.0"
+publish = false
 edition = "2024"
 description = "Tessera authority core: pure, deterministic capability ledger and transition semantics (spec §4-§7)."
 license = "Apache-2.0"

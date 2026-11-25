@@ -112,6 +112,7 @@ pub struct FileSlotRec {
 /// Non-secret HTTPS endpoint description (secrets come only from the
 /// daemon configuration and are never journaled).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointSpec {
     /// Host name used for DNS, SNI, certificate validation and `Host`.
     pub host: String,

@@ -16,7 +16,9 @@ use tessera_broker::{
     AdapterExecutor, AuditLog, AuditSync, Broker, BrokerConfig, LauncherSpawner, MonotonicClock,
     SandboxSpawner, Services,
 };
-use tessera_journal::Journal;
+use tessera_journal::{Journal, JournalOptions, TailPolicy};
+
+const USAGE: &str = "usage: tesserad --config FILE [--truncate-unverifiable-final-record]";
 use tessera_launcher::{CgroupRequirement, LandlockRequirement, LauncherConfig};
 
 fn main() {
@@ -28,9 +30,21 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let cfg_path = match (args.next().as_deref(), args.next()) {
-        (Some("--config"), Some(p)) => p,
-        _ => return Err("usage: tesserad --config FILE".into()),
+    let mut cfg_path = None;
+    let mut tail_policy = TailPolicy::Strict;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--config" => cfg_path = args.next(),
+            // Explicit operator override (see TailPolicy): only after
+            // investigating a journal that refuses to open.
+            "--truncate-unverifiable-final-record" => {
+                tail_policy = TailPolicy::TruncateUnverifiableFinalRecord;
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let Some(cfg_path) = cfg_path else {
+        return Err(USAGE.into());
     };
     let cfg = DaemonConfig::load(cfg_path.as_ref())?;
     cfg.check()?;
@@ -49,7 +63,21 @@ fn run() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    let journal = Journal::open(&cfg.state_dir.join("journal")).map_err(|e| e.to_string())?;
+    let journal = Journal::open_with(
+        &cfg.state_dir.join("journal"),
+        JournalOptions {
+            tail_policy,
+            ..JournalOptions::default()
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if tail_policy != TailPolicy::Strict {
+        let r = journal.recovery_report();
+        eprintln!(
+            "tesserad: WARNING: journal opened with --truncate-unverifiable-final-record \
+             (recovery: {r:?}); an acknowledged record may have been discarded"
+        );
+    }
     let audit_sync: AuditSync = match &cfg.audit_fsync {
         Some(s) => s.parse()?,
         None => AuditSync::default(),

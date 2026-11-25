@@ -46,6 +46,7 @@ use crate::spawner::{AgentSpawnProfile, ProfileSpec};
 
 /// Secret header source.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretHeaderConfig {
     /// Header name.
     pub name: String,
@@ -55,6 +56,7 @@ pub struct SecretHeaderConfig {
 
 /// Configured endpoint.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     /// Endpoint id agents name.
     pub id: u64,
@@ -70,6 +72,7 @@ pub struct EndpointConfig {
 
 /// Launcher settings.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LauncherSection {
     /// bubblewrap path.
     #[serde(default)]
@@ -91,6 +94,7 @@ pub struct LauncherSection {
 
 /// Optional per-principal limits (defaults from `BrokerConfig`).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsSection {
     /// Children one principal may spawn per epoch.
     pub max_children_per_agent: Option<u32>,
@@ -108,6 +112,7 @@ pub struct LimitsSection {
 
 /// Daemon configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Broker-owned directory (journal, audit log). Never mounted into a
     /// sandbox.
@@ -207,4 +212,37 @@ pub fn pem_certs(pem: &str) -> Result<Vec<Vec<u8>>, String> {
         return Err("no certificates in PEM".into());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonConfig;
+
+    fn parse(s: &str) -> Result<DaemonConfig, String> {
+        serde_json::from_str(s).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_at_every_level() {
+        let base = r#"{"state_dir": "/s", "admin_socket": "/a"}"#;
+        assert!(parse(base).is_ok());
+        for bad in [
+            r#"{"state_dir": "/s", "admin_socket": "/a", "audit_fsyn": "never"}"#,
+            r#"{"state_dir": "/s", "admin_socket": "/a", "launcher": {"landlok": "disabled"}}"#,
+            r#"{"state_dir": "/s", "admin_socket": "/a", "limits": {"max_childs": 1}}"#,
+            r#"{"state_dir": "/s", "admin_socket": "/a",
+                "profiles": {"p": {"program": "/bin/sh", "argz": []}}}"#,
+            r#"{"state_dir": "/s", "admin_socket": "/a",
+                "agent_spawn_profiles": {"1": {"profile": "p", "baselin": []}}}"#,
+        ] {
+            assert!(parse(bad).is_err(), "accepted: {bad}");
+        }
+        // An agent profile must name a configured launch profile.
+        let c = parse(
+            r#"{"state_dir": "/s", "admin_socket": "/a",
+                "agent_spawn_profiles": {"1": {"profile": "nope"}}}"#,
+        )
+        .unwrap();
+        assert!(c.check().is_err());
+    }
 }

@@ -38,6 +38,7 @@ pub trait SandboxSpawner: Send + 'static {
 
 /// A trusted launch profile from the daemon configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileSpec {
     /// Program to run inside the sandbox.
     pub program: PathBuf,
@@ -67,6 +68,7 @@ pub struct ProfileSpec {
 /// One operator baseline grant installed for a principal at creation
 /// (recorded as `InstallBaseline`, R2: separately from approved roots).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BaselineGrant {
     /// Scope.
     pub scope: tessera_protocol::WireScope,
@@ -84,6 +86,7 @@ pub struct BaselineGrant {
 /// a trusted launcher profile by name. The child receives exactly the
 /// `baseline` grants listed here and nothing from its parent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSpawnProfile {
     /// Name of a trusted launcher profile ([`ProfileSpec`]).
     pub profile: String,
