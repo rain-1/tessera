@@ -39,10 +39,11 @@ This builds `HEAD` twice from two separate `git archive` checkouts at
 different paths, each with its own target directory, and compares
 `SHA256SUMS`.
 
-**Result (2026-11-25, rustc 1.100.0, Debian 13 x86_64).** All five
-binaries checked were bit-identical across two checkouts at different
-paths with separate target directories: `tesserad`, `tessera-admin`,
-`tessera`, `tessera-sandbox-init` and `tessera-launch-run`. Without the
+**Result (2026-11-25, rustc 1.100.0, Debian 13 x86_64).** `make repro`
+printed `REPRODUCIBLE`. All six binaries were bit-identical across two
+`git archive` checkouts at different paths with separate target
+directories (for example, `tesserad`
+`30cfe392…8e7d7` at commit `452d21e`). Without the
 `CFLAGS` prefix map, the binaries were still identical on one machine but
 embedded `$CARGO_HOME` paths from ring's C sources. That is why the C flags
 are part of the recipe. Cross-machine reproduction (a different distro or

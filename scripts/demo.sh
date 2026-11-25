@@ -30,10 +30,13 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/tessera-demo.XXXXXX")"
 chmod 700 "$work"
 daemon=""
 cleanup() {
-    [ -n "$daemon" ] && kill "$daemon" 2>/dev/null && wait "$daemon" 2>/dev/null
+    rc=$?
+    if [ -n "$daemon" ]; then kill "$daemon" 2>/dev/null; wait "$daemon" 2>/dev/null || true; fi
     if [ "${KEEP:-0}" = 1 ]; then echo "kept $work"; else rm -rf "$work"; fi
+    exit "$rc"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 admin() { echo "\$ tessera-admin $*" >&2; "$bin/tessera-admin" --socket "$work/run/admin.sock" "$@"; }
