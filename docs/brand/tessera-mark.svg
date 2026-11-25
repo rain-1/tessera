@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="t">
+  <title id="t">Tessera mark</title>
+  <!-- Root authority: a 2x2 mosaic tile. -->
+  <g fill="#14213D">
+    <rect x="14" y="14" width="44" height="44" rx="7"/>
+    <rect x="64" y="14" width="44" height="44" rx="7"/>
+    <rect x="14" y="64" width="44" height="44" rx="7"/>
+  </g>
+  <!-- Conservation: the delegated share's origin remains accounted for. -->
+  <rect x="64" y="64" width="44" height="44" rx="7" fill="none"
+        stroke="#14213D" stroke-width="3" stroke-dasharray="6 5" opacity="0.45"/>
+  <!-- Delegated, attenuated child capability. -->
+  <rect x="74" y="74" width="40" height="40" rx="7" fill="#F2A541"/>
+</svg>
