@@ -353,10 +353,16 @@ tests require the kernel controls reported by the launcher probe.
 - **One attempt has an uncertain edge.** A remote endpoint may have acted before a
   connection failed. Tessera retains the uncertain outcome and leaves remote
   reconciliation to the operator.
-- **Ledger capacity is finite across epochs.** Historical records remain in the ledger,
-  and exhaustion can persist across a restart. Per-principal and per-root quotas limit
-  how many records one workload or grant tree can allocate. Reclaiming capacity from
-  historical records remains an open review finding.
+- **Ledger capacity is finite within an epoch.** Per-principal and per-root quotas limit
+  how many records one workload or grant tree can allocate. At each restart the broker
+  journals a compaction that prunes earlier-epoch records. Spent nonces and ID counters
+  survive it, and pruned pools stay in the conservation accounting. The journal file
+  itself is never rewritten, so replay time grows with total history.
+  [Epoch compaction](docs/adr/0031-epoch-compaction.md)
+- **The model API is a disclosure channel.** In compatibility mode an unmodified harness
+  reaches its model provider only through a host-side proxy that holds the credential.
+  That channel is unlimited-use, and anything the agent can read can be sent to the
+  provider. [Compatibility mode](docs/compat.md)
 - **A key touch authenticates presence.** The operator's understanding of the grant
   depends on the trusted display and the terms they review.
 - **The active enforcement path is broker-only.** The BPF LSM direct-grant prototype is
@@ -372,6 +378,7 @@ The independent review records the findings and their remediation status.
 |---|---|
 | Operate a daemon or write a profile | [Installation](docs/install.md) · [Operations](docs/operations.md) |
 | Integrate a workload | [SDK and CLI](docs/sdk.md) · [Swarm example](crates/sdk/examples/swarm_demo.rs) |
+| Run an existing harness (Claude Code, Codex) unmodified | [Compatibility mode](docs/compat.md) · [Examples](examples/compat) |
 | Follow the design or audit a claim | [Specification](docs/specification.md) · [Architecture decisions](docs/adr/README.md) · [Traceability](docs/traceability.md) |
 | Review build and test evidence | [Release engineering](docs/release.md) · [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) |
 
