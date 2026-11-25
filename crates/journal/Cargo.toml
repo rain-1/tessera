@@ -2,5 +2,18 @@
 name = "tessera-journal"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+rust-version.workspace = true
+description = "Durable single-writer append-only hash-chained write-ahead log for the Tessera broker"
 
 [dependencies]
+rustix = { version = "1.1.6", features = ["fs"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.12.0"
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
