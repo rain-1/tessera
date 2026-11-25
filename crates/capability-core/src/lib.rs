@@ -8,7 +8,9 @@
 //! * One entry point mutates authority: [`step`]. It validates completely
 //!   before mutating, so a [`Denial`] never changes the [`State`].
 //! * [`check_invariant`] states conservation, lineage, attenuation and
-//!   nonce invariants executably. Nothing here is machine-proved yet; see
+//!   nonce invariants executably. This crate is not itself machine-proved.
+//!   A function-by-function mirror in `proofs/` is verified with Verus and
+//!   differentially tested against it; see `proofs/README.md` and
 //!   `docs/proof-register.md`.
 //!
 //! ## Broker integration sketch

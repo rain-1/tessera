@@ -2,3 +2,4 @@
 **/*.rs.bk
 *.journal
 *.db
+/proofs/target

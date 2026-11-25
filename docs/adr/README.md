@@ -19,7 +19,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design) |
 | [0006](0006-fido2-verification.md) | RustCrypto verification, libfido2 transport | §8, changes WP4 wording | Accepted (design) |
 | [0007](0007-https-client.md) | HTTPS client: no redirects/retries, own DNS | §9.4 | Accepted (design) |
-| [0008](0008-verification-strategy.md) | Verus target; tests/proptest/model meanwhile | §16 Verification | Accepted; Verus not installed |
+| [0008](0008-verification-strategy.md) | Verus target; tests/proptest/model meanwhile | §16 Verification | Accepted; amended 2026-11-25: Verus pinned, mirrored core verified (`proofs/`) |
 | [0009](0009-project-name-and-brand.md) | Name and mark: Tessera | — | Accepted |
 | [0010](0010-product-boundary.md) | External platform, not a harness | §16 Product boundary | Accepted |
 | [0011](0011-scope-language.md) | Small typed exact-resource scopes | §16 Scope | Accepted |
