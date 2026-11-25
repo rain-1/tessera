@@ -1,0 +1,16 @@
+{
+  "upstream": { "host": "api.openai.com", "port": 443 },
+  "credential": { "file": "/etc/tessera/openai-api-key", "inject": "bearer" },
+  "routes": [
+    { "method": "POST", "path": "/v1/responses" },
+    { "method": "GET",  "path": "/v1/models", "match": "prefix" }
+  ],
+  "audit_log": "/var/log/tessera/model-proxy-openai.jsonl",
+  "sandboxes": [
+    {
+      "label": "codex-1",
+      "socket": "/run/user/1000/tessera/codex-1/model.sock",
+      "budget": { "requests_per_minute": 60, "burst": 10, "max_concurrent": 4 }
+    }
+  ]
+}

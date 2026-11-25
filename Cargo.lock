@@ -1584,6 +1584,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tessera-adapter-https",
+ "tessera-launcher",
  "tokio",
  "tokio-rustls",
  "webpki-roots",

@@ -1,0 +1,38 @@
+{
+  "upstream": {
+    "host": "api.anthropic.com",
+    "port": 443,
+    "connect_timeout_ms": 10000,
+    "response_header_timeout_ms": 300000,
+    "idle_timeout_ms": 300000,
+    "max_duration_ms": 1800000
+  },
+  "credential": { "file": "/etc/tessera/anthropic-api-key", "inject": "x-api-key" },
+  "routes": [
+    { "method": "POST", "path": "/v1/messages" },
+    { "method": "POST", "path": "/v1/messages/count_tokens" },
+    { "method": "GET",  "path": "/v1/models", "match": "prefix" }
+  ],
+  "limits": {
+    "max_request_body": 33554432,
+    "max_response_body": 67108864,
+    "max_header_bytes": 65536,
+    "max_headers": 100,
+    "request_read_timeout_ms": 60000
+  },
+  "audit_log": "/var/log/tessera/model-proxy.jsonl",
+  "sandboxes": [
+    {
+      "label": "claude-1",
+      "socket": "/run/user/1000/tessera/claude-1/model.sock",
+      "budget": {
+        "requests_per_minute": 60,
+        "burst": 10,
+        "max_concurrent": 4,
+        "max_requests": 2000,
+        "max_request_bytes": 2147483648,
+        "max_response_bytes": 1073741824
+      }
+    }
+  ]
+}

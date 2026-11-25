@@ -14,7 +14,10 @@
 //!       "secret_header": { "name": "x-api-key", "value_file": "/etc/tessera/api-key" },
 //!       "ca_pem_file": null }
 //!   ],
-//!   "profiles": { "shell": { "program": "/bin/sh", "args": ["-c", "..."] } },
+//!   "profiles": { "shell": { "program": "/bin/sh", "args": ["-c", "..."] },
+//!                 "claude": { "program": "/opt/claude/claude", "args": ["-p", "..."],
+//!                             "env": [["ANTHROPIC_UNIX_SOCKET", "/.tessera/model.sock"]],
+//!                             "model_route": { "socket": "/run/user/1000/tessera/claude/model.sock" } } },
 //!   "agent_spawn_profiles": { "1": { "profile": "shell", "baseline": [] } },
 //!   "limits": { "max_children_per_agent": 8, "max_spawn_depth": 2,
 //!               "max_domain_agents": 16, "max_in_flight_per_agent": 64,

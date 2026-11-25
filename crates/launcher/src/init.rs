@@ -8,8 +8,9 @@
 //!    broker channel (defence against descriptors leaked into the launcher or
 //!    bubblewrap by their own parents);
 //! 2. applies a Landlock ruleset (filesystem access limited to the runtime,
-//!    workspace, `/tmp` and `/dev`; all TCP bind/connect denied; signal and
-//!    abstract-unix-socket scoping);
+//!    workspace, `/tmp` and `/dev`; all TCP bind/connect denied except on
+//!    the ports named by `--allow-tcp-port` (compatibility-mode loopback
+//!    shim, Required mode only); signal and abstract-unix-socket scoping);
 //! 3. verifies seccomp mode 2 and `NoNewPrivs` from `/proc/self/status`;
 //! 4. reports one status line to the launcher over the status pipe and only
 //!    then `exec`s the workload.
@@ -18,7 +19,7 @@
 //!
 //! ```text
 //! tessera-sandbox-init --status-fd N [--keep-fd N]... --landlock required|best_effort|disabled
-//!     [--ro PATH]... [--rw PATH]... [--dev PATH]... -- PROGRAM [ARGS]...
+//!     [--allow-tcp-port PORT]... [--ro PATH]... [--rw PATH]... [--dev PATH]... -- PROGRAM [ARGS]...
 //! ```
 
 use std::ffi::OsString;
@@ -30,8 +31,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
+    PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use crate::LandlockRequirement;
@@ -49,6 +50,7 @@ struct Args {
     ro: Vec<PathBuf>,
     rw: Vec<PathBuf>,
     dev: Vec<PathBuf>,
+    tcp_ports: Vec<u16>,
     program: Option<OsString>,
     args: Vec<OsString>,
 }
@@ -74,6 +76,15 @@ fn parse(mut it: impl Iterator<Item = OsString>) -> Result<Args, String> {
                         other => return Err(format!("bad --landlock {other:?}")),
                     },
                 )
+            }
+            Some("--allow-tcp-port") => {
+                let port = it
+                    .next()
+                    .and_then(|s| s.into_string().ok())
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .filter(|p| *p != 0)
+                    .ok_or("--allow-tcp-port needs a non-zero port")?;
+                a.tcp_ports.push(port);
             }
             Some("--ro") => a.ro.push(it.next().ok_or("--ro needs a path")?.into()),
             Some("--rw") => a.rw.push(it.next().ok_or("--rw needs a path")?.into()),
@@ -122,6 +133,11 @@ fn status_field(status: &str, key: &str) -> Option<String> {
 }
 
 fn apply_landlock(a: &Args, req: LandlockRequirement) -> Result<String, String> {
+    // A TCP port exception is only meaningful if Landlock restricts every
+    // other port; anything weaker would silently open the network policy.
+    if !a.tcp_ports.is_empty() && req != LandlockRequirement::Required {
+        return Err("--allow-tcp-port requires --landlock required".into());
+    }
     if req == LandlockRequirement::Disabled {
         return Ok("disabled".into());
     }
@@ -163,6 +179,14 @@ fn apply_landlock(a: &Args, req: LandlockRequirement) -> Result<String, String> 
                 created = created.add_rule(PathBeneath::new(fd, access)).map_err(e)?;
             }
         }
+    }
+    for port in &a.tcp_ports {
+        created = created
+            .add_rule(NetPort::new(
+                *port,
+                AccessNet::BindTcp | AccessNet::ConnectTcp,
+            ))
+            .map_err(e)?;
     }
     let st = created.restrict_self().map_err(e)?;
     let label = match st.ruleset {
@@ -299,6 +323,33 @@ mod tests {
         assert_eq!(a.landlock, Some(LandlockRequirement::Required));
         assert_eq!(a.program, Some("/bin/sh".into()));
         assert_eq!(a.args, vec![OsString::from("-c"), OsString::from("--ro")]);
+    }
+
+    #[test]
+    fn tcp_port_exception_parsing_and_fail_closed() {
+        let a = parse(os(&[
+            "--landlock",
+            "required",
+            "--allow-tcp-port",
+            "18080",
+            "--",
+            "/bin/true",
+        ]))
+        .unwrap();
+        assert_eq!(a.tcp_ports, vec![18080]);
+        for bad in ["0", "70000", "x"] {
+            assert!(parse(os(&["--allow-tcp-port", bad, "--", "x"])).is_err());
+        }
+        // A port exception without a Required ruleset is refused before any
+        // Landlock call (it would otherwise silently open the network).
+        for req in [
+            LandlockRequirement::BestEffort,
+            LandlockRequirement::Disabled,
+        ] {
+            let mut a = Args::default();
+            a.tcp_ports.push(18080);
+            assert!(apply_landlock(&a, req).is_err());
+        }
     }
 
     #[test]
