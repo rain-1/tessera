@@ -1,0 +1,39 @@
+[package]
+name = "tessera-model-proxy"
+version = "0.1.0"
+edition = "2024"
+description = "Tessera compatibility mode: trusted host-side model API proxy (credential injection) and in-sandbox loopback shim"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tessera-model-proxy"
+path = "src/bin/tessera-model-proxy.rs"
+
+[[bin]]
+name = "tessera-netshim"
+path = "src/bin/tessera-netshim.rs"
+
+[dependencies]
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tessera-adapter-https = { path = "../../adapters/https" }
+tokio = { version = "1", default-features = false, features = ["net", "rt", "rt-multi-thread", "time", "sync", "io-util", "process", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
