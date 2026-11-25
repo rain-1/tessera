@@ -1,0 +1,25 @@
+# Verus-verified mirror of the authority core. NOT a member of the root
+# workspace (it has its own empty [workspace] table): the verifier is run by
+# `proofs/run_verus.sh`. Plain `cargo test` here compiles the same sources
+# with ghost code erased (vstd from crates.io) and runs the differential test
+# against `tessera-capability-core`.
+[package]
+name = "tessera-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Erasure-only build of vstd matching the pinned Verus release
+# (0.2026.11.02.8bf68ee); the verifier itself uses its bundled vstd.
+vstd = "=0.0.0-2026-11-01-0251"
+
+[dev-dependencies]
+tessera-capability-core = { path = "../crates/capability-core" }
+proptest = "1.12.0"
+
+[workspace]

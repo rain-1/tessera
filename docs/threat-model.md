@@ -70,12 +70,12 @@ exploit is a residual risk (R-3), not a defended case.
 | Hardware and firmware, including the storage fsync semantics | Trusted | ADR-0002 assumption |
 | Launcher (`crates/launcher`) and pinned `bwrap` | Trusted | Must activate every restriction before exec |
 | Broker (`crates/broker`), journal (`crates/journal`), protocol parser (`crates/protocol`) | Trusted; partially verified later | The parser is the first code to touch hostile bytes |
-| Authority core (`crates/capability-core`) | Trusted; intended to be Verus-verified (ADR-0008) | Not yet verified |
+| Authority core (`crates/capability-core`) | Trusted; intended to be Verus-verified (ADR-0008) | A function-by-function mirror is Verus-verified (`proofs/`). The production crate is linked to it only by a differential test (proof register A13). |
 | Adapters (`adapters/file`, `adapters/https`) | Trusted per adapter | Must refine the reservation model (T11) |
 | Approval service and UI (`crates/approval`), libfido2 transport | Trusted | libfido2 is trusted for transport and availability only, not for acceptance (ADR-0006) |
 | RustCrypto, rustls, hyper and other pinned crates | Trusted, unverified | Supply-chain risk R-9 |
 | Operator and administrative endpoint | Trusted | Hostile admin is out of scope (R-4) |
-| Verification and build toolchain (rustc, Verus later, Python model checker) | Trusted | |
+| Verification and build toolchain (rustc, Verus `0.2026.11.02.8bf68ee` with bundled Z3, Python model checker) | Trusted | |
 | Model API proxy (P5 profile only, ADR-0020) | Trusted | New component; needs review |
 | SDK, CLI client code inside sandboxes, harnesses | **Untrusted** | |
 

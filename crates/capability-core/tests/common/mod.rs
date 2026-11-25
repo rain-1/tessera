@@ -4,6 +4,8 @@
 
 use tessera_capability_core::*;
 
+pub mod sym;
+
 pub fn copy_state(s: &State) -> State {
     serde_json::from_str(&serde_json::to_string(s).expect("serialize")).expect("deserialize")
 }
