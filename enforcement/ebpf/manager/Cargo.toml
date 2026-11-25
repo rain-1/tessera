@@ -1,0 +1,16 @@
+[package]
+name = "tessera-bpf-manager"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+rust-version.workspace = true
+description = "WP7 research stub: BPF LSM direct-grant generation protocol as a pure state machine (no kernel backend)"
+publish = false
+
+# No dependencies on purpose: builds and tests without root, libbpf or bpftool.
+# The kernel backend (libbpf-rs, ADR-0023) is not implemented; `KernelPolicy`
+# is the seam it would fill.
+[dependencies]
+
+[lints]
+workspace = true

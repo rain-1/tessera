@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "adapters/*"]
+members = ["crates/*", "adapters/*", "enforcement/ebpf/manager"]
 
 [workspace.package]
 edition = "2024"
