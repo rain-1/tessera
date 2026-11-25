@@ -24,11 +24,13 @@ use tessera_sdk::{
 
 /// Usage text.
 pub const USAGE: &str = "\
-usage: tessera [--json] [--timeout SECS] [--approval-timeout SECS] <command> [options]
+usage: tessera [--json] [--timeout SECS] [--approval-timeout SECS] [--socket PATH]
+               <command> [options]
 
 commands:
   request   ask the operator for a new capability (blocks until approved/denied)
-            SCOPE TERMS [--description TEXT]
+            SCOPE TERMS [--description TEXT]   (TEXT is shown to the operator
+            labelled UNTRUSTED; at most 512 bytes)
   read      read one bounded snapshot of a file      --cap CAP [--max-bytes N] [--out FILE]
   replace   atomically replace a file's content      --cap CAP (--from FILE | --stdin)
   http      issue one HTTPS request                  --cap CAP [--method M] [--path P]
@@ -38,8 +40,10 @@ commands:
   transfer  move a capability to another agent       --cap CAP --to AGENT
   drop      discard a capability's remaining balance --cap CAP
   inspect   show a capability you own                --cap CAP
+  list      list every capability you own (find ones delegated to you)
   spawn     launch a child sandbox (trusted profile) --profile N
-  revoke    revoke a capability subtree (revokers)   --cap CAP
+  revoke    revoke a capability you own, or a descendant of one, with its subtree
+            --cap CAP
 
 SCOPE: --file OBJECT_ID [--rights read,replace]
      | --https ENDPOINT_ID [--methods get,head,post,put,patch,delete] [--max-body BYTES]
@@ -52,6 +56,9 @@ status of the earlier request instead. After a timeout, retry with the id
 that was printed.
 
 CAP and request ids are hex. AGENT is <epoch-hex>:<serial>, as printed by spawn.
+
+The broker channel is TESSERA_BROKER_FD (set by the launcher). --socket PATH
+connects to a stream socket instead (tests and tools).
 ";
 
 /// Exit codes.
@@ -169,6 +176,8 @@ pub enum Command {
         /// Capability.
         cap: CapId,
     },
+    /// `list`
+    List,
     /// `spawn`
     Spawn {
         /// Launch profile.
@@ -196,6 +205,8 @@ pub struct Invocation {
     pub timeout: Option<Duration>,
     /// Override for `request`.
     pub approval_timeout: Option<Duration>,
+    /// Connect to this stream socket instead of `TESSERA_BROKER_FD`.
+    pub socket: Option<PathBuf>,
     /// Command.
     pub command: Command,
 }
@@ -421,6 +432,7 @@ pub fn parse(args: &[String]) -> Parse<Invocation> {
     let mut json = false;
     let mut timeout = None;
     let mut approval_timeout = None;
+    let mut socket = None;
     let mut i = 0;
     while i < args.len() && args[i].starts_with('-') {
         match args[i].as_str() {
@@ -430,8 +442,16 @@ pub fn parse(args: &[String]) -> Parse<Invocation> {
                     json,
                     timeout,
                     approval_timeout,
+                    socket,
                     command: Command::Help,
                 });
+            }
+            "--socket" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| UsageError("--socket needs a path".into()))?;
+                socket = Some(PathBuf::from(v));
             }
             flag @ ("--timeout" | "--approval-timeout") => {
                 i += 1;
@@ -571,6 +591,10 @@ pub fn parse(args: &[String]) -> Parse<Invocation> {
             o.finish()?;
             c
         }
+        "list" => {
+            Opts::new(rest, &[])?.finish()?;
+            Command::List
+        }
         "spawn" => {
             let mut o = Opts::new(rest, &[])?;
             let c = Command::Spawn {
@@ -595,6 +619,7 @@ pub fn parse(args: &[String]) -> Parse<Invocation> {
         json,
         timeout,
         approval_timeout,
+        socket,
         command,
     })
 }
@@ -809,21 +834,23 @@ fn execute(client: &Client, inv: &Invocation, io: &mut Io<'_>) -> Result<Done, E
             request_id,
         } => {
             let r = rid(*request_id)?;
-            if description.is_some() {
-                let _ = writeln!(
-                    io.stderr,
-                    "note: --description is not carried by protocol v1; the operator sees only \
-                     the broker's normalized request"
-                );
-            }
-            let _ = writeln!(
-                io.stderr,
-                "request id {} — waiting for operator approval… (the operator must approve on \
-                 the trusted approval device; this can take minutes)",
-                format_id(r)
-            );
+            let _ = writeln!(io.stderr, "request id {}", format_id(r));
             let _ = io.stderr.flush();
-            let cap = client.request_grant_with_id(r, *terms, description.as_deref())?;
+            let stderr = &mut *io.stderr;
+            let cap = client.request_grant_with_progress(
+                r,
+                *terms,
+                description.as_deref(),
+                &mut |left| {
+                    let _ = writeln!(
+                        stderr,
+                        "queued: waiting for operator approval (the operator must approve on \
+                         the trusted approval device; the request expires in {}s)",
+                        left.as_secs()
+                    );
+                    let _ = stderr.flush();
+                },
+            )?;
             Done::Text {
                 human: format!("granted capability {}\n", format_id(cap)),
                 json: json!({ "result": "granted", "cap_id": format_id(cap), "request_id": format_id(r) }),
@@ -1062,6 +1089,18 @@ fn execute(client: &Client, inv: &Invocation, io: &mut Io<'_>) -> Result<Done, E
                 json: view_json(&v),
             }
         }
+        Command::List => {
+            let caps = client.list_capabilities()?;
+            let human: String = if caps.is_empty() {
+                "no capabilities\n".into()
+            } else {
+                caps.iter().map(view_human).collect::<Vec<_>>().join("\n")
+            };
+            Done::Text {
+                human,
+                json: json!({ "result": "list", "caps": caps.iter().map(view_json).collect::<Vec<_>>() }),
+            }
+        }
         Command::Spawn {
             profile,
             request_id,
@@ -1172,7 +1211,13 @@ pub fn main_with(args: &[String], io: &mut Io<'_>) -> i32 {
         let _ = write!(io.stdout, "{USAGE}");
         return exit::OK;
     }
-    let client = match Client::from_env_with(config(&inv)) {
+    let connected = match &inv.socket {
+        Some(p) => std::os::unix::net::UnixStream::connect(p)
+            .map_err(Error::from)
+            .and_then(|s| Client::from_fd_with(s.into(), config(&inv))),
+        None => Client::from_env_with(config(&inv)),
+    };
+    let client = match connected {
         Ok(c) => c,
         Err(e) => {
             report_error(&e, inv.json, io);

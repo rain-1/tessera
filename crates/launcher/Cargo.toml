@@ -1,6 +1,7 @@
 [package]
 name = "tessera-launcher"
 version = "0.1.0"
+publish = false
 edition = "2024"
 license = "Apache-2.0"
 description = "Trusted sandbox launcher for Tessera (bubblewrap + seccomp + Landlock + cgroup v2)"

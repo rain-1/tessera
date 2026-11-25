@@ -1,6 +1,7 @@
 [package]
 name = "tessera-adapter-file"
 version = "0.1.0"
+publish = false
 edition = "2024"
 description = "Tessera trusted file adapter: registered logical file slots, bounded snapshot reads and atomic replacement"
 license = "Apache-2.0"

@@ -38,6 +38,7 @@ pub trait SandboxSpawner: Send + 'static {
 
 /// A trusted launch profile from the daemon configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileSpec {
     /// Program to run inside the sandbox.
     pub program: PathBuf,
@@ -64,6 +65,36 @@ pub struct ProfileSpec {
     pub piped_stdio: bool,
 }
 
+/// One operator baseline grant installed for a principal at creation
+/// (recorded as `InstallBaseline`, R2: separately from approved roots).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineGrant {
+    /// Scope.
+    pub scope: tessera_protocol::WireScope,
+    /// Budget.
+    pub budget: tessera_protocol::WireBudget,
+    /// Delegation depth.
+    pub depth: tessera_protocol::WireDepth,
+    /// Lifetime in ms (`None`: until revoked or the epoch ends).
+    #[serde(default)]
+    pub expiry_ms: Option<u64>,
+}
+
+/// An operator-configured profile that *agents* may name in `Spawn`
+/// (spec §9.2). Agents name it by its numeric `LaunchProfileId`; it maps to
+/// a trusted launcher profile by name. The child receives exactly the
+/// `baseline` grants listed here and nothing from its parent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSpawnProfile {
+    /// Name of a trusted launcher profile ([`ProfileSpec`]).
+    pub profile: String,
+    /// Baseline authority of every child launched from this profile.
+    #[serde(default)]
+    pub baseline: Vec<BaselineGrant>,
+}
+
 /// Hook run after each launch (e.g. a test taking the sandbox's stdio).
 pub type OnSpawn = Box<dyn FnMut(AgentId, &mut SandboxHandle) + Send>;
 
@@ -88,6 +119,13 @@ impl LauncherSpawner {
             running: HashMap::new(),
             on_spawn: None,
         })
+    }
+
+    /// Kill and remove sandbox cgroups left by an earlier broker run (spec
+    /// §11). `tesserad` calls this before serving and refuses to start on
+    /// error.
+    pub fn sweep_stale_cgroups(&self) -> Result<Vec<PathBuf>, tessera_launcher::LaunchError> {
+        self.launcher.sweep_stale_cgroups()
     }
 }
 

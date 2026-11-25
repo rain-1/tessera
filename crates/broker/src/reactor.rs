@@ -16,7 +16,7 @@
 //! agent sees any result. No step is pipelined: the next message is not
 //! looked at until the current commit returned.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroU64;
 use std::os::fd::OwnedFd;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use sha2::Digest as _;
 use tessera_approval as ap;
 use tessera_capability_core::{
     AdminCommand, AgentCommand, AgentId, AuthenticatedCommand, Budget, CapabilityId, Denial,
@@ -33,8 +34,8 @@ use tessera_capability_core::{
 };
 use tessera_journal::{Journal, JournalError, RecordKind, Storage};
 use tessera_protocol::{
-    ErrorCode, Request, Response, ServerMessage, WireCapStatus, WireCapabilityView, WireOperation,
-    WireReservationStatus,
+    ErrorCode, MAX_LIST, Request, Response, ServerMessage, WireCapStatus, WireCapabilityView,
+    WireOperation, WireReservationStatus,
 };
 
 use crate::admin::{
@@ -47,7 +48,7 @@ use crate::conn::{self, ChannelHandle, error};
 use crate::convert::{self as cv, hex};
 use crate::entry::{Binding, BindingResult, EndpointSpec, Entry, FileIdentityRec, FileSlotRec};
 use crate::executor::{DispatchJob, ExecResult, Executor, JobOperation, MAX_INLINE_CONTENT};
-use crate::spawner::{SandboxSpawner, SpawnerMsg, SpawnerThread};
+use crate::spawner::{AgentSpawnProfile, BaselineGrant, SandboxSpawner, SpawnerMsg, SpawnerThread};
 
 /// Points at which a test can kill the reactor (simulated crash).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,6 +97,28 @@ pub struct BrokerConfig {
     pub dispatch_workers: usize,
     /// Endpoints from the daemon configuration `(id, spec, secret header)`.
     pub endpoints: Vec<crate::entry::ConfiguredEndpoint>,
+    /// Profiles agents may name in `Spawn`, by `LaunchProfileId` (§9.2).
+    /// Empty: agent-initiated spawn is denied (`InvalidProfile`).
+    pub spawn_profiles: BTreeMap<u64, AgentSpawnProfile>,
+    /// Children one principal may spawn per epoch (terminated ones count).
+    pub max_children_per_agent: u32,
+    /// Spawn generations below an operator-created principal (which is at
+    /// depth 0); a principal at this depth may not spawn.
+    pub max_spawn_depth: u32,
+    /// Principals per orchestration domain (an operator-created principal
+    /// and everything spawned under it), including terminated ones.
+    pub max_domain_agents: u32,
+    /// Requests per principal forwarded to the writer and not yet finally
+    /// answered.
+    pub max_in_flight_per_agent: usize,
+    /// Sustained requests per second per principal.
+    pub agent_rate_per_sec: u32,
+    /// Burst size of the per-principal rate limit.
+    pub agent_rate_burst: u32,
+    /// Final denials remembered per principal (request-id consistency for
+    /// denied/timed-out grants and failed spawns). When full, new grant and
+    /// spawn requests from that principal are refused with `RateLimited`.
+    pub max_denied_bindings_per_agent: usize,
 }
 
 impl std::fmt::Debug for BrokerConfig {
@@ -121,6 +144,14 @@ impl Default for BrokerConfig {
             agent_max_frame: 128 * 1024,
             dispatch_workers: 4,
             endpoints: Vec::new(),
+            spawn_profiles: BTreeMap::new(),
+            max_children_per_agent: 8,
+            max_spawn_depth: 2,
+            max_domain_agents: 16,
+            max_in_flight_per_agent: 64,
+            agent_rate_per_sec: 100,
+            agent_rate_burst: 200,
+            max_denied_bindings_per_agent: 1024,
         }
     }
 }
@@ -150,6 +181,8 @@ pub enum StopReason {
     JournalFailure(String),
     /// Journaled command could not be applied (core/journal disagree).
     Inconsistent(String),
+    /// The audit log could not be written or synced: fail closed.
+    AuditFailure(String),
 }
 
 /// Startup failure.
@@ -202,13 +235,41 @@ pub(crate) enum Inbox {
     SpawnDone {
         agent: AgentId,
         result: Result<OwnedFd, String>,
-        reply: Sender<AdminResponse>,
+        origin: SpawnOrigin,
     },
     DispatchDone {
         reservation: ReservationId,
         result: ExecResult,
     },
     Shutdown,
+}
+
+/// Who asked for a sandbox launch.
+pub(crate) enum SpawnOrigin {
+    /// The operator (`CreatePrincipal`).
+    Admin(Sender<AdminResponse>),
+    /// An agent's `Spawn` request.
+    Agent {
+        parent: AgentId,
+        request_id: RequestId,
+    },
+}
+
+/// A child sandbox being launched for an agent's `Spawn`.
+struct SpawnWait {
+    child: AgentId,
+    digest: [u8; 32],
+    correlations: Vec<u64>,
+}
+
+/// Position of a principal in its orchestration domain (§9.2). In memory
+/// only: every restart ends the epoch and terminates every principal.
+#[derive(Debug, Clone)]
+struct OrchNode {
+    parent: Option<AgentId>,
+    domain: AgentId,
+    depth: u32,
+    children: Vec<AgentId>,
 }
 
 struct PendingGrant {
@@ -221,12 +282,23 @@ struct PendingGrant {
     request_id: RequestId,
     digest: [u8; 32],
     request: ap::GrantRequest,
+    /// Agent's untrusted description (shown escaped, labelled UNTRUSTED).
+    description: Option<String>,
 }
 
 impl PendingGrant {
     fn correlations(&self) -> impl Iterator<Item = u64> + '_ {
         std::iter::once(self.correlation).chain(self.waiters.iter().copied())
     }
+}
+
+/// The terms of a `RequestGrant`.
+struct GrantAsk {
+    scope: tessera_protocol::WireScope,
+    budget: tessera_protocol::WireBudget,
+    depth: tessera_protocol::WireDepth,
+    expiry: tessera_protocol::WireExpiry,
+    description: Option<String>,
 }
 
 struct PendingDispatch {
@@ -242,6 +314,7 @@ enum Stop {
     Killed(FaultPoint),
     Journal(String),
     Inconsistent(String),
+    Audit(String),
     Shutdown,
 }
 
@@ -273,6 +346,12 @@ pub(crate) struct Reactor<S: Storage> {
     inbox_tx: SyncSender<Inbox>,
     jobs: Option<Sender<DispatchJob>>,
     spawner: Option<SpawnerThread>,
+    orch: HashMap<AgentId, OrchNode>,
+    domain_size: HashMap<AgentId, u32>,
+    spawned: HashMap<AgentId, u32>,
+    spawning: HashMap<(AgentId, RequestId), SpawnWait>,
+    denied: HashMap<AgentId, usize>,
+    audit_failed: Option<String>,
 }
 
 fn journal_err(e: JournalError) -> Stop {
@@ -426,6 +505,12 @@ impl<S: Storage> Reactor<S> {
             next_ticket: 1,
             inbox_tx,
             jobs: None,
+            orch: HashMap::new(),
+            domain_size: HashMap::new(),
+            spawned: HashMap::new(),
+            spawning: HashMap::new(),
+            denied: HashMap::new(),
+            audit_failed: None,
         };
         r.record(AuditEvent {
             principal: "broker".into(),
@@ -576,6 +661,9 @@ impl<S: Storage> Reactor<S> {
             if let Err(stop) = r {
                 break stop;
             }
+            if let Some(e) = self.audit_failed.take() {
+                break Stop::Audit(e);
+            }
         };
         // Whatever the reason: release nothing more, close every channel.
         self.jobs = None;
@@ -591,6 +679,10 @@ impl<S: Storage> Reactor<S> {
             Stop::Inconsistent(e) => {
                 eprintln!("tessera-broker: inconsistency, failing closed: {e}");
                 StopReason::Inconsistent(e)
+            }
+            Stop::Audit(e) => {
+                eprintln!("tessera-broker: audit log failure, failing closed: {e}");
+                StopReason::AuditFailure(e)
             }
         }
     }
@@ -629,8 +721,8 @@ impl<S: Storage> Reactor<S> {
             Inbox::SpawnDone {
                 agent,
                 result,
-                reply,
-            } => self.on_spawned(agent, result, reply),
+                origin,
+            } => self.on_spawned(agent, result, origin),
             Inbox::DispatchDone {
                 reservation,
                 result,
@@ -698,7 +790,11 @@ impl<S: Storage> Reactor<S> {
     }
 
     fn record(&mut self, ev: AuditEvent) {
-        self.audit.record(ev);
+        if let Err(e) = self.audit.record(ev) {
+            // Checked by the main loop after the current message: the
+            // broker stops (fail closed).
+            self.audit_failed.get_or_insert(e.to_string());
+        }
     }
 
     fn audit_error(&mut self, kind: &str, detail: &str) {
@@ -732,6 +828,9 @@ impl<S: Storage> Reactor<S> {
 
     fn reply(&self, agent: AgentId, correlation: u64, response: Response) {
         if let Some(ch) = self.channels.get(&agent) {
+            if !matches!(response, Response::GrantPending { .. }) {
+                ch.finished_one();
+            }
             ch.send(ServerMessage {
                 correlation_id: correlation,
                 response,
@@ -798,6 +897,15 @@ impl<S: Storage> Reactor<S> {
             },
             BindingResult::Dropped(_) => Response::Dropped { request_id },
             BindingResult::Revoked(_) => Response::Revoked { request_id },
+            BindingResult::Spawned(a) => Response::Spawned {
+                request_id,
+                agent: cv::agent_to_wire(a),
+            },
+            BindingResult::Denied(code) => error(
+                Some(request_id),
+                code,
+                "request id already answered with this denial",
+            ),
         }
     }
 
@@ -815,6 +923,26 @@ impl<S: Storage> Reactor<S> {
 
     fn on_agent(&mut self, agent: AgentId, corr: u64, request: Request, digest: [u8; 32]) -> Flow {
         let kind = request_kind(&request);
+        // A spawn still launching under this id: attach (one sandbox).
+        if let Some(rid) = request.request_id() {
+            let rid = RequestId::from_raw(rid);
+            if let Some(w) = self.spawning.get_mut(&(agent, rid)) {
+                if w.digest == digest && w.correlations.len() < 16 {
+                    w.correlations.push(corr);
+                    return Ok(());
+                }
+                let (code, why) = if w.digest == digest {
+                    (
+                        ErrorCode::RateLimited,
+                        "too many retries of a pending spawn",
+                    )
+                } else {
+                    (ErrorCode::RequestIdConflict, "RequestIdConflict")
+                };
+                self.deny_agent(agent, corr, kind, Some(rid), Some(digest), None, code, why);
+                return Ok(());
+            }
+        }
         // Request-id binding (ADR-0012): same id + same content returns the
         // earlier result without any new effect; different content is
         // denied. Checked before anything else.
@@ -855,16 +983,20 @@ impl<S: Storage> Reactor<S> {
                 budget,
                 depth,
                 expiry,
+                untrusted_description,
             } => {
                 self.on_request_grant(
                     agent,
                     corr,
                     RequestId::from_raw(request_id),
                     digest,
-                    requested_scope,
-                    budget,
-                    depth,
-                    expiry,
+                    GrantAsk {
+                        scope: requested_scope,
+                        budget,
+                        depth,
+                        expiry,
+                        description: untrusted_description.map(|d| d.into_inner()),
+                    },
                 );
                 Ok(())
             }
@@ -1032,34 +1164,14 @@ impl<S: Storage> Reactor<S> {
             }
             Request::Inspect { cap_id } => {
                 let cap = CapabilityId::from_raw(cap_id);
-                let now = self.clock.now();
                 match self.state.capability(cap) {
                     Some(c) if c.owner() == agent => {
-                        let status = match self.state.live(cap, now) {
-                            Ok(_) => WireCapStatus::Live,
-                            Err(n) => match cv::denial_code(Denial::NotLive(n)) {
-                                ErrorCode::Expired => WireCapStatus::Expired,
-                                _ if c.status() == tessera_capability_core::Status::Dropped => {
-                                    WireCapStatus::Dropped
-                                }
-                                _ => WireCapStatus::Revoked,
-                            },
+                        let view = self.wire_view(cap);
+                        let resp = match view {
+                            Some(v) => Response::Inspected(v),
+                            None => error(None, ErrorCode::Internal, "no view"),
                         };
-                        let view = WireCapabilityView {
-                            cap_id: cap.to_raw(),
-                            root_id: c.root().to_raw(),
-                            parent: c.parent().map(|p| p.to_raw()),
-                            owner: cv::agent_to_wire(c.owner()),
-                            scope: cv::scope_to_wire(&c.scope()),
-                            budget_remaining: cv::budget_to_wire(c.budget()),
-                            depth: cv::depth_to_wire(c.depth()),
-                            expires_in_millis: match c.expiry() {
-                                Expiry::Never => None,
-                                Expiry::At(t) => Some(t.to_raw().saturating_sub(now.to_raw())),
-                            },
-                            status,
-                        };
-                        self.reply(agent, corr, Response::Inspected(view));
+                        self.reply(agent, corr, resp);
                     }
                     _ => self.deny_agent(
                         agent,
@@ -1074,20 +1186,71 @@ impl<S: Storage> Reactor<S> {
                 }
                 Ok(())
             }
-            Request::Spawn { request_id, .. } => {
-                self.deny_agent(
-                    agent,
-                    corr,
-                    kind,
-                    Some(RequestId::from_raw(request_id)),
-                    Some(digest),
-                    None,
-                    ErrorCode::InvalidProfile,
-                    "agent-initiated spawn is not enabled in the MVP",
-                );
+            Request::ListCapabilities { after } => {
+                // Only the caller's own capabilities, in id order (§9.2:
+                // inspection is limited to the authenticated owner).
+                let mut ids: Vec<CapabilityId> = self
+                    .state
+                    .capabilities()
+                    .filter(|c| c.owner() == agent)
+                    .map(|c| c.id())
+                    .filter(|id| after.is_none_or(|a| id.to_raw() > a))
+                    .collect();
+                ids.sort_unstable_by_key(|i| i.to_raw());
+                let more = ids.len() > MAX_LIST;
+                let caps: Vec<WireCapabilityView> = ids
+                    .into_iter()
+                    .take(MAX_LIST)
+                    .filter_map(|i| self.wire_view(i))
+                    .collect();
+                let resp = match tessera_protocol::bounded::BoundedVec::new(caps) {
+                    Ok(caps) => Response::Capabilities { caps, more },
+                    Err(_) => error(None, ErrorCode::Internal, "list bound"),
+                };
+                self.reply(agent, corr, resp);
                 Ok(())
             }
+            Request::Spawn {
+                request_id,
+                launch_profile,
+            } => self.on_spawn(
+                agent,
+                corr,
+                RequestId::from_raw(request_id),
+                digest,
+                launch_profile,
+            ),
         }
+    }
+
+    /// Owner-visible metadata of one capability.
+    fn wire_view(&self, cap: CapabilityId) -> Option<WireCapabilityView> {
+        let c = self.state.capability(cap)?;
+        let now = self.clock.now();
+        let status = match self.state.live(cap, now) {
+            Ok(_) => WireCapStatus::Live,
+            Err(n) => match cv::denial_code(Denial::NotLive(n)) {
+                ErrorCode::Expired => WireCapStatus::Expired,
+                _ if c.status() == tessera_capability_core::Status::Dropped => {
+                    WireCapStatus::Dropped
+                }
+                _ => WireCapStatus::Revoked,
+            },
+        };
+        Some(WireCapabilityView {
+            cap_id: cap.to_raw(),
+            root_id: c.root().to_raw(),
+            parent: c.parent().map(|p| p.to_raw()),
+            owner: cv::agent_to_wire(c.owner()),
+            scope: cv::scope_to_wire(&c.scope()),
+            budget_remaining: cv::budget_to_wire(c.budget()),
+            depth: cv::depth_to_wire(c.depth()),
+            expires_in_millis: match c.expiry() {
+                Expiry::Never => None,
+                Expiry::At(t) => Some(t.to_raw().saturating_sub(now.to_raw())),
+            },
+            status,
+        })
     }
 
     /// Build child / attenuated terms; `None` if the caller does not own
@@ -1455,19 +1618,53 @@ impl<S: Storage> Reactor<S> {
     // Grant requests and approvals
     // ------------------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
+    /// Remember a final denial of `(agent, rid)` so that a repeat of the id
+    /// gets the same answer (in memory, bounded per principal). Transient
+    /// refusals (rate limits, unavailability) and conflicts are not bound:
+    /// nothing was decided, so a retry with the same id is a fresh attempt.
+    fn bind_denied(&mut self, agent: AgentId, rid: RequestId, digest: [u8; 32], code: ErrorCode) {
+        if matches!(
+            code,
+            ErrorCode::RateLimited
+                | ErrorCode::Unavailable
+                | ErrorCode::Internal
+                | ErrorCode::RequestIdConflict
+        ) || self.bindings.contains_key(&(agent, rid))
+        {
+            return;
+        }
+        let n = self.denied.entry(agent).or_insert(0);
+        if *n >= self.cfg.max_denied_bindings_per_agent {
+            return;
+        }
+        *n += 1;
+        self.bindings
+            .insert((agent, rid), (digest, BindingResult::Denied(code)));
+    }
+
+    /// Whether `agent` may make another request that can end in a bound
+    /// denial (otherwise its denial table is full).
+    fn denial_room(&self, agent: AgentId) -> bool {
+        self.denied.get(&agent).copied().unwrap_or(0) < self.cfg.max_denied_bindings_per_agent
+    }
+
     fn on_request_grant(
         &mut self,
         agent: AgentId,
         corr: u64,
         rid: RequestId,
         digest: [u8; 32],
-        scope: tessera_protocol::WireScope,
-        budget: tessera_protocol::WireBudget,
-        depth: tessera_protocol::WireDepth,
-        expiry: tessera_protocol::WireExpiry,
+        ask: GrantAsk,
     ) {
+        let GrantAsk {
+            scope,
+            budget,
+            depth,
+            expiry,
+            description,
+        } = ask;
         let deny = |s: &mut Self, code, why: &str| {
+            s.bind_denied(agent, rid, digest, code);
             s.deny_agent(
                 agent,
                 corr,
@@ -1492,12 +1689,34 @@ impl<S: Storage> Reactor<S> {
             }
             if p.waiters.len() < 16 {
                 p.waiters.push(corr);
+                // Status answer: still waiting for the operator.
+                let left = p
+                    .request
+                    .fields()
+                    .request_expires_at
+                    .0
+                    .saturating_sub(self.clock.now().to_raw());
+                self.reply(
+                    agent,
+                    corr,
+                    Response::GrantPending {
+                        request_id: rid.to_raw(),
+                        expires_in_millis: left,
+                    },
+                );
                 return;
             }
             return deny(
                 self,
                 ErrorCode::RateLimited,
                 "too many retries of a pending request",
+            );
+        }
+        if !self.denial_room(agent) {
+            return deny(
+                self,
+                ErrorCode::RateLimited,
+                "too many denied requests remembered for this principal",
             );
         }
         let (Some(enrollment), true) = (self.enrollment.clone(), self.session.is_some()) else {
@@ -1566,6 +1785,16 @@ impl<S: Storage> Reactor<S> {
         }
         let ticket = self.next_ticket;
         self.next_ticket += 1;
+        // The description is untrusted agent text: audited by length and
+        // digest only, never verbatim.
+        let desc_audit = match &description {
+            Some(d) => format!(
+                " untrusted_description_len={} untrusted_description_sha256={}",
+                d.len(),
+                hex(&sha2::Sha256::digest(d.as_bytes()))
+            ),
+            None => String::new(),
+        };
         let ev = AuditEvent {
             principal: agent_str(agent),
             kind: "request-grant".into(),
@@ -1575,12 +1804,22 @@ impl<S: Storage> Reactor<S> {
             budget_after: Some(cv::budget_summary(core_budget)),
             outcome: "pending-approval".into(),
             detail: Some(format!(
-                "ticket={ticket} approval_digest={}",
+                "ticket={ticket} approval_digest={}{desc_audit}",
                 hex(&request.digest().0)
             )),
             ..self.ev()
         };
         self.record(ev);
+        // Interim answer before any final one (the final answer may follow
+        // immediately if activation fails).
+        self.reply(
+            agent,
+            corr,
+            Response::GrantPending {
+                request_id: rid.to_raw(),
+                expires_in_millis: req_exp.saturating_sub(now.to_raw()),
+            },
+        );
         self.queue.push_back(PendingGrant {
             ticket,
             agent,
@@ -1589,6 +1828,7 @@ impl<S: Storage> Reactor<S> {
             request_id: rid,
             digest,
             request,
+            description,
         });
         self.activate_next();
     }
@@ -1614,6 +1854,7 @@ impl<S: Storage> Reactor<S> {
     }
 
     fn fail_grant(&mut self, pg: PendingGrant, code: ErrorCode, why: &str) {
+        self.bind_denied(pg.agent, pg.request_id, pg.digest, code);
         self.deny_agent(
             pg.agent,
             pg.correlation,
@@ -1789,7 +2030,12 @@ impl<S: Storage> Reactor<S> {
             conn,
             fd,
             self.inbox_tx.clone(),
-            self.cfg.agent_max_frame,
+            conn::ChannelLimits {
+                max_frame: self.cfg.agent_max_frame,
+                max_in_flight: self.cfg.max_in_flight_per_agent.max(1),
+                rate_per_sec: self.cfg.agent_rate_per_sec,
+                burst: self.cfg.agent_rate_burst,
+            },
         )
         .map_err(|e| e.to_string())?;
         self.channels.insert(agent, h);
@@ -1804,21 +2050,63 @@ impl<S: Storage> Reactor<S> {
         Ok(())
     }
 
-    fn create_principal(&mut self) -> Result<Result<AgentId, String>, Stop> {
+    /// Create a principal. `parent`: the spawning agent and the binding of
+    /// its `Spawn` request (journaled in the same record); `None` for an
+    /// operator-created principal, which roots its own orchestration domain.
+    fn create_principal(
+        &mut self,
+        parent: Option<(AgentId, Binding)>,
+    ) -> Result<Result<AgentId, String>, Stop> {
         match self.commit(
             AuthenticatedCommand::operator(AdminCommand::CreatePrincipal),
-            None,
+            parent.map(|(_, b)| b),
             None,
         )? {
             Ok((tessera_capability_core::Effect::PrincipalCreated { agent }, jseq)) => {
+                let node = match parent.and_then(|(p, _)| self.orch.get(&p).map(|n| (p, n))) {
+                    Some((p, n)) => OrchNode {
+                        parent: Some(p),
+                        domain: n.domain,
+                        depth: n.depth + 1,
+                        children: Vec::new(),
+                    },
+                    None => OrchNode {
+                        parent: None,
+                        domain: agent,
+                        depth: 0,
+                        children: Vec::new(),
+                    },
+                };
+                if let Some(p) = node.parent {
+                    if let Some(pn) = self.orch.get_mut(&p) {
+                        pn.children.push(agent);
+                    }
+                    *self.spawned.entry(p).or_insert(0) += 1;
+                }
+                *self.domain_size.entry(node.domain).or_insert(0) += 1;
                 let ev = AuditEvent {
-                    principal: "operator".into(),
-                    kind: "create-principal".into(),
+                    principal: match node.parent {
+                        Some(p) => agent_str(p),
+                        None => "operator".into(),
+                    },
+                    kind: if node.parent.is_some() {
+                        "spawn-principal".into()
+                    } else {
+                        "create-principal".into()
+                    },
                     journal_seq: Some(jseq),
+                    request_id: parent.map(|(_, b)| format!("{:x}", b.request_id.to_raw())),
+                    request_digest: parent.map(|(_, b)| hex(&b.digest)),
                     outcome: "ok".into(),
-                    detail: Some(agent_str(agent)),
+                    detail: Some(format!(
+                        "{} domain={} depth={}",
+                        agent_str(agent),
+                        agent_str(node.domain),
+                        node.depth
+                    )),
                     ..self.ev()
                 };
+                self.orch.insert(agent, node);
                 self.record(ev);
                 Ok(Ok(agent))
             }
@@ -1828,7 +2116,7 @@ impl<S: Storage> Reactor<S> {
     }
 
     fn attach_in_process(&mut self) -> Result<Result<(AgentId, OwnedFd), String>, Stop> {
-        let agent = match self.create_principal()? {
+        let agent = match self.create_principal(None)? {
             Ok(a) => a,
             Err(e) => return Ok(Err(e)),
         };
@@ -1851,24 +2139,238 @@ impl<S: Storage> Reactor<S> {
         &mut self,
         agent: AgentId,
         result: Result<OwnedFd, String>,
-        reply: Sender<AdminResponse>,
+        origin: SpawnOrigin,
     ) -> Flow {
-        let resp = match result {
+        let attached: Result<(), String> = match result {
             Ok(fd) if self.state.is_active(agent) => match self.attach_channel(agent, fd) {
-                Ok(()) => AdminResponse::Agent(agent),
+                Ok(()) => Ok(()),
                 Err(e) => {
                     let _ = self.terminate(agent, "attach failed")?;
-                    AdminResponse::Error(e)
+                    Err(e)
                 }
             },
-            Ok(_) => AdminResponse::Error("principal no longer active".into()),
+            Ok(_) => Err("principal no longer active".into()),
             Err(e) => {
                 let _ = self.terminate(agent, "spawn failed")?;
-                AdminResponse::Error(format!("spawn failed: {e}"))
+                Err(format!("spawn failed: {e}"))
             }
         };
-        let _ = reply.send(resp);
+        match origin {
+            SpawnOrigin::Admin(reply) => {
+                let _ = reply.send(match attached {
+                    Ok(()) => AdminResponse::Agent(agent),
+                    Err(e) => AdminResponse::Error(e),
+                });
+            }
+            SpawnOrigin::Agent { parent, request_id } => {
+                let Some(w) = self.spawning.remove(&(parent, request_id)) else {
+                    return Ok(());
+                };
+                let rid = request_id.to_raw();
+                let resp = match &attached {
+                    Ok(()) => Response::Spawned {
+                        request_id: rid,
+                        agent: cv::agent_to_wire(agent),
+                    },
+                    Err(_) => {
+                        // A repeat of the id gets this same failure, never a
+                        // second launch.
+                        self.bindings.remove(&(parent, request_id));
+                        self.bind_denied(parent, request_id, w.digest, ErrorCode::InvalidProfile);
+                        error(
+                            Some(rid),
+                            ErrorCode::InvalidProfile,
+                            "sandbox launch failed",
+                        )
+                    }
+                };
+                let ev = AuditEvent {
+                    principal: agent_str(parent),
+                    kind: "spawn".into(),
+                    request_id: Some(format!("{rid:x}")),
+                    request_digest: Some(hex(&w.digest)),
+                    outcome: match &attached {
+                        Ok(()) => "ok".into(),
+                        Err(e) => format!("error:{e}"),
+                    },
+                    detail: Some(format!("child={}", agent_str(w.child))),
+                    ..self.ev()
+                };
+                self.record(ev);
+                for c in w.correlations {
+                    self.reply(parent, c, resp.clone());
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Agent `Spawn` (§9.2): only operator-configured agent profiles, only
+    /// inside the requester's orchestration domain, within quotas; the
+    /// child gets the profile's baseline grants and nothing else. The child
+    /// principal and the request-id binding are one journal record, so a
+    /// repeated id never launches a second sandbox.
+    fn on_spawn(
+        &mut self,
+        agent: AgentId,
+        corr: u64,
+        rid: RequestId,
+        digest: [u8; 32],
+        profile_id: u64,
+    ) -> Flow {
+        let deny = |s: &mut Self, code: ErrorCode, why: &str| {
+            s.bind_denied(agent, rid, digest, code);
+            s.deny_agent(
+                agent,
+                corr,
+                "spawn",
+                Some(rid),
+                Some(digest),
+                None,
+                code,
+                why,
+            );
+            Ok(())
+        };
+        let Some(profile) = self.cfg.spawn_profiles.get(&profile_id).cloned() else {
+            return deny(
+                self,
+                ErrorCode::InvalidProfile,
+                "launch profile unknown or not agent-spawnable",
+            );
+        };
+        if self.spawner.is_none() {
+            return deny(
+                self,
+                ErrorCode::Unavailable,
+                "no sandbox launcher configured",
+            );
+        }
+        if !self.denial_room(agent) {
+            return deny(
+                self,
+                ErrorCode::RateLimited,
+                "too many denied requests remembered for this principal",
+            );
+        }
+        let Some(node) = self.orch.get(&agent).cloned() else {
+            return deny(
+                self,
+                ErrorCode::PermissionDenied,
+                "caller has no orchestration domain",
+            );
+        };
+        if node.depth >= self.cfg.max_spawn_depth {
+            return deny(self, ErrorCode::PermissionDenied, "spawn depth limit");
+        }
+        if self.spawned.get(&agent).copied().unwrap_or(0) >= self.cfg.max_children_per_agent {
+            return deny(
+                self,
+                ErrorCode::RateLimited,
+                "spawn quota: children per principal",
+            );
+        }
+        if self.domain_size.get(&node.domain).copied().unwrap_or(0) >= self.cfg.max_domain_agents {
+            return deny(
+                self,
+                ErrorCode::RateLimited,
+                "spawn quota: orchestration domain",
+            );
+        }
+        let binding = Binding {
+            agent,
+            request_id: rid,
+            digest,
+        };
+        let child = match self.create_principal(Some((agent, binding)))? {
+            Ok(c) => c,
+            Err(e) => return deny(self, ErrorCode::Internal, &e),
+        };
+        for g in &profile.baseline {
+            if let Err(e) = self.install_baseline(child, g)? {
+                let _ = self.terminate(child, "baseline grant failed")?;
+                self.bindings.remove(&(agent, rid));
+                return deny(self, ErrorCode::InvalidProfile, &format!("baseline: {e}"));
+            }
+        }
+        self.spawning.insert(
+            (agent, rid),
+            SpawnWait {
+                child,
+                digest,
+                correlations: vec![corr],
+            },
+        );
+        let tx = self.inbox_tx.clone();
+        if let Some(sp) = &self.spawner {
+            sp.send(SpawnerMsg::Spawn {
+                agent: child,
+                profile: profile.profile.clone(),
+                done: Box::new(move |result| {
+                    let _ = tx.send(Inbox::SpawnDone {
+                        agent: child,
+                        result,
+                        origin: SpawnOrigin::Agent {
+                            parent: agent,
+                            request_id: rid,
+                        },
+                    });
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    /// Install one operator baseline grant (R2: recorded as such).
+    fn install_baseline(
+        &mut self,
+        agent: AgentId,
+        g: &BaselineGrant,
+    ) -> Result<Result<CapabilityId, String>, Stop> {
+        let Some(scope) = cv::scope_from_wire(&g.scope) else {
+            return Ok(Err("empty scope".into()));
+        };
+        let now = self.clock.now();
+        let expiry = match g.expiry_ms {
+            None => Expiry::Never,
+            Some(ms) => match now.to_raw().checked_add(ms) {
+                Some(t) => Expiry::At(Tick::from_raw(t)),
+                None => return Ok(Err("expiry overflow".into())),
+            },
+        };
+        let terms = tessera_capability_core::Terms {
+            scope,
+            budget: cv::budget_from_wire(g.budget),
+            depth: cv::depth_from_wire(g.depth),
+            expiry,
+        };
+        Ok(
+            match self.commit(
+                AuthenticatedCommand::operator(AdminCommand::InstallBaseline {
+                    recipient: agent,
+                    terms,
+                }),
+                None,
+                None,
+            )? {
+                Ok((tessera_capability_core::Effect::RootCreated { capability, .. }, j)) => {
+                    let mut ev = AuditEvent {
+                        principal: "operator".into(),
+                        kind: "install-baseline".into(),
+                        journal_seq: Some(j),
+                        outcome: "ok".into(),
+                        budget_after: self.budget_of(capability),
+                        detail: Some(format!("recipient={}", agent_str(agent))),
+                        ..self.ev()
+                    };
+                    self.cap_audit(&mut ev, capability);
+                    self.record(ev);
+                    Ok(capability)
+                }
+                Ok(_) => Err("unexpected effect".into()),
+                Err(d) => Err(format!("denied: {d:?}")),
+            },
+        )
     }
 
     /// Terminate a principal: journal, close channel, stop sandbox, fail its
@@ -1896,6 +2398,9 @@ impl<S: Storage> Reactor<S> {
             self.reset_session();
         }
         self.queue.retain(|p| p.agent != agent);
+        // Pending spawns of this principal: their children are in `children`
+        // already and are terminated below; drop the waiters.
+        self.spawning.retain(|(p, _), _| *p != agent);
         let ev = AuditEvent {
             principal: agent_str(agent),
             kind: "terminate-principal".into(),
@@ -1908,6 +2413,21 @@ impl<S: Storage> Reactor<S> {
             ..self.ev()
         };
         self.record(ev);
+        // Principals this one spawned go with it (their sandboxes are
+        // killed as well): an orchestration domain never outlives the
+        // principal that created it.
+        let children = self
+            .orch
+            .get(&agent)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        for c in children {
+            if self.state.principal(c) == Some(PrincipalStatus::Active)
+                || self.channels.contains_key(&c)
+            {
+                let _ = self.terminate(c, &format!("parent {} terminated", agent_str(agent)))?;
+            }
+        }
         Ok(r.map(|_| ()))
     }
 
@@ -2068,7 +2588,7 @@ impl<S: Storage> Reactor<S> {
                 if self.spawner.is_none() {
                     AdminResponse::Error("no sandbox launcher configured".into())
                 } else {
-                    let agent = match self.create_principal()? {
+                    let agent = match self.create_principal(None)? {
                         Ok(a) => a,
                         Err(e) => return Ok(Some(AdminResponse::Error(e))),
                     };
@@ -2082,7 +2602,7 @@ impl<S: Storage> Reactor<S> {
                                 let _ = tx.send(Inbox::SpawnDone {
                                     agent,
                                     result,
-                                    reply,
+                                    origin: SpawnOrigin::Admin(reply),
                                 });
                             }),
                         });
@@ -2117,49 +2637,18 @@ impl<S: Storage> Reactor<S> {
                 budget,
                 depth,
                 expiry_ms,
-            } => {
-                let Some(scope) = cv::scope_from_wire(&scope) else {
-                    return Ok(Some(AdminResponse::Error("empty scope".into())));
-                };
-                let expiry = match expiry_ms {
-                    None => Expiry::Never,
-                    Some(ms) => match now.to_raw().checked_add(ms) {
-                        Some(t) => Expiry::At(Tick::from_raw(t)),
-                        None => return Ok(Some(AdminResponse::Error("expiry overflow".into()))),
-                    },
-                };
-                let terms = tessera_capability_core::Terms {
+            } => match self.install_baseline(
+                agent,
+                &BaselineGrant {
                     scope,
-                    budget: cv::budget_from_wire(budget),
-                    depth: cv::depth_from_wire(depth),
-                    expiry,
-                };
-                match self.commit(
-                    AuthenticatedCommand::operator(AdminCommand::InstallBaseline {
-                        recipient: agent,
-                        terms,
-                    }),
-                    None,
-                    None,
-                )? {
-                    Ok((tessera_capability_core::Effect::RootCreated { capability, .. }, j)) => {
-                        let mut ev = AuditEvent {
-                            principal: "operator".into(),
-                            kind: "install-baseline".into(),
-                            journal_seq: Some(j),
-                            outcome: "ok".into(),
-                            budget_after: self.budget_of(capability),
-                            detail: Some(format!("recipient={}", agent_str(agent))),
-                            ..self.ev()
-                        };
-                        self.cap_audit(&mut ev, capability);
-                        self.record(ev);
-                        AdminResponse::Capability(capability.to_raw())
-                    }
-                    Ok(_) => AdminResponse::Error("unexpected effect".into()),
-                    Err(d) => AdminResponse::Error(format!("denied: {d:?}")),
-                }
-            }
+                    budget,
+                    depth,
+                    expiry_ms,
+                },
+            )? {
+                Ok(c) => AdminResponse::Capability(c.to_raw()),
+                Err(e) => AdminResponse::Error(e),
+            },
             AdminRequest::ListPending => AdminResponse::Pending(self.pending_views()),
             AdminRequest::Narrow { ticket, request } => {
                 if !self.active_ticket(ticket) {
@@ -2331,6 +2820,13 @@ impl<S: Storage> Reactor<S> {
                     head: hex(&cp.hash),
                 }
             }
+            AdminRequest::AuditCheckpoint => match self.audit.checkpoint() {
+                Some(cp) => AdminResponse::AuditCheckpoint {
+                    seq: cp.seq,
+                    hash: hex(&cp.hash),
+                },
+                None => AdminResponse::Error("audit log is empty".into()),
+            },
         }))
     }
 
@@ -2346,8 +2842,14 @@ impl<S: Storage> Reactor<S> {
         if self.journal.current_epoch() != self.state.epoch() {
             return Err(Stop::Inconsistent("journal/ledger epoch mismatch".into()));
         }
-        let agents: Vec<AgentId> = self.channels.keys().copied().collect();
+        let mut agents: Vec<AgentId> = self.channels.keys().copied().collect();
+        agents.extend(self.spawning.values().map(|w| w.child));
         self.channels.clear();
+        self.spawning.clear();
+        self.orch.clear();
+        self.domain_size.clear();
+        self.spawned.clear();
+        self.denied.clear();
         if let Some(sp) = &self.spawner {
             for a in agents {
                 sp.send(SpawnerMsg::Stop(a));
@@ -2386,8 +2888,9 @@ impl<S: Storage> Reactor<S> {
                 ticket: pg.ticket,
                 agent: pg.agent,
                 active: true,
-                rendered: ap::render_request(&cur, None, &ctx),
+                rendered: ap::render_request(&cur, pg.description.as_deref(), &ctx),
                 request: cur.encode(),
+                untrusted_description: pg.description.clone(),
             });
         }
         for pg in &self.queue {
@@ -2395,8 +2898,9 @@ impl<S: Storage> Reactor<S> {
                 ticket: pg.ticket,
                 agent: pg.agent,
                 active: false,
-                rendered: ap::render_request(&pg.request, None, &ctx),
+                rendered: ap::render_request(&pg.request, pg.description.as_deref(), &ctx),
                 request: pg.request.encode(),
+                untrusted_description: pg.description.clone(),
             });
         }
         v
@@ -2492,6 +2996,7 @@ fn request_kind(r: &Request) -> &'static str {
         Request::Transfer { .. } => "transfer",
         Request::Drop { .. } => "drop",
         Request::Inspect { .. } => "inspect",
+        Request::ListCapabilities { .. } => "list-capabilities",
         Request::Spawn { .. } => "spawn",
         Request::Revoke { .. } => "revoke",
     }

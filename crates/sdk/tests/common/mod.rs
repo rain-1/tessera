@@ -36,6 +36,8 @@ pub enum Reply {
     Raw(Vec<u8>),
     /// Close the channel.
     Close,
+    /// Pause before the next reply.
+    Sleep(std::time::Duration),
 }
 
 pub type Log = Arc<Mutex<Vec<Received>>>;
@@ -114,6 +116,10 @@ where
                     Reply::Message(m) => encode_server(&m).unwrap(),
                     Reply::Raw(b) => b,
                     Reply::Close => return,
+                    Reply::Sleep(d) => {
+                        std::thread::sleep(d);
+                        continue;
+                    }
                 };
                 if !send_raw(&server, kind, &bytes) {
                     return;

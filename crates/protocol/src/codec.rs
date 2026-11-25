@@ -24,7 +24,12 @@ use crate::frame::HARD_MAX_FRAME;
 use crate::wire::{ClientMessage, Request, ServerMessage};
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// * 1: initial schema.
+/// * 2: `RequestGrant.untrusted_description`, `Request::ListCapabilities`,
+///   `Response::GrantPending`, `Response::Capabilities` (ADR-0023). Version 1
+///   payloads are rejected before body parsing.
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Bytes of envelope header preceding the body.
 pub const ENVELOPE_HEADER_LEN: usize = 2;
 

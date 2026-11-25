@@ -282,6 +282,23 @@ impl Launcher {
         &self.report
     }
 
+    /// Kill and remove every sandbox cgroup leaf in this launcher's group
+    /// that this process did not create (leftovers of an earlier broker
+    /// run). Call once at startup, before the first spawn, and refuse to
+    /// start on error (fail closed). A no-op without cgroup delegation (no
+    /// leaves can exist then). See [`crate::sweep_cgroup_group`].
+    pub fn sweep_stale_cgroups(&self) -> Result<Vec<PathBuf>, LaunchError> {
+        match (
+            &self.report.cgroup.usable,
+            &self.report.cgroup.delegation_root,
+        ) {
+            (true, Some(root)) => {
+                crate::cgroup::sweep_group(Path::new(root), &self.config.cgroup_group_name)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
     pub fn config(&self) -> &LauncherConfig {
         &self.config
     }
@@ -847,12 +864,25 @@ impl SandboxHandle {
     ///
     /// With a cgroup leaf, `cgroup.kill` SIGKILLs every member atomically
     /// (including processes that escaped the session or daemonised). Without
-    /// one (operator opt-out), the outer bubblewrap process is SIGKILLed via
-    /// its pidfd; `--die-with-parent` then kills the PID namespace's init and
-    /// the kernel tears down every process in the namespace.
+    /// one (operator opt-out), the PID namespace's init (the outer
+    /// bubblewrap's child) and the outer bubblewrap process are SIGKILLed via
+    /// pidfds, and this returns only after the namespace init has *exited*:
+    /// the kernel kills and reaps every other process of the namespace
+    /// before its init's exit completes, so nothing of the sandbox runs
+    /// afterwards. (Relying on `--die-with-parent` alone is asynchronous:
+    /// the outer process could be reaped while the namespace still ran.)
     pub fn stop(&mut self) -> io::Result<ExitStatus> {
         if let Some(leaf) = &self.cgroup {
             let _ = leaf.kill();
+        }
+        // Pin the namespace init(s) before the outer process dies.
+        let inits = if self.finished {
+            Vec::new()
+        } else {
+            namespace_inits(self.pid)
+        };
+        for fd in &inits {
+            let _ = pidfd_send_signal(fd, Signal::KILL);
         }
         if !self.finished
             && let Some(pidfd) = &self.pidfd
@@ -865,8 +895,59 @@ impl SandboxHandle {
             Some(c) => c.wait()?,
             None => return Err(io::Error::other("already reaped")),
         };
+        for fd in &inits {
+            wait_pidfd_exit(fd, Duration::from_secs(10))?;
+        }
         self.cleanup();
         Ok(st)
+    }
+}
+
+/// pidfds of the current children of `pid` (bubblewrap's PID-namespace
+/// init). Each is checked, after `pidfd_open`, to still be a child of `pid`,
+/// so a recycled pid is never signalled.
+fn namespace_inits(pid: u32) -> Vec<OwnedFd> {
+    let list = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+    list.split_whitespace()
+        .filter_map(|c| c.parse::<i32>().ok())
+        .filter_map(|c| {
+            let fd = pidfd_open(Pid::from_raw(c)?, PidfdFlags::empty()).ok()?;
+            let stat = fs::read_to_string(format!("/proc/{c}/stat")).ok()?;
+            // Field 4 (ppid) follows the parenthesised command name.
+            let ppid: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (ppid == pid).then_some(fd)
+        })
+        .collect()
+}
+
+/// Wait until the process behind `fd` has exited (pidfd becomes readable).
+fn wait_pidfd_exit(fd: &OwnedFd, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "sandbox PID namespace did not terminate",
+            ));
+        }
+        let ts = rustix::time::Timespec {
+            tv_sec: left.as_secs() as _,
+            tv_nsec: left.subsec_nanos() as _,
+        };
+        let mut fds = [PollFd::new(fd, PollFlags::IN)];
+        match poll(&mut fds, Some(&ts)) {
+            Ok(0) => continue,
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 

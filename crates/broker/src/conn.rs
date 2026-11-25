@@ -10,8 +10,10 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use tessera_capability_core::AgentId;
@@ -30,14 +32,81 @@ const OUT_QUEUE: usize = 1024;
 /// Malformed / oversized frames tolerated before the channel is closed.
 const MAX_STRIKES: u32 = 64;
 
+/// Per-channel admission limits, enforced by the reader thread *before* a
+/// request reaches the single writer (§9.2: rate limits before expensive
+/// work). Both answer `RateLimited` under the request's correlation id; the
+/// request is not forwarded, not bound to its id and has no effect, so the
+/// client may retry it with the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChannelLimits {
+    /// Frame bound (bytes).
+    pub max_frame: usize,
+    /// Requests forwarded to the writer and not yet finally answered. A
+    /// pending grant request counts until the operator decides; a consume
+    /// counts until its outcome is journaled.
+    pub max_in_flight: usize,
+    /// Sustained requests per second (token bucket refill rate).
+    pub rate_per_sec: u32,
+    /// Token bucket capacity (burst).
+    pub burst: u32,
+}
+
+/// Token bucket.
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+    rate: f64,
+    cap: f64,
+}
+
+impl Bucket {
+    fn new(rate: u32, burst: u32) -> Self {
+        let cap = f64::from(burst.max(1));
+        Bucket {
+            tokens: cap,
+            last: Instant::now(),
+            rate: f64::from(rate),
+            cap,
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * self.rate).min(self.cap);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The reactor's handle on one attached channel.
 pub(crate) struct ChannelHandle {
     pub(crate) conn: u64,
     fd: Arc<OwnedFd>,
     out: SyncSender<ServerMessage>,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl ChannelHandle {
+    /// A forwarded request got its final answer.
+    pub(crate) fn finished_one(&self) {
+        let mut cur = self.in_flight.load(Ordering::SeqCst);
+        while cur > 0 {
+            match self
+                .in_flight
+                .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(now) => cur = now,
+            }
+        }
+    }
+
     /// Queue a response; disconnects a peer whose queue is full.
     pub(crate) fn send(&self, msg: ServerMessage) {
         match self.out.try_send(msg) {
@@ -102,11 +171,13 @@ pub(crate) fn attach(
     conn: u64,
     fd: OwnedFd,
     inbox: SyncSender<Inbox>,
-    max_frame: usize,
+    cl: ChannelLimits,
 ) -> std::io::Result<ChannelHandle> {
     size_buffers(&fd);
+    let max_frame = cl.max_frame;
     let fd = Arc::new(fd);
     let limits = FrameLimits::new(max_frame);
+    let in_flight = Arc::new(AtomicUsize::new(0));
     let (out, out_rx) = mpsc::sync_channel::<ServerMessage>(OUT_QUEUE);
 
     let wfd = Arc::clone(&fd);
@@ -129,13 +200,20 @@ pub(crate) fn attach(
 
     let rfd = Arc::clone(&fd);
     let rout = out.clone();
+    let rin = Arc::clone(&in_flight);
     thread::Builder::new()
         .name(format!("tessera-in-{}.{}", agent.epoch(), agent.serial()))
-        .spawn(move || reader(agent, conn, rfd, inbox, rout, limits))?;
+        .spawn(move || reader(agent, conn, rfd, inbox, rout, limits, cl, rin))?;
 
-    Ok(ChannelHandle { conn, fd, out })
+    Ok(ChannelHandle {
+        conn,
+        fd,
+        out,
+        in_flight,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reader(
     agent: AgentId,
     conn: u64,
@@ -143,22 +221,52 @@ fn reader(
     inbox: SyncSender<Inbox>,
     out: SyncSender<ServerMessage>,
     limits: FrameLimits,
+    cl: ChannelLimits,
+    in_flight: Arc<AtomicUsize>,
 ) {
     let mut strikes = 0u32;
+    let mut bucket = Bucket::new(cl.rate_per_sec, cl.burst);
+    let reject_id =
+        |out: &SyncSender<ServerMessage>, corr: u64, rid: Option<u128>, code, detail: &str| {
+            let _ = out.try_send(ServerMessage {
+                correlation_id: corr,
+                response: error(rid, code, detail),
+            });
+        };
     let reject = |out: &SyncSender<ServerMessage>, corr: u64, code, detail: &str| {
-        let _ = out.try_send(ServerMessage {
-            correlation_id: corr,
-            response: error(None, code, detail),
-        });
+        reject_id(out, corr, None, code, detail)
     };
     let violation = loop {
         match recv_packet(fd.as_fd(), limits) {
             Ok(None) => break None,
             Ok(Some(p)) => match decode_client(&p, limits.max_frame()) {
                 Ok(msg) => {
+                    let rid = msg.request.request_id();
+                    if !bucket.take() {
+                        reject_id(
+                            &out,
+                            msg.correlation_id,
+                            rid,
+                            ErrorCode::RateLimited,
+                            "request rate limit; retry later (same request id is safe)",
+                        );
+                        continue;
+                    }
+                    if in_flight.fetch_add(1, Ordering::SeqCst) >= cl.max_in_flight {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        reject_id(
+                            &out,
+                            msg.correlation_id,
+                            rid,
+                            ErrorCode::RateLimited,
+                            "too many requests in flight; retry later",
+                        );
+                        continue;
+                    }
                     let digest: [u8; 32] = match canonical_request_bytes(&msg.request) {
                         Ok(b) => Sha256::digest(&b).into(),
                         Err(_) => {
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
                             reject(
                                 &out,
                                 msg.correlation_id,

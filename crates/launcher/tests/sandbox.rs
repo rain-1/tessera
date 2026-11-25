@@ -245,6 +245,10 @@ fn dangerous_syscalls_denied() {
     for s in [
         "ptrace(TRACEME)",
         "io_uring_setup",
+        "io_setup",
+        "io_submit",
+        "io_getevents",
+        "io_pgetevents",
         "bpf ",
         "clone3",
         "clone(CLONE_NEWUSER",

@@ -37,6 +37,9 @@ usage: tessera-admin [--socket PATH] <command>
   revoke CAP | inspect CAP | lineage CAP
   reservations [--uncertain]
   audit [--since N] [--limit N]
+  audit checkpoint                      print SEQ:HASH of the last audit event (keep it off-host)
+  audit verify --file PATH [--checkpoint SEQ:HASH]
+                                        verify the audit hash chain offline (no broker needed)
 
 AGENT is e<epoch>.s<serial> or <epoch-hex>:<serial>; CAP is hex.
 The socket defaults to $TESSERA_ADMIN_SOCKET or /run/tessera/admin.sock.
@@ -141,6 +144,9 @@ fn run() -> Result<(), String> {
             .map(String::as_str)
             .ok_or(format!("{cmd}: missing argument"))
     };
+    if cmd == "audit" && a.pos.get(1).map(String::as_str) == Some("verify") {
+        return audit_verify(&a.opts);
+    }
     let mut c = AdminClient::connect(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let o = &a.opts;
     let out = match cmd {
@@ -267,6 +273,9 @@ fn run() -> Result<(), String> {
                 only_uncertain: a.flags.iter().any(|f| f == "uncertain"),
             },
         )?,
+        "audit" if a.pos.get(1).map(String::as_str) == Some("checkpoint") => {
+            call(&mut c, AdminRequest::AuditCheckpoint)?
+        }
         "audit" => call(
             &mut c,
             AdminRequest::Audit {
@@ -277,6 +286,35 @@ fn run() -> Result<(), String> {
         _ => return Err(format!("unknown command {cmd:?}\n{USAGE}")),
     };
     print_response(&out);
+    Ok(())
+}
+
+fn audit_verify(o: &BTreeMap<String, String>) -> Result<(), String> {
+    use tessera_broker::audit::{AuditCheckpoint, verify_file};
+    let file = o.get("file").ok_or("audit verify: --file PATH")?;
+    let cp = o
+        .get("checkpoint")
+        .map(|c| AuditCheckpoint::parse(c))
+        .transpose()?;
+    let v = verify_file(file.as_ref(), cp)?;
+    println!(
+        "ok: {} events, chain intact{}{}",
+        v.events,
+        match v.head {
+            Some(h) => format!(", head {h}"),
+            None => String::new(),
+        },
+        match cp {
+            Some(c) => format!(", checkpoint {} matches", c.seq),
+            None => ", no external checkpoint given (prefix rewrite undetectable)".into(),
+        }
+    );
+    if v.torn_tail_bytes > 0 {
+        println!(
+            "note: {} bytes of a torn final line ignored",
+            v.torn_tail_bytes
+        );
+    }
     Ok(())
 }
 
@@ -324,7 +362,13 @@ fn approve(
         now: ap::Tick(0),
         ticks_per_second: std::num::NonZeroU64::new(1000),
     };
-    println!("{}", ap::render_request(&shown, None, &ctx));
+    // The agent's description (if any) is printed by the renderer in a
+    // separate block labelled UNTRUSTED, escaped and truncated. It is not
+    // part of what the key signs.
+    println!(
+        "{}",
+        ap::render_request(&shown, pv.untrusted_description.as_deref(), &ctx)
+    );
     println!("digest: {}", hex(&ch.client_data_hash));
     if !yes {
         print!("Approve exactly this grant? Type 'yes': ");
@@ -423,6 +467,7 @@ fn print_response(r: &AdminResponse) {
                 println!("no pending approvals");
             }
         }
+        AdminResponse::AuditCheckpoint { seq, hash } => println!("{seq}:{hash}"),
         AdminResponse::Audit(ev) => {
             for e in ev {
                 println!("{}", serde_json::to_string(e).unwrap_or_default());

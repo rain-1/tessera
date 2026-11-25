@@ -40,6 +40,18 @@ pub enum Error {
         request_id: Option<RequestId>,
     },
 
+    /// A grant request was acknowledged by the broker (`GrantPending`: it is
+    /// queued for the human operator) but no decision arrived before
+    /// [`crate::ClientConfig::approval_timeout`]. The broker is alive. The
+    /// request is still pending: repeat it with the *same* request id (the
+    /// `*_with_id` method) to keep waiting for the same approval, which
+    /// never opens a second prompt.
+    #[error("grant request {} is still waiting for the operator", crate::format_id(*.request_id))]
+    ApprovalPending {
+        /// Request id of the pending grant.
+        request_id: RequestId,
+    },
+
     /// A consume retry (same request id) found an earlier reservation. No
     /// new effect was dispatched. Returned by the convenience methods
     /// (`read_file`, `replace_file`, `https_request`) because they cannot
@@ -121,6 +133,7 @@ impl Error {
         match self {
             Error::Broker(b) => b.request_id,
             Error::Timeout { request_id } => *request_id,
+            Error::ApprovalPending { request_id } => Some(*request_id),
             Error::PriorReservation { request_id, .. } => Some(*request_id),
             _ => None,
         }
@@ -132,7 +145,11 @@ impl Error {
     pub fn outcome_uncertain(&self) -> bool {
         matches!(
             self,
-            Error::Timeout { .. } | Error::Closed | Error::Poisoned | Error::Io(_)
+            Error::Timeout { .. }
+                | Error::ApprovalPending { .. }
+                | Error::Closed
+                | Error::Poisoned
+                | Error::Io(_)
         ) || self.code() == Some(ErrorCode::EffectUnknown)
     }
 }

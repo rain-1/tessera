@@ -185,6 +185,7 @@ fn swarm_example_12_2_through_the_broker() {
         budget: WireBudget::Finite(100),
         depth: WireDepth::Finite(2),
         expiry: WireExpiry::Inherit,
+        untrusted_description: None,
     });
     let AdminResponse::Capability(root_cap) = h.approve(&b) else {
         panic!()

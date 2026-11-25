@@ -15,7 +15,11 @@ use tessera_protocol::*;
 
 #[test]
 fn thousand_concurrent_attempts_on_budget_one_dispatch_exactly_once() {
-    let h = Harness::new();
+    let mut h = Harness::new();
+    // This test is about the single writer, not admission control: let all
+    // 1,000 requests through the per-principal rate and in-flight limits.
+    h.config.max_in_flight_per_agent = 2000;
+    h.config.agent_rate_burst = 2000;
     let b = h.start(None);
     let obj = register_file(&b, "notes.txt");
     let mut a = Agent::attach(&b);

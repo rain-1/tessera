@@ -155,6 +155,9 @@ pub enum AdminRequest {
     EmergencyStop,
     /// Journal head (for an external checkpoint).
     Checkpoint,
+    /// Audit log head: sequence and line hash of the last event, to keep
+    /// off-host and check later with `tessera-admin audit verify`.
+    AuditCheckpoint,
 }
 
 /// Broker status.
@@ -202,8 +205,12 @@ pub struct PendingView {
     pub active: bool,
     /// Canonical request to sign (`GrantRequest::encode`), current version.
     pub request: Vec<u8>,
-    /// Broker-normalized rendering (trusted fields only).
+    /// Broker-normalized rendering. Trusted fields, plus the agent's
+    /// description (if any) in a separate block labelled UNTRUSTED, escaped.
     pub rendered: String,
+    /// The agent's raw description, **untrusted** (render it only with
+    /// `tessera_approval::render::render_request`, which escapes it).
+    pub untrusted_description: Option<String>,
 }
 
 /// Challenge for the authenticator.
@@ -320,6 +327,13 @@ pub enum AdminResponse {
         records: u64,
         /// Head hash (hex).
         head: String,
+    },
+    /// Audit checkpoint (`SEQ:HASH` for `tessera-admin audit verify`).
+    AuditCheckpoint {
+        /// Sequence of the last event.
+        seq: u64,
+        /// SHA-256 of its line (hex).
+        hash: String,
     },
 }
 
