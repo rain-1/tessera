@@ -282,6 +282,23 @@ impl Launcher {
         &self.report
     }
 
+    /// Kill and remove every sandbox cgroup leaf in this launcher's group
+    /// that this process did not create (leftovers of an earlier broker
+    /// run). Call once at startup, before the first spawn, and refuse to
+    /// start on error (fail closed). A no-op without cgroup delegation (no
+    /// leaves can exist then). See [`crate::sweep_cgroup_group`].
+    pub fn sweep_stale_cgroups(&self) -> Result<Vec<PathBuf>, LaunchError> {
+        match (
+            &self.report.cgroup.usable,
+            &self.report.cgroup.delegation_root,
+        ) {
+            (true, Some(root)) => {
+                crate::cgroup::sweep_group(Path::new(root), &self.config.cgroup_group_name)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
     pub fn config(&self) -> &LauncherConfig {
         &self.config
     }

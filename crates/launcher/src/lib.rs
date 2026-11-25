@@ -38,7 +38,7 @@ mod profile;
 pub mod seccomp;
 
 pub use agent::AgentLabel;
-pub use cgroup::CgroupLeaf;
+pub use cgroup::{CgroupLeaf, sweep_group as sweep_cgroup_group};
 pub use error::LaunchError;
 pub use launcher::{ConfinementStatus, LaunchRecord, Launcher, SandboxHandle};
 pub use probe::{

@@ -205,34 +205,128 @@ impl CgroupLeaf {
             .unwrap_or(false)
     }
 
-    /// Kills remaining processes, waits for the leaf to drain and removes it.
+    /// Kills remaining processes (including any nested cgroups the
+    /// workload created), waits for the leaf to drain and removes it.
     pub(crate) fn destroy(&mut self) -> io::Result<()> {
         if self.removed {
             return Ok(());
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if self.populated() {
-                let _ = self.kill();
-            }
-            match fs::remove_dir(&self.path) {
-                Ok(()) => {
-                    self.removed = true;
-                    return Ok(());
+        remove_tree(&self.path, Instant::now() + Duration::from_secs(5))?;
+        self.removed = true;
+        Ok(())
+    }
+}
+
+fn populated(p: &Path) -> bool {
+    fs::read_to_string(p.join("cgroup.events"))
+        .map(|s| s.lines().any(|l| l.trim() == "populated 1"))
+        .unwrap_or(false)
+}
+
+/// `cgroup.kill` the whole subtree at `path`, then remove it bottom-up.
+/// Fails if anything is still there at `deadline`.
+fn remove_tree(path: &Path, deadline: Instant) -> io::Result<()> {
+    // cgroup.kill acts on the whole subtree.
+    match fs::write(path.join("cgroup.kill"), "1") {
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !path.exists() => return Ok(()),
+        _ => {}
+    }
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for e in entries {
+        let e = e?;
+        // Child cgroups are the only directories in a cgroup directory.
+        if e.file_type()?.is_dir() {
+            remove_tree(&e.path(), deadline)?;
+        }
+    }
+    loop {
+        match fs::remove_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if Instant::now() >= deadline => return Err(e),
+            Err(_) => {
+                if populated(path) {
+                    let _ = fs::write(path.join("cgroup.kill"), "1");
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    self.removed = true;
-                    return Ok(());
-                }
-                Err(e) if Instant::now() >= deadline => return Err(e),
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
 }
 
+/// The launcher pid embedded in a leaf name `<label>-<pid>-<n>-<nanos>`.
+fn leaf_pid(name: &str) -> Option<u32> {
+    let mut it = name.rsplitn(4, '-');
+    let (_nanos, _n, pid) = (it.next()?, it.next()?, it.next()?);
+    it.next()?;
+    pid.parse().ok()
+}
+
+/// Startup sweep (spec §11: stop existing sandbox trees). Kills and removes
+/// every sandbox leaf under `<delegation_root>/<group>` that was not created
+/// by this process (its name does not carry our pid). Leaves from earlier
+/// broker runs belong to earlier authority epochs, so nothing in them may
+/// keep running. Fails (and the caller must fail closed) if any leaf cannot
+/// be killed and removed within a few seconds. Returns the removed paths.
+///
+/// The group must be private to one broker instance: two brokers sharing a
+/// group would sweep each other's sandboxes.
+pub fn sweep_group(delegation_root: &Path, group: &str) -> Result<Vec<PathBuf>, LaunchError> {
+    let cg = |m: String| LaunchError::Cgroup(m);
+    if group.is_empty() || group.contains('/') || group.starts_with('.') {
+        return Err(cg(format!("invalid cgroup group name {group:?}")));
+    }
+    let dir = delegation_root.join(group);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(cg(format!("read {}: {e}", dir.display()))),
+    };
+    let me = std::process::id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut removed = Vec::new();
+    for e in entries {
+        let e = e.map_err(|e| cg(format!("read {}: {e}", dir.display())))?;
+        let is_dir = e
+            .file_type()
+            .map_err(|x| cg(format!("stat {}: {x}", e.path().display())))?
+            .is_dir();
+        if !is_dir {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if leaf_pid(&name) == Some(me) {
+            continue;
+        }
+        let p = e.path();
+        remove_tree(&p, deadline).map_err(|x| {
+            cg(format!(
+                "could not kill/remove stale sandbox cgroup {}: {x}",
+                p.display()
+            ))
+        })?;
+        removed.push(p);
+    }
+    Ok(removed)
+}
+
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
         let _ = self.destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn leaf_names_parse() {
+        assert_eq!(super::leaf_pid("e1.s2-4242-0-1a2b"), Some(4242));
+        assert_eq!(super::leaf_pid("agent-with-dashes-77-3-ff"), Some(77));
+        assert_eq!(super::leaf_pid("short-1"), None);
+        assert_eq!(super::leaf_pid("x-notapid-1-2"), None);
     }
 }
