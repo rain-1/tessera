@@ -587,9 +587,16 @@ fn agent_spawn_is_idempotent_domain_bounded_and_baseline_only() {
         assert_eq!(principal_status(&b, x), "terminated", "{x:?}");
     }
     assert_eq!(principal_status(&b, o1), "active");
-    let stops = sp.stops.lock().unwrap().clone();
+    // Stop requests reach the spawner thread asynchronously.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     for x in [c1, c_slow, g] {
-        assert!(stops.contains(&x), "sandbox of {x:?} stopped");
+        while !sp.stops.lock().unwrap().contains(&x) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sandbox of {x:?} not stopped"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
     assert!(child.recv().is_none(), "child channel closed");
     assert!(grand.recv().is_none(), "grandchild channel closed");

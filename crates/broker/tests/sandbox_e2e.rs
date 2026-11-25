@@ -119,13 +119,43 @@ impl Sandbox {
         }
     }
 
-    /// Whether the sandbox's stdout reaches EOF (its process tree died).
+    /// Whether the sandbox's stdout reaches EOF (its process tree died)
+    /// within 10 s.
     fn is_dead(&mut self) -> bool {
-        let mut rest = String::new();
-        matches!(
-            std::io::Read::read_to_string(&mut self.stdout, &mut rest),
-            Ok(_)
-        )
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        loop {
+            // Drain anything buffered first.
+            if !self.stdout.buffer().is_empty() {
+                let n = self.stdout.buffer().len();
+                self.stdout.consume(n);
+                continue;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let ts = rustix::time::Timespec {
+                tv_sec: left.as_secs() as _,
+                tv_nsec: left.subsec_nanos() as _,
+            };
+            let fd = self.stdout.get_ref().as_fd();
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut fds, Some(&ts)) {
+                Ok(0) => return false,
+                Ok(_) => match self.stdout.get_mut().read(&mut buf) {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return true,
+                },
+                Err(_) => continue,
+            }
+        }
     }
 }
 

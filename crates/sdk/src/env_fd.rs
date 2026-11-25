@@ -1,6 +1,7 @@
 //! Taking ownership of the inherited broker channel descriptor.
 //!
-//! This module holds the crate's only `unsafe` code: one call to
+//! This module holds the only `unsafe` code in the whole workspace (trusted
+//! assumption A14 in `docs/proof-register.md`): one call to
 //! [`OwnedFd::from_raw_fd`]. Every other part of the SDK is safe Rust.
 //!
 //! # Why `unsafe` is needed
