@@ -337,6 +337,10 @@ pub enum WireReservationStatus {
     Completed,
     /// Outcome uncertain (e.g. broker restarted mid-dispatch). Never retried.
     Unknown,
+    /// Adapter reported a definite failure: no effect took place. The budget
+    /// unit stays spent (no refund, ADR-0012). Appended last so the encoding
+    /// of the earlier variants is unchanged.
+    Failed,
 }
 
 /// Liveness of a capability as reported by `Inspect`.

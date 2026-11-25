@@ -25,7 +25,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0011](0011-scope-language.md) | Small typed exact-resource scopes | §16 Scope | Accepted |
 | [0012](0012-budget-semantics.md) | At-most-once attempt, no refunds, dedup | §16 Budget | Accepted (design), model-checked |
 | [0013](0013-delegation.md) | Single owner, split/transfer, bounded depth | §16 Delegation | Accepted |
-| [0014](0014-revocation.md) | Recursive prospective revocation; admin-only in MVP | §16 Revocation | Accepted (design), model-checked |
+| [0014](0014-revocation.md) | Recursive prospective revocation; operator, or agent within its own subtree | §16 Revocation | Accepted, implemented (amended by 0022) |
 | [0015](0015-attenuation.md) | Non-retroactive attenuation | §16 Attenuation | Accepted |
 | [0016](0016-enforcement-split.md) | Brokered finite enforcement; BPF LSM deferred | §16 Finite/Direct enforcement, open Q BPF toolchain | Accepted / Deferred |
 | [0017](0017-human-approval-and-ui.md) | FIDO2 UP/UV, isolated approval UI | §16 Human approval, open Q UI deployment | Proposed |
@@ -33,6 +33,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0019](0019-file-object-identity.md) | Logical file slots | open Q file slot identity | Proposed |
 | [0020](0020-model-api-credentials.md) | Model API proxy and credentials | open Q model API | Proposed |
 | [0021](0021-independent-review.md) | Independent review | open Q review resources | Open |
+| [0022](0022-broker.md) | Broker: single writer, journal entries, dispatch marker, request-id binding, channel identity, admin endpoint | §5.2, §9, §11, WP3 | Accepted, implemented (tested) |
 
 ## Specification inconsistencies and gaps found in WP0
 
@@ -47,8 +48,9 @@ governs.
    and §9.2 make DELEGATE an eighth public transaction (ADR-0013).
 3. **Where Revoke is accepted.** §9.2 lists `Revoke` in the agent protocol
    ("admin or designated revoker") and also requires a separate admin
-   endpoint. There is no designated-revoker design. In the MVP, revoke is
-   admin-only (ADR-0014).
+   endpoint. There is no designated-revoker design. The operator revokes
+   anything; an agent may revoke only within its own subtree (ADR-0014 as
+   amended by ADR-0022).
 4. **Request id reused with different content.** §5.2 says a repeated
    request id returns the earlier status. §9.2 binds ids to canonical
    content. The spec does not say what happens when the same id arrives with
@@ -83,3 +85,12 @@ governs.
 11. **Dedup test bound (from the model).** A request-id dedup test at budget
     1 cannot detect a missing dedup check, because the budget check hides
     it. The §15 and WP3 tests must use budget ≥ 2.
+12. **`SO_PEERCRED` is not a cross-check (WP3).** ADR-0004 planned a
+    `SO_PEERCRED`/cgroup cross-check of each channel. The launcher creates
+    the socketpair in the broker process, so the credentials name the broker
+    itself. Identity is the channel alone (ADR-0022).
+13. **Datagram size (WP3).** `MAX_CONTENT_BYTES` (8 MiB) cannot be carried
+    in one `SOCK_SEQPACKET` datagram under default socket buffers. The
+    broker caps inline content at 96 KiB and denies larger reads rather than
+    truncating (ADR-0022). The spec should state a content bound or a
+    streaming design.

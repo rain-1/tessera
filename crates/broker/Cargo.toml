@@ -2,5 +2,51 @@
 name = "tessera-broker"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+rust-version.workspace = true
+description = "Tessera broker: single-writer reactor, authenticated agent IPC, journal-first transactions, approval flow and admin endpoint"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Lets `tessera-admin` drive a real token through libfido2's CLI tools.
+fido2-cli = ["tessera-approval/fido2-cli"]
 
 [dependencies]
+tessera-capability-core = { path = "../capability-core" }
+tessera-protocol = { path = "../protocol" }
+tessera-journal = { path = "../journal" }
+tessera-approval = { path = "../approval" }
+tessera-launcher = { path = "../launcher" }
+tessera-adapter-file = { path = "../../adapters/file" }
+tessera-adapter-https = { path = "../../adapters/https" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+postcard = { version = "1.2.0", default-features = false, features = ["alloc", "use-std"] }
+sha2 = "0.10"
+getrandom = "0.2"
+rustix = { version = "1.1.6", features = ["net", "fs", "process"] }
+http = "1"
+tokio = { version = "1", default-features = false, features = ["net", "rt", "time"] }
+rustls-pki-types = "1"
+base64ct = { version = "1", features = ["alloc"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+
+[dev-dependencies]
+tessera-approval = { path = "../approval", features = ["software-authenticator"] }
+tessera-journal = { path = "../journal" }
+tempfile = "3.27.0"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+
+[[bin]]
+name = "tesserad"
+path = "src/bin/tesserad.rs"
+
+[[bin]]
+name = "tessera-admin"
+path = "src/bin/tessera-admin.rs"

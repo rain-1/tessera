@@ -693,6 +693,7 @@ fn reservation_str(s: WireReservationStatus) -> &'static str {
         WireReservationStatus::Dispatched => "dispatched",
         WireReservationStatus::Completed => "completed",
         WireReservationStatus::Unknown => "unknown",
+        WireReservationStatus::Failed => "failed",
     }
 }
 

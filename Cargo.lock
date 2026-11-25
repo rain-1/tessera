@@ -1377,6 +1377,30 @@ dependencies = [
 [[package]]
 name = "tessera-broker"
 version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "getrandom 0.2.17",
+ "http",
+ "p256",
+ "postcard",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tessera-adapter-file",
+ "tessera-adapter-https",
+ "tessera-approval",
+ "tessera-capability-core",
+ "tessera-journal",
+ "tessera-launcher",
+ "tessera-protocol",
+ "tokio",
+ "tokio-rustls",
+]
 
 [[package]]
 name = "tessera-capability-core"
