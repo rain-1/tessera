@@ -93,13 +93,30 @@ fn run() -> Result<(), String> {
         None
     } else {
         let mut lc = LauncherConfig::default();
-        for path in std::iter::once(&cfg.state_dir).chain(&cfg.file_root) {
+        // Host paths no profile may expose (ancestor or descendant):
+        // broker state, protected file root, the admin socket and its
+        // directory, broker-held endpoint secrets and CA files, and
+        // operator-listed paths such as the model proxy's credential file.
+        let endpoint_files = cfg.endpoints.iter().flat_map(|e| {
+            e.secret_header
+                .iter()
+                .map(|s| &s.value_file)
+                .chain(&e.ca_pem_file)
+        });
+        for path in std::iter::once(&cfg.state_dir)
+            .chain(&cfg.file_root)
+            .chain(endpoint_files)
+            .chain(&cfg.launcher.protected_paths)
+        {
             lc.protected_host_paths.push(
                 path.canonicalize()
-                    .map_err(|e| format!("{}: {e}", path.display()))?,
+                    .map_err(|e| format!("protected path {}: {e}", path.display()))?,
             );
         }
         lc.protected_host_paths.push(admin_socket.clone());
+        if let Some(dir) = admin_socket.parent() {
+            lc.protected_host_paths.push(dir.to_path_buf());
+        }
         if let Some(p) = &cfg.launcher.bwrap_path {
             lc.bwrap_path = p.clone();
         }

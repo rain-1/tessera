@@ -20,8 +20,9 @@ use serde::Serialize;
 use crate::cgroup::CgroupLeaf;
 use crate::{
     AGENT_ID_ENV, AgentLabel, BROKER_FD, BROKER_FD_ENV, CgroupRequirement, FeatureReport,
-    LandlockRequirement, LaunchError, LaunchProfile, LauncherConfig, ResourceLimits,
-    SANDBOX_INIT_PATH, SANDBOX_WORKSPACE, StdioMode, seccomp,
+    LandlockRequirement, LaunchError, LaunchProfile, LauncherConfig, MODEL_PORT_ENV,
+    MODEL_SOCKET_ENV, ModelRoute, ResourceLimits, SANDBOX_INIT_PATH, SANDBOX_MODEL_SOCKET,
+    SANDBOX_NETSHIM_PATH, SANDBOX_WORKSPACE, StdioMode, seccomp,
 };
 
 /// Descriptor numbers as seen by bubblewrap (and, before the init shim
@@ -155,6 +156,9 @@ pub struct LaunchRecord {
     pub workspace: Option<String>,
     pub workspace_read_only: bool,
     pub broker_fd: i32,
+    /// Compatibility-mode model route, if any (an unmediated baseline
+    /// channel; see `docs/compat.md`).
+    pub model_route: Option<ModelRoute>,
     pub confinement: ConfinementStatus,
 }
 
@@ -243,6 +247,12 @@ fn stdio(m: StdioMode) -> Stdio {
         StdioMode::Inherit => Stdio::inherit(),
         StdioMode::Piped => Stdio::piped(),
     }
+}
+
+/// A validated model route: canonical socket, optional (port, netshim).
+struct CheckedModelRoute {
+    socket: PathBuf,
+    loopback: Option<(u16, PathBuf)>,
 }
 
 /// Everything needed to run one sandbox, prepared before any process exists.
@@ -372,6 +382,57 @@ impl Launcher {
         Ok(env.into_iter().collect())
     }
 
+    /// Validate a compatibility-mode model route (fail closed).
+    fn check_model_route(&self, r: &ModelRoute) -> Result<CheckedModelRoute, LaunchError> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let invalid = |m: String| LaunchError::InvalidProfile(m);
+        let socket = fs::canonicalize(&r.host_socket)
+            .map_err(|e| invalid(format!("model socket {}: {e}", r.host_socket.display())))?;
+        let md = fs::symlink_metadata(&socket)?;
+        let uid = rustix::process::getuid().as_raw();
+        // Only a private socket owned by the launcher's user (the model
+        // proxy creates it 0600) may be exposed; this rules out host
+        // service sockets such as the Docker or D-Bus sockets.
+        if !md.file_type().is_socket() || md.uid() != uid || md.mode() & 0o077 != 0 {
+            return Err(invalid(format!(
+                "model socket {} must be a socket owned by uid {uid} with mode 0600",
+                socket.display()
+            )));
+        }
+        // Never the broker's admin socket or anything else protected.
+        check_protected_paths(&socket, &self.config.protected_host_paths)?;
+        if std::env::var_os("SSH_AUTH_SOCK")
+            .and_then(|p| fs::canonicalize(p).ok())
+            .is_some_and(|p| p == socket)
+        {
+            return Err(invalid("model socket is the SSH agent socket".into()));
+        }
+        let loopback = match &r.loopback {
+            None => None,
+            Some(l) => {
+                if l.port == 0 {
+                    return Err(invalid("model loopback port must be non-zero".into()));
+                }
+                // The port exception must be expressible and enforced: only
+                // a fully enforced Landlock ruleset restricts TCP to it.
+                if self.config.landlock != LandlockRequirement::Required {
+                    return Err(invalid(
+                        "a model loopback port requires LandlockRequirement::Required".into(),
+                    ));
+                }
+                let shim = fs::canonicalize(&l.netshim_path)
+                    .map_err(|e| invalid(format!("netshim {}: {e}", l.netshim_path.display())))?;
+                if !shim.is_file() {
+                    return Err(invalid(format!("netshim {} is not a file", shim.display())));
+                }
+                check_host_exposure("netshim", &shim)?;
+                check_protected_paths(&shim, &self.config.protected_host_paths)?;
+                Some((l.port, shim))
+            }
+        };
+        Ok(CheckedModelRoute { socket, loopback })
+    }
+
     fn plan(&self, profile: &LaunchProfile) -> Result<Plan, LaunchError> {
         let invalid = |m: String| LaunchError::InvalidProfile(m);
         if !normalized_abs(&profile.program) {
@@ -380,7 +441,17 @@ impl Launcher {
                 profile.program.display()
             )));
         }
-        let env = Self::workload_env(profile)?;
+        let mut env = Self::workload_env(profile)?;
+        let model = match &profile.model_route {
+            Some(r) => Some(self.check_model_route(r)?),
+            None => None,
+        };
+        if let Some(m) = &model {
+            env.push((MODEL_SOCKET_ENV.into(), SANDBOX_MODEL_SOCKET.into()));
+            if let Some((port, _)) = &m.loopback {
+                env.push((MODEL_PORT_ENV.into(), port.to_string()));
+            }
+        }
 
         let workspace = match &profile.workspace {
             Some(ws) => {
@@ -523,6 +594,21 @@ impl Launcher {
         for (host, dest) in &extra {
             a.extend(["--ro-bind".into(), host.clone().into(), dest.clone().into()]);
         }
+        if let Some(m) = &model {
+            // A Unix socket on a read-only bind can still be connected to.
+            a.extend([
+                "--ro-bind".into(),
+                m.socket.clone().into(),
+                SANDBOX_MODEL_SOCKET.into(),
+            ]);
+            if let Some((_, shim)) = &m.loopback {
+                a.extend([
+                    "--ro-bind".into(),
+                    shim.clone().into(),
+                    SANDBOX_NETSHIM_PATH.into(),
+                ]);
+            }
+        }
         a.extend([
             "--ro-bind".into(),
             self.config.init_path.clone().into(),
@@ -556,6 +642,10 @@ impl Launcher {
             "--landlock".into(),
             landlock.into(),
         ]);
+        let loopback = model.as_ref().and_then(|m| m.loopback.as_ref());
+        if let Some((port, _)) = loopback {
+            a.extend(["--allow-tcp-port".into(), port.to_string().into()]);
+        }
         let mut ro: Vec<OsString> = vec!["/usr".into(), "/etc".into(), "/proc".into()];
         ro.extend(
             RUNTIME_TOP_LEVEL
@@ -563,6 +653,9 @@ impl Launcher {
                 .map(|n| OsString::from(format!("/{n}"))),
         );
         ro.extend(extra.iter().map(|(_, d)| d.clone().into()));
+        if loopback.is_some() {
+            ro.push(SANDBOX_NETSHIM_PATH.into());
+        }
         let mut rw: Vec<OsString> = vec!["/tmp".into(), "/dev/shm".into()];
         if workspace.is_some() {
             if profile.workspace_read_only {
@@ -579,6 +672,17 @@ impl Launcher {
         }
         a.extend(["--dev".into(), "/dev".into()]);
         a.push("--".into());
+        if let Some((port, _)) = loopback {
+            // The shim binds the port, then runs the workload as its child.
+            a.extend([
+                SANDBOX_NETSHIM_PATH.into(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}").into(),
+                "--socket".into(),
+                SANDBOX_MODEL_SOCKET.into(),
+                "--".into(),
+            ]);
+        }
         a.push(profile.program.clone().into());
         a.extend(profile.args.iter().cloned());
 
@@ -709,6 +813,7 @@ impl Launcher {
                 workspace: plan.workspace.as_ref().map(|p| p.display().to_string()),
                 workspace_read_only: profile.workspace_read_only,
                 broker_fd: BROKER_FD,
+                model_route: profile.model_route.clone(),
                 confinement: ConfinementStatus::default(),
             },
             finished: false,

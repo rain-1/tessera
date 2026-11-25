@@ -109,6 +109,32 @@ pub enum StdioMode {
     Piped,
 }
 
+/// In-sandbox loopback TCP shim for harnesses that cannot speak HTTP over a
+/// Unix socket (compatibility mode, `docs/compat.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LoopbackShim {
+    /// Loopback TCP port the shim listens on inside the sandbox. Landlock
+    /// allows TCP bind and connect on exactly this port and nothing else.
+    pub port: u16,
+    /// Host path of the `tessera-netshim` binary (bound read-only at
+    /// [`crate::SANDBOX_NETSHIM_PATH`]).
+    pub netshim_path: PathBuf,
+}
+
+/// Model API route for compatibility mode (ADR-0020, ADR-0030): the host
+/// model proxy's Unix socket is bound at [`crate::SANDBOX_MODEL_SOCKET`].
+/// This is an unmediated, unlimited-use baseline channel and a disclosure
+/// channel (threat model R-2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ModelRoute {
+    /// Host path of the proxy socket. Must be a socket owned by the
+    /// launcher's uid with no group/other permissions.
+    pub host_socket: PathBuf,
+    /// Optional loopback TCP shim. The workload is then started as
+    /// `netshim --listen 127.0.0.1:PORT --socket SOCK -- PROGRAM ARGS...`.
+    pub loopback: Option<LoopbackShim>,
+}
+
 /// A trusted launch profile (spec §9.2 `Spawn { launch_profile }`).
 #[derive(Clone, Debug)]
 pub struct LaunchProfile {
@@ -128,6 +154,8 @@ pub struct LaunchProfile {
     pub stdin: StdioMode,
     pub stdout: StdioMode,
     pub stderr: StdioMode,
+    /// Compatibility-mode model API route (none by default: no network).
+    pub model_route: Option<ModelRoute>,
 }
 
 impl LaunchProfile {
@@ -144,7 +172,13 @@ impl LaunchProfile {
             stdin: StdioMode::Null,
             stdout: StdioMode::Inherit,
             stderr: StdioMode::Inherit,
+            model_route: None,
         }
+    }
+
+    pub fn model_route(mut self, route: ModelRoute) -> Self {
+        self.model_route = Some(route);
+        self
     }
 
     pub fn arg(mut self, a: impl Into<OsString>) -> Self {

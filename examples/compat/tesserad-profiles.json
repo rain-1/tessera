@@ -1,0 +1,32 @@
+{
+  "profiles": {
+    "claude": {
+      "program": "/opt/claude/claude",
+      "args": ["-p", "summarise the README in /workspace"],
+      "workspace": "/srv/tessera/workspaces/claude-1",
+      "ro_binds": [["/opt/claude-code/claude", "/opt/claude/claude"]],
+      "env": [
+        ["ANTHROPIC_UNIX_SOCKET", "/.tessera/model.sock"],
+        ["ANTHROPIC_BASE_URL", "http://localhost"],
+        ["ANTHROPIC_API_KEY", "tessera-placeholder"],
+        ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"],
+        ["DISABLE_AUTOUPDATER", "1"]
+      ],
+      "memory_max_bytes": 4294967296,
+      "pids_max": 512,
+      "model_route": { "socket": "/run/user/1000/tessera/claude-1/model.sock" }
+    },
+    "codex": {
+      "program": "/opt/codex/codex",
+      "args": ["exec", "summarise the README in /workspace"],
+      "workspace": "/srv/tessera/workspaces/codex-1",
+      "ro_binds": [["/opt/codex/bin/codex", "/opt/codex/codex"]],
+      "env": [["CODEX_HOME", "/workspace/.codex"]],
+      "model_route": {
+        "socket": "/run/user/1000/tessera/codex-1/model.sock",
+        "loopback_port": 18080,
+        "netshim_path": "/usr/libexec/tessera/tessera-netshim"
+      }
+    }
+  }
+}

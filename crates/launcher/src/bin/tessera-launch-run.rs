@@ -4,6 +4,7 @@
 //! tessera-launch-run [--agent LABEL] [--workspace DIR] [--ro-bind HOST:DEST]...
 //!     [--env K=V]... [--landlock required|best_effort|disabled]
 //!     [--allow-no-cgroup REASON] [--init PATH] [--record] [--broker-echo]
+//!     [--model-socket PATH [--model-port PORT --netshim PATH]]
 //!     -- PROGRAM [ARGS]...
 //! ```
 //!
@@ -20,7 +21,7 @@ use std::path::PathBuf;
 
 use tessera_launcher::{
     AgentLabel, CgroupRequirement, LandlockRequirement, LaunchError, LaunchProfile, Launcher,
-    LauncherConfig, StdioMode,
+    LauncherConfig, LoopbackShim, ModelRoute, StdioMode,
 };
 
 fn usage(msg: &str) -> ! {
@@ -37,6 +38,9 @@ fn main() {
     let mut env = Vec::new();
     let mut record = false;
     let mut echo = false;
+    let mut model_socket: Option<PathBuf> = None;
+    let mut model_port: Option<u16> = None;
+    let mut netshim: Option<PathBuf> = None;
     let mut cmd: Vec<OsString> = Vec::new();
     let str_arg = |v: Option<OsString>, f: &str| -> String {
         v.and_then(|s| s.into_string().ok())
@@ -72,6 +76,17 @@ fn main() {
                 }
             }
             Some("--init") => config.init_path = str_arg(it.next(), "--init").into(),
+            Some("--model-socket") => {
+                model_socket = Some(str_arg(it.next(), "--model-socket").into())
+            }
+            Some("--model-port") => {
+                model_port = Some(
+                    str_arg(it.next(), "--model-port")
+                        .parse()
+                        .unwrap_or_else(|_| usage("bad --model-port")),
+                )
+            }
+            Some("--netshim") => netshim = Some(str_arg(it.next(), "--netshim").into()),
             Some("--record") => record = true,
             Some("--broker-echo") => echo = true,
             Some("--") => {
@@ -96,6 +111,21 @@ fn main() {
     }
     for (k, v) in env {
         profile = profile.env(k, v);
+    }
+    match (model_socket, model_port, netshim) {
+        (None, None, None) => {}
+        (Some(host_socket), port, shim) => {
+            let loopback = match (port, shim) {
+                (None, None) => None,
+                (Some(port), Some(netshim_path)) => Some(LoopbackShim { port, netshim_path }),
+                _ => usage("--model-port and --netshim go together"),
+            };
+            profile = profile.model_route(ModelRoute {
+                host_socket,
+                loopback,
+            });
+        }
+        _ => usage("--model-port/--netshim need --model-socket"),
     }
     let fail = |e: LaunchError| -> ! {
         eprintln!("tessera-launch-run: {e}");

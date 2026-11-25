@@ -14,13 +14,17 @@
 //!       "secret_header": { "name": "x-api-key", "value_file": "/etc/tessera/api-key" },
 //!       "ca_pem_file": null }
 //!   ],
-//!   "profiles": { "shell": { "program": "/bin/sh", "args": ["-c", "..."] } },
+//!   "profiles": { "shell": { "program": "/bin/sh", "args": ["-c", "..."] },
+//!                 "claude": { "program": "/opt/claude/claude", "args": ["-p", "..."],
+//!                             "env": [["ANTHROPIC_UNIX_SOCKET", "/.tessera/model.sock"]],
+//!                             "model_route": { "socket": "/run/user/1000/tessera/claude/model.sock" } } },
 //!   "agent_spawn_profiles": { "1": { "profile": "shell", "baseline": [] } },
 //!   "limits": { "max_children_per_agent": 8, "max_spawn_depth": 2,
 //!               "max_domain_agents": 16, "max_in_flight_per_agent": 64,
 //!               "agent_rate_per_sec": 100, "agent_rate_burst": 200 },
 //!   "audit_fsync": "every-event",
 //!   "launcher": { "init_path": "/usr/libexec/tessera/tessera-sandbox-init",
+//!                 "protected_paths": ["/etc/tessera/anthropic-api-key"],
 //!                 "cgroup_group": "tesserad",
 //!                 "cgroup_opt_out_reason": null, "landlock": "required" }
 //! }
@@ -90,6 +94,13 @@ pub struct LauncherSection {
     /// broker; default `tesserad`.
     #[serde(default)]
     pub cgroup_group: Option<String>,
+    /// Further host paths no sandbox workspace, bind or model route may
+    /// overlap (be, contain or lie inside), e.g. the model proxy's
+    /// credential files and audit log. `state_dir`, `file_root`, the admin
+    /// socket and its directory, and every endpoint secret/CA file are
+    /// always protected.
+    #[serde(default)]
+    pub protected_paths: Vec<PathBuf>,
 }
 
 /// Optional broker limits (defaults from `BrokerConfig`).

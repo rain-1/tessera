@@ -1,0 +1,13 @@
+# $CODEX_HOME/config.toml inside the sandbox (e.g. /workspace/.codex).
+# Codex has no HTTP-over-Unix-socket option, so it talks to the in-sandbox
+# tessera-netshim on 127.0.0.1:18080, which splices to the model proxy.
+# No env_key: Codex sends no credential; the proxy injects the host key.
+model_provider = "tessera"
+model = "gpt-5-codex"
+
+[model_providers.tessera]
+name = "Tessera model proxy"
+base_url = "http://127.0.0.1:18080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false

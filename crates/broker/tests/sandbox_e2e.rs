@@ -206,6 +206,7 @@ fn two_real_sandboxes_read_delegate_revoke_via_tessera_cli() {
         memory_max_bytes: Some(CgroupLimit::Max(256 << 20)),
         pids_max: Some(CgroupLimit::Max(64)),
         piped_stdio: true,
+        model_route: None,
     };
     let mut spawner = match LauncherSpawner::new(lc, HashMap::from([("agent".into(), profile)])) {
         Ok(s) => s,

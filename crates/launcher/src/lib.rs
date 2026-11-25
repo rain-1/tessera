@@ -46,8 +46,8 @@ pub use probe::{
     SeccompProbe, UserNamespaceProbe,
 };
 pub use profile::{
-    CgroupRequirement, LandlockRequirement, LaunchProfile, LauncherConfig, ResourceLimits, RoBind,
-    StdioMode,
+    CgroupRequirement, LandlockRequirement, LaunchProfile, LauncherConfig, LoopbackShim,
+    ModelRoute, ResourceLimits, RoBind, StdioMode,
 };
 
 /// File descriptor number of the broker channel inside the workload.
@@ -60,6 +60,14 @@ pub const AGENT_ID_ENV: &str = "TESSERA_AGENT_ID";
 pub const SANDBOX_WORKSPACE: &str = "/workspace";
 /// Path of the init shim inside the sandbox.
 pub const SANDBOX_INIT_PATH: &str = "/.tessera/init";
+/// Sandbox path of the model proxy socket (compatibility mode).
+pub const SANDBOX_MODEL_SOCKET: &str = "/.tessera/model.sock";
+/// Sandbox path of the `tessera-netshim` binary (compatibility mode).
+pub const SANDBOX_NETSHIM_PATH: &str = "/.tessera/netshim";
+/// Environment variable announcing [`SANDBOX_MODEL_SOCKET`] to the workload.
+pub const MODEL_SOCKET_ENV: &str = "TESSERA_MODEL_SOCKET";
+/// Environment variable announcing the loopback shim port to the workload.
+pub const MODEL_PORT_ENV: &str = "TESSERA_MODEL_PORT";
 /// Minimum supported bubblewrap version (`--disable-userns` appeared in 0.8.0).
 pub const MIN_BWRAP_VERSION: (u32, u32, u32) = (0, 8, 0);
 /// Landlock ABI the `Required` policy is pinned to (Linux 6.12: ABI 6, which

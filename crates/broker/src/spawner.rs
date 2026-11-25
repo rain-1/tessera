@@ -23,8 +23,8 @@ use std::thread;
 
 use tessera_capability_core::AgentId;
 use tessera_launcher::{
-    AGENT_ID_ENV, AgentLabel, LaunchError, LaunchProfile, Launcher, LauncherConfig, ResourceLimits,
-    SandboxHandle, StdioMode,
+    AGENT_ID_ENV, AgentLabel, LaunchError, LaunchProfile, Launcher, LauncherConfig, LoopbackShim,
+    ModelRoute, ResourceLimits, SandboxHandle, StdioMode,
 };
 
 use crate::convert::agent_label;
@@ -67,6 +67,50 @@ pub struct ProfileSpec {
     /// Pipe stdio to the spawner (tests) instead of inheriting `/dev/null`.
     #[serde(default)]
     pub piped_stdio: bool,
+    /// Compatibility mode: model API route through the host model proxy
+    /// (`docs/compat.md`). An unmediated, unlimited-use baseline channel
+    /// and a disclosure channel (threat model R-2).
+    #[serde(default)]
+    pub model_route: Option<ModelRouteSpec>,
+}
+
+/// Model API route of a compatibility-mode profile.
+///
+/// ```json
+/// "model_route": { "socket": "/run/user/1000/tessera/agent-1/model.sock",
+///                  "loopback_port": 18080,
+///                  "netshim_path": "/usr/libexec/tessera/tessera-netshim" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRouteSpec {
+    /// Host path of the `tessera-model-proxy` socket for this profile.
+    pub socket: PathBuf,
+    /// Loopback TCP port for `tessera-netshim` (omit for harnesses that
+    /// speak HTTP over the Unix socket, e.g. `ANTHROPIC_UNIX_SOCKET`).
+    #[serde(default)]
+    pub loopback_port: Option<u16>,
+    /// Host path of `tessera-netshim`; required with `loopback_port`.
+    #[serde(default)]
+    pub netshim_path: Option<PathBuf>,
+}
+
+impl ModelRouteSpec {
+    /// Convert to the launcher's form.
+    pub fn to_route(&self) -> Result<ModelRoute, String> {
+        let loopback = match (self.loopback_port, &self.netshim_path) {
+            (None, None) => None,
+            (Some(port), Some(path)) => Some(LoopbackShim {
+                port,
+                netshim_path: path.clone(),
+            }),
+            _ => return Err("model_route: loopback_port and netshim_path go together".into()),
+        };
+        Ok(ModelRoute {
+            host_socket: self.socket.clone(),
+            loopback,
+        })
+    }
 }
 
 /// A cgroup limit in a launch profile (security review finding 2): a
@@ -245,6 +289,25 @@ fn prepare_profiles(
             }
             *host = canon;
         }
+        // Compat-mode model route: the socket and netshim must not be (or
+        // lie inside) a protected path such as the admin socket.
+        if let Some(m) = &profile.model_route {
+            for path in std::iter::once(&m.socket).chain(&m.netshim_path) {
+                let canon = fs::canonicalize(path).map_err(|e| {
+                    LaunchError::InvalidProfile(format!(
+                        "profile {name} model route {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                if let Some(p) = protected.iter().find(|p| overlapping(&canon, p)) {
+                    return Err(LaunchError::InvalidProfile(format!(
+                        "profile {name} model route {} overlaps protected host path {}",
+                        canon.display(),
+                        p.display()
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -295,6 +358,9 @@ impl SandboxSpawner for LauncherSpawner {
             }
         }
         lp = lp.limits(p.limits());
+        if let Some(m) = &p.model_route {
+            lp = lp.model_route(m.to_route()?);
+        }
         if p.piped_stdio {
             lp = lp.stdio(StdioMode::Piped, StdioMode::Piped, StdioMode::Piped);
         }
@@ -488,5 +554,67 @@ mod tests {
             prepare_profiles(&mut profiles, &protected),
             Err(LaunchError::InvalidProfile(_))
         ));
+    }
+
+    #[test]
+    fn model_route_must_not_overlap_protected_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let run = root.join("run");
+        let free = root.join("free");
+        fs::create_dir(&run).unwrap();
+        fs::create_dir(&free).unwrap();
+        let admin = run.join("admin.sock");
+        let _a = std::os::unix::net::UnixListener::bind(&admin).unwrap();
+        let model = free.join("model.sock");
+        let _m = std::os::unix::net::UnixListener::bind(&model).unwrap();
+        let protected = [run.clone(), admin.clone()];
+        let mut p = profile();
+        p.model_route = Some(ModelRouteSpec {
+            socket: model,
+            loopback_port: None,
+            netshim_path: None,
+        });
+        let mut profiles = HashMap::from([("compat".to_string(), p)]);
+        prepare_profiles(&mut profiles, &protected).unwrap();
+        profiles.get_mut("compat").unwrap().model_route = Some(ModelRouteSpec {
+            socket: admin,
+            loopback_port: None,
+            netshim_path: None,
+        });
+        assert!(matches!(
+            prepare_profiles(&mut profiles, &protected),
+            Err(LaunchError::InvalidProfile(_))
+        ));
+    }
+
+    #[test]
+    fn model_route_spec() {
+        let p: ProfileSpec = serde_json::from_str(
+            r#"{ "program": "/usr/bin/python3",
+                 "model_route": { "socket": "/run/user/1000/tessera/a/model.sock",
+                                  "loopback_port": 18080,
+                                  "netshim_path": "/usr/libexec/tessera/tessera-netshim" } }"#,
+        )
+        .unwrap();
+        let r = p.model_route.unwrap().to_route().unwrap();
+        assert_eq!(r.loopback.as_ref().unwrap().port, 18080);
+        let socket_only = ModelRouteSpec {
+            socket: "/s".into(),
+            loopback_port: None,
+            netshim_path: None,
+        };
+        assert!(socket_only.to_route().unwrap().loopback.is_none());
+        let half = ModelRouteSpec {
+            loopback_port: Some(1),
+            ..socket_only
+        };
+        assert!(half.to_route().is_err());
+        assert!(
+            serde_json::from_str::<ProfileSpec>(
+                r#"{ "program": "/x", "model_route": { "socket": "/s", "port": 1 } }"#
+            )
+            .is_err()
+        );
     }
 }

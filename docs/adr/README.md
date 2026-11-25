@@ -16,7 +16,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0002](0002-persistence-wal.md) | Append-only hash-chained WAL + fsync | §11, open Q persistence | Accepted (design) |
 | [0003](0003-restart-epoch-fail-closed.md) | Restart: epoch bump, fail closed | §16 Restart, §11 | Accepted (design), model-checked |
 | [0004](0004-peer-authentication.md) | Socketpair per sandbox + SO_PEERCRED | open Q peer auth | Accepted (design) |
-| [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design); amended by 0024 (AIO denied, synchronous stop, startup sweep) |
+| [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design); amended by 0024 (AIO denied, synchronous stop, startup sweep) and 0030 (newer syscalls denied, ENOSYS above the reviewed table, model route) |
 | [0006](0006-fido2-verification.md) | RustCrypto verification, libfido2 transport | §8, changes WP4 wording | Accepted (design) |
 | [0007](0007-https-client.md) | HTTPS client: no redirects/retries, own DNS | §9.4 | Accepted (design) |
 | [0008](0008-verification-strategy.md) | Verus target; tests/proptest/model meanwhile | §16 Verification | Accepted; amended 2026-11-25: Verus pinned, mirrored core verified (`proofs/`) |
@@ -36,6 +36,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0022](0022-broker.md) | Broker: single writer, journal entries, dispatch marker, request-id binding, channel identity, admin endpoint | §5.2, §9, §11, WP3 | Accepted, implemented (tested); gaps closed by 0024 |
 | [0023](0023-bpf-lsm-direct-grants.md) | BPF LSM direct grants: not in MVP; read-only subtree class, libbpf-rs, lease-gated generation protocol | §10.2, §10.3, WP7 | Accepted (no direct grants in MVP); P6 design Proposed, modelled, not kernel-tested |
 | [0024](0024-broker-hardening.md) | Broker hardening: protocol v2 (description, `GrantPending`, `ListCapabilities`), agent spawn in orchestration domains, denial bindings, admission control, hash-chained audit, startup cgroup sweep | §8.1, §9.1, §9.2, §11 | Accepted, implemented (tested) |
+| [0030](0030-compatibility-mode-model-proxy.md) | Compatibility mode: host model proxy, Unix-socket route, loopback shim with one Landlock port | §3.1, §10.1, §12.3, WP6 | Accepted, implemented (tested) |
 | [0031](0031-epoch-compaction.md) | Ledger compaction at the epoch boundary (`CompactEpoch`), retired-pool accounting, archived admin views | §4.4, §6.1, §11; review finding 3 | Accepted, implemented (tested; outside the Verus mirror) |
 | [0032](0032-review-remediation.md) | Review remediation: per-principal workspace retention, explicit `"unlimited"` limits, approval-screen escaping, HTTPS path rules, per-principal dispatch fairness | §8.1, §9.1, §9.4, §11; review findings 1, 2, 5 | Accepted, implemented (tested) |
 
