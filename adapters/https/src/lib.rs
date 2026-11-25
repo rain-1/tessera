@@ -483,6 +483,11 @@ fn clean_path(path: &str) -> bool {
     if !path.starts_with('/') || path.starts_with("//") {
         return false;
     }
+    // Path parameters (`/api/..;/admin`, `/api;x=y/..`) are stripped or
+    // honoured differently by servlet containers and proxies; refuse them.
+    if path.contains(';') {
+        return false;
+    }
     let lower = path.to_ascii_lowercase();
     // Encoded dot, slash, backslash or NUL could be re-interpreted downstream.
     if ["%2e", "%2f", "%5c", "%00"]
@@ -491,13 +496,52 @@ fn clean_path(path: &str) -> bool {
     {
         return false;
     }
-    // No dot segments; empty segments only as a trailing slash.
+    // No dot segments, before or after one round of percent-decoding (a
+    // backend that decodes twice must not see `..`); empty segments only as
+    // a trailing slash.
     let segments: Vec<&str> = path.split('/').skip(1).collect();
     let last = segments.len().saturating_sub(1);
-    !segments
-        .iter()
-        .enumerate()
-        .any(|(i, seg)| *seg == "." || *seg == ".." || (seg.is_empty() && i != last))
+    segments.iter().enumerate().all(|(i, seg)| {
+        let Some(decoded) = percent_decode(seg) else {
+            return false;
+        };
+        !is_dot_segment(seg) && !is_dot_segment(&decoded) && !(seg.is_empty() && i != last)
+    })
+}
+
+fn is_dot_segment(seg: &str) -> bool {
+    seg == "." || seg == ".."
+}
+
+/// One round of percent-decoding of a path segment, refusing malformed
+/// escapes and double encoding (`%25` followed by two hex digits), which a
+/// normalizing backend would decode a second time.
+fn percent_decode(seg: &str) -> Option<String> {
+    let b = seg.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = |c: u8| (c as char).to_digit(16);
+            let (Some(hi), Some(lo)) = (
+                b.get(i + 1).copied().and_then(hex),
+                b.get(i + 2).copied().and_then(hex),
+            ) else {
+                return None;
+            };
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    // Still an escape after one decoding (`%252e`, `%25%32%65`): double
+    // encoding.
+    let escaped = out
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit());
+    (!escaped).then(|| String::from_utf8_lossy(&out).into_owned())
 }
 
 fn path_allowed(path: &str, prefix: &str) -> bool {
@@ -992,6 +1036,9 @@ mod tests {
             ("/api", "/api"),
             ("/api/", "/api/"),
             ("/api/x?y=1&z=%20", "/api/"),
+            ("/api/x?a=1;b=2", "/api"),
+            ("/api/100%25", "/api"),
+            ("/api/a%20b", "/api"),
             ("/api?q=1", "/api"),
             ("/anything", "/"),
         ];
@@ -1011,6 +1058,18 @@ mod tests {
             ("/api/x%2fy", "/api"),
             ("/api/x%5cy", "/api"),
             ("/api/x\\y", "/api"),
+            // Security review (unconfirmed): `..;` and double encoding
+            // against normalizing backends.
+            ("/api/..;/admin", "/api"),
+            ("/api/x;jsessionid=1", "/api"),
+            ("/api;/x", "/api"),
+            ("/api/%252e%252e/admin", "/api"),
+            ("/api/%252E%252e/admin", "/api"),
+            ("/api/x%252fy", "/api"),
+            ("/api/%25%32%65", "/api"),
+            ("/api/%", "/api"),
+            ("/api/%2", "/api"),
+            ("/api/%zz", "/api"),
             ("/api/x#frag", "/api"),
             ("/api/a b", "/api"),
             ("/api/\u{e9}", "/api"),
