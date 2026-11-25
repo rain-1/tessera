@@ -1,0 +1,187 @@
+# Tessera CI (spec WP8).
+#
+# Third-party actions are pinned by full commit SHA (resolved from the
+# release tag noted beside each one; update both together). Rust toolchains
+# come from the runner's preinstalled rustup, not from an action.
+name: CI
+
+on:
+  push:
+    branches: [main, "wp/**"]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1" # weekly: fresh advisories, longer fuzzing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Sandbox prerequisites
+        # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor;
+        # bubblewrap needs them. See docs/install.md "User namespaces".
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+      - name: Unit, property and integration tests
+        # Sandbox tests SKIP (loudly) here if cgroup delegation is missing;
+        # the `sandbox` job below is the strict gate for those.
+        run: cargo test --workspace --locked
+      - name: Build all features
+        run: cargo build --workspace --locked --all-features
+
+  sandbox:
+    name: real sandbox (launcher, broker e2e, adversarial corpus, demo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Sandbox prerequisites
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          cat /sys/kernel/security/lsm || true
+          stat -fc %T /sys/fs/cgroup
+      - name: Build binaries
+        run: cargo build --workspace --locked --bins --tests
+      - name: Run sandbox tests inside a delegated cgroup
+        # The launcher requires a cgroup v2 subtree delegated to the broker
+        # user (memory + pids). The runner is not a systemd user session, so
+        # create a transient service owned by the runner user with
+        # Delegate=yes. Any "SKIPPED" banner fails the job: this job exists
+        # to prove the mandatory controls actually ran.
+        run: |
+          cat > "$RUNNER_TEMP/sandbox.sh" <<'EOF'
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          cargo test --locked -p tessera-launcher --test sandbox -- --nocapture
+          cargo test --locked -p tessera-broker --test sandbox_e2e -- --nocapture
+          tests/adversarial/run.sh
+          scripts/demo.sh
+          EOF
+          sudo systemd-run --wait --pipe --collect \
+            --uid="$(id -u)" --gid="$(id -g)" -p Delegate=yes \
+            --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+            --setenv=CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            --setenv=RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            --setenv=GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            bash "$RUNNER_TEMP/sandbox.sh" 2>&1 | tee "$RUNNER_TEMP/sandbox.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -q "SKIPPED" "$RUNNER_TEMP/sandbox.log"; then
+            echo "::error::a sandbox test was skipped (mandatory control missing)"
+            exit 1
+          fi
+
+  models:
+    name: protocol models (Python + TLC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Explicit-state model checker
+        run: python3 -I models/dispatch_model.py
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: TLC (pinned, checksum-verified tla2tools.jar)
+        run: models/run_tlc.sh
+
+  verus:
+    name: Verus proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: present
+        name: Look for proofs/run_verus.sh
+        run: |
+          if [ -x proofs/run_verus.sh ]; then echo "run=true" >> "$GITHUB_OUTPUT";
+          else echo "run=false" >> "$GITHUB_OUTPUT";
+               echo "::notice::proofs/run_verus.sh not present on this ref; Verus skipped"; fi
+      - name: Verify (pinned, checksum-verified Verus release)
+        if: steps.present.outputs.run == 'true'
+        run: proofs/run_verus.sh
+
+  supply-chain:
+    name: cargo-deny + cargo-audit + SBOM drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2.1.4
+        with:
+          command: check
+          arguments: --all-features
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --ignore RUSTSEC-2026-0387 # same justification as deny.toml
+      - name: SBOM is up to date with Cargo.lock
+        run: |
+          cargo install cargo-cyclonedx --locked
+          scripts/sbom.sh
+          git diff --exit-code -- docs/sbom || {
+            echo "::error::docs/sbom is stale; run scripts/sbom.sh and commit"; exit 1; }
+
+  fuzz-smoke:
+    name: fuzz smoke (cargo-fuzz, nightly)
+    runs-on: ubuntu-latest
+    env:
+      FUZZ_SECS: ${{ github.event_name == 'schedule' && '600' || '30' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+      - name: Run every target for FUZZ_SECS seconds
+        run: make fuzz-smoke FUZZ_SECS="$FUZZ_SECS"
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  reproducible:
+    name: reproducible release build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build twice from two checkouts and compare
+        run: scripts/repro-check.sh
