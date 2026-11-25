@@ -147,10 +147,20 @@ fn apply_landlock(a: &Args, req: LandlockRequirement) -> Result<String, String> 
         for p in paths {
             // Paths absent from this sandbox (e.g. /lib32) are skipped: no rule
             // means no access, which is the safe direction.
+            let Ok(md) = std::fs::metadata(p) else {
+                continue;
+            };
+            // A single-file bind (e.g. one binary) gets a file-level rule:
+            // directory-only rights (ReadDir, MakeReg, ...) do not apply to
+            // a file, and asking for them would downgrade the ruleset to
+            // "partial" and make a Required launch fail.
+            let access = if md.is_dir() {
+                access & fs_all
+            } else {
+                access & AccessFs::from_file(abi)
+            };
             if let Ok(fd) = PathFd::new(p) {
-                created = created
-                    .add_rule(PathBeneath::new(fd, access & fs_all))
-                    .map_err(e)?;
+                created = created.add_rule(PathBeneath::new(fd, access)).map_err(e)?;
             }
         }
     }
