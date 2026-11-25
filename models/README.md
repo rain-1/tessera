@@ -10,6 +10,7 @@ covered by journal fault-injection tests (WP3) and the proof register.
 |---|---|---|
 | `dispatch_model.py` | Explicit-state BFS checker, Python 3 stdlib only | **Run; results below** |
 | `Dispatch.tla` / `Dispatch.cfg` | TLA+ version of the same model (same actions, invariants, `BUG` flag) | **Written, not yet checked with TLC or parsed with SANY** (no TLA+ tools installed). Treat it as a draft until CI runs TLC. |
+| `bpf_generation_model.py` | BPF LSM direct-grant generation/revocation/lease protocol (WP7, spec §10.3), Python 3 stdlib only | **Run; results in "BPF generation model" below** |
 
 ## Running
 
@@ -197,3 +198,102 @@ Bounds as in `Dispatch.cfg` (Budget=2, MaxCrashes=1, MaxMsgs=3, MaxMintReplays=2
 | no-epoch-bump | `RestartInvalidatesGrants` violated |
 
 The Python checker and TLC agree on every variant checked.
+
+## BPF generation model
+
+`bpf_generation_model.py` models the direct-grant update protocol in
+`docs/bpf-lsm.md` §6. That protocol is implemented as a pure state machine
+in `enforcement/ebpf/manager`. Direct grants are not part of the MVP
+(ADR-0023), so this model is design evidence for P6.
+
+### What is modelled
+
+* **Broker.** It issues generations 1–4 for one sandbox:
+  * {a};
+  * {b} (revokes a);
+  * {a} (revokes b, grants a again);
+  * {a, b}.
+
+  It may go down once, and then stops lease renewal.
+* **Manager.** It jumps to the latest issued generation. Each transition
+  runs reconcile, stage (one entry per step), freeze barrier, activate,
+  thaw, delete (one entry per step), then verify and report. A freeze may
+  time out, which aborts the transition and leaves staged entries behind.
+  The manager may crash at any step, and pinned maps survive the crash. On
+  restart it expires the lease, wipes all entries and thaws.
+* **Kernel.** It holds the active generation, the grant entries with
+  `[gen_from, gen_until)`, a frozen flag and a lease counted in ticks.
+* **Workload hooks.** A hook is a CHECK step followed by a COMPLETE step,
+  with at most one hook in flight. A frozen cgroup does neither step, and
+  a freeze completes only when no hook is in flight.
+
+Not modelled:
+* BPF hook coverage (see the hook matrix in `docs/bpf-lsm.md` §4);
+* several sandboxes;
+* map capacity;
+* broker recovery;
+* `ALLOW_MMAP` grants, whose revocation is non-strict by definition.
+
+### Invariants
+
+| Invariant | Meaning |
+|---|---|
+| KernelWithinActiveGeneration | While hooks can run, the entries valid at the active generation are a subset of what that generation grants. No stale or partial generation is usable |
+| NoUseAfterRevocationAck | No access completes after its revocation was acknowledged, unless a later generation grants the object again |
+| AckAfterRemoval | When a revocation is acknowledged, no entry for that object remains |
+| ManagerFailureFailsClosed | No check passes more than LEASE ticks after the manager or broker failed |
+| RestartFailsClosed | After a manager restart, nothing installed before the restart is usable |
+| ActiveNeverAheadOfDesired | The active generation was issued by the broker |
+
+Bug variants:
+* `ack-before-removal`;
+* `no-barrier`;
+* `activate-before-stage`;
+* `no-reconcile`;
+* `no-lease`;
+* `restart-trusts-maps`.
+
+### Results (recorded 2026-11-25, Python 3.13.5)
+
+```text
+$ python3 -I models/bpf_generation_model.py
+[correct] crashes=1 aborts=1 broker_downs=1 objects=2 generations=4 lease=2: 33806 states, 107890 transitions, depth 55 (exhaustive)
+    KernelWithinActiveGeneration: holds
+    NoUseAfterRevocationAck: holds
+    AckAfterRemoval: holds
+    ManagerFailureFailsClosed: holds
+    RestartFailsClosed: holds
+    ActiveNeverAheadOfDesired: holds
+[bug: ack-before-removal] crashes=1 aborts=1 broker_downs=1 objects=2 generations=4 lease=2: 33304 states, depth 54 (exhaustive)
+    AckAfterRemoval violated in 17 steps: revocation of a at generation 2 acked while entries [('a', 1, 2)] remain
+      trace: issue 1 ; begin 0->1 ; issue 2 ; plan ; stage add a@1 ; to-activate ; activate 1 ; thaw ; done ; begin 1->2 ; plan ; stage add b@2 ; stage rem a@2 ; to-freeze ; freeze ; activate 2 ; thaw
+[bug: no-barrier] crashes=1 aborts=1 broker_downs=1 objects=2 generations=4 lease=2: 21082 states, depth 45 (exhaustive)
+    NoUseAfterRevocationAck violated in 20 steps: access to a authorised at generation 1 completed after revocation ack at 2
+      trace: issue 1 ; begin 0->1 ; issue 2 ; plan ; stage add a@1 ; to-activate ; activate 1 ; thaw ; verify+report ; begin 1->2 ; plan ; stage add b@2 ; stage rem a@2 ; to-activate ; check a passes@1 ; activate 2 ; thaw ; delete ('a', 1, 2) ; verify+report ; complete a
+[bug: activate-before-stage] crashes=1 aborts=1 broker_downs=1 objects=2 generations=4 lease=2: 27366 states, depth 45 (exhaustive)
+    KernelWithinActiveGeneration violated in 12 steps: objects ['a'] usable at generation 2, which grants ['b']
+      trace: issue 1 ; begin 0->1 ; issue 2 ; plan ; activate 1 ; stage add a@1 ; to-thaw ; thaw ; verify+report ; begin 1->2 ; plan ; activate 2
+    NoUseAfterRevocationAck violated in 20 steps: access to a authorised at generation 1 completed after revocation ack at 2
+      trace: issue 1 ; begin 0->1 ; issue 2 ; plan ; activate 1 ; stage add a@1 ; to-thaw ; thaw ; verify+report ; begin 1->2 ; plan ; check a passes@1 ; activate 2 ; stage add b@2 ; stage rem a@2 ; to-thaw ; thaw ; delete ('a', 1, 2) ; verify+report ; complete a
+[bug: no-reconcile] crashes=1 aborts=1 broker_downs=1 objects=2 generations=4 lease=2: 33302 states, depth 53 (exhaustive)
+    KernelWithinActiveGeneration violated in 20 steps: objects ['b'] usable at generation 3, which grants ['a']
+      trace: issue 1 ; begin 0->1 ; issue 2 ; plan ; stage add a@1 ; to-activate ; activate 1 ; thaw ; verify+report ; begin 1->2 ; issue 3 ; plan ; stage add b@2 ; stage rem a@2 ; to-freeze ; freeze-timeout (abort) ; begin 1->3 ; plan ; to-activate ; activate 3
+[bug: no-lease] crashes=1 aborts=1 broker_downs=1 objects=2 generations=4 lease=2: 33806 states, depth 54 (exhaustive)
+    ManagerFailureFailsClosed violated in 11 steps: check passed 3 ticks after manager/broker failure (lease 2)
+      trace: issue 1 ; broker down ; begin 0->1 ; plan ; stage add a@1 ; to-activate ; activate 1 ; tick ; tick ; tick ; check a passes@1
+[bug: restart-trusts-maps] crashes=1 aborts=1 broker_downs=1 objects=2 generations=4 lease=2: 39726 states, depth 53 (exhaustive)
+    RestartFailsClosed violated in 9 steps: check passed at generation 1 after a manager restart (only generations > 1 may be used)
+      trace: issue 1 ; begin 0->1 ; plan ; stage add a@1 ; to-activate ; activate 1 ; manager crash ; manager restart ; check a passes@1
+RESULT: as expected (correct protocol safe, every bug variant caught)
+
+$ python3 -I models/bpf_generation_model.py --no-bugs --crashes 2 --aborts 2   (invariant lines omitted: all hold)
+[correct] crashes=2 aborts=2 broker_downs=1 objects=2 generations=4 lease=2: 103244 states, 351739 transitions, depth 65 (exhaustive)
+RESULT: as expected (correct protocol safe, every bug variant caught)
+```
+
+`no-reconcile` is the subtle case. A transition 1→2 stages "add b at 2"
+and then aborts at the freeze. The broker has meanwhile issued 3 = {a}, and
+the next transition jumps 1→3. Without reconcile, the leftover entry
+`(b, 2, ∞)` becomes valid at 3. The Rust test
+`without_reconcile_leftover_becomes_usable` reproduces this: the manager's
+read-back verification catches it and expires the lease (fails closed).

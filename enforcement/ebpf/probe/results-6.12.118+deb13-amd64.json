@@ -1,0 +1,244 @@
+{
+  "active_lsms": [
+    "lockdown",
+    "capability",
+    "landlock",
+    "yama",
+    "apparmor",
+    "tomoyo",
+    "bpf",
+    "ipe",
+    "ima",
+    "evm"
+  ],
+  "arch": "x86_64",
+  "bpf_syscall": {
+    "errno": "Operation not permitted",
+    "tested": true,
+    "unprivileged_map_create": "refused"
+  },
+  "bpffs_mounts": [
+    "bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0"
+  ],
+  "bpftool": null,
+  "btf_vmlinux": {
+    "present": true,
+    "types": 113961
+  },
+  "clang": "/usr/bin/clang",
+  "config": {
+    "CONFIG_BPF_JIT": "y",
+    "CONFIG_BPF_JIT_ALWAYS_ON": "n",
+    "CONFIG_BPF_LSM": "y",
+    "CONFIG_BPF_SYSCALL": "y",
+    "CONFIG_BPF_UNPRIV_DEFAULT_OFF": "y",
+    "CONFIG_CGROUP_BPF": "y",
+    "CONFIG_DEBUG_INFO_BTF": "y",
+    "CONFIG_IO_URING": "y",
+    "CONFIG_LSM": "landlock,lockdown,yama,loadpin,safesetid,integrity,apparmor,selinux,smack,tomoyo,bpf,ipe",
+    "CONFIG_SECURITY": "y",
+    "CONFIG_SECURITY_LANDLOCK": "y",
+    "CONFIG_SECURITY_NETWORK": "y",
+    "CONFIG_SECURITY_PATH": "y"
+  },
+  "config_source": "/boot/config-6.12.118+deb13-amd64",
+  "core_fields": {
+    "dentry.d_sb": {
+      "byte_offset": 104,
+      "type": "struct super_block *"
+    },
+    "file.f_inode": {
+      "byte_offset": 40,
+      "type": "struct inode *"
+    },
+    "file.f_mode": {
+      "byte_offset": 12,
+      "type": "fmode_t"
+    },
+    "file.f_path": {
+      "byte_offset": 64,
+      "type": "struct path"
+    },
+    "inode.i_sb": {
+      "byte_offset": 40,
+      "type": "struct super_block *"
+    },
+    "mount.mnt": {
+      "byte_offset": 32,
+      "type": "struct vfsmount"
+    },
+    "mount.mnt_id_unique": {
+      "byte_offset": 304,
+      "type": "u64"
+    },
+    "path.dentry": {
+      "byte_offset": 8,
+      "type": "struct dentry *"
+    },
+    "path.mnt": {
+      "byte_offset": 0,
+      "type": "struct vfsmount *"
+    },
+    "super_block.s_dev": {
+      "byte_offset": 16,
+      "type": "dev_t"
+    },
+    "vfsmount.mnt_sb": {
+      "byte_offset": 8,
+      "type": "struct super_block *"
+    },
+    "vm_area_struct.vm_file": {
+      "byte_offset": 128,
+      "type": "struct file *"
+    }
+  },
+  "euid": 1000,
+  "kernel_cmdline_lsm": [],
+  "kernel_release": "6.12.118+deb13-amd64",
+  "kernel_version": "Linux version 6.12.118+deb13-amd64 (debian-kernel@lists.debian.org) (x86_64-linux-gnu-gcc-14 (Debian 14.2.0-19) 14.2.0, GNU ld (GNU Binutils for Debian) 2.44) #1 SMP PREEMPT_DYNAMIC Debian 6.12.118-1 (2026-11-20)",
+  "lockdown": "none [integrity] confidentiality",
+  "lsm_attach_targets": {
+    "file_ioctl": {
+      "attach_target": true,
+      "params": [
+        "struct file * file",
+        "unsigned int cmd",
+        "long unsigned int arg"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "file_ioctl_compat": {
+      "attach_target": true,
+      "params": [
+        "struct file * file",
+        "unsigned int cmd",
+        "long unsigned int arg"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "file_mprotect": {
+      "attach_target": true,
+      "params": [
+        "struct vm_area_struct * vma",
+        "long unsigned int reqprot",
+        "long unsigned int prot"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "file_open": {
+      "attach_target": true,
+      "params": [
+        "struct file * file"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "file_permission": {
+      "attach_target": true,
+      "params": [
+        "struct file * file",
+        "int mask"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "file_receive": {
+      "attach_target": true,
+      "params": [
+        "struct file * file"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "inode_getattr": {
+      "attach_target": true,
+      "params": [
+        "struct path * path"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "inode_getxattr": {
+      "attach_target": true,
+      "params": [
+        "struct dentry * dentry",
+        "char * name"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "inode_listxattr": {
+      "attach_target": true,
+      "params": [
+        "struct dentry * dentry"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "inode_readlink": {
+      "attach_target": true,
+      "params": [
+        "struct dentry * dentry"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "mmap_file": {
+      "attach_target": true,
+      "params": [
+        "struct file * file",
+        "long unsigned int reqprot",
+        "long unsigned int prot",
+        "long unsigned int flags"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "path_notify": {
+      "attach_target": true,
+      "params": [
+        "struct path * path",
+        "u64 mask",
+        "unsigned int obj_type"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "socket_connect": {
+      "attach_target": true,
+      "params": [
+        "struct socket * sock",
+        "struct sockaddr * address",
+        "int addrlen"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    },
+    "socket_sendmsg": {
+      "attach_target": true,
+      "params": [
+        "struct socket * sock",
+        "struct msghdr * msg",
+        "int size"
+      ],
+      "params_match_6_12": true,
+      "ret": "int"
+    }
+  },
+  "not_tested_here": [
+    "verifier acceptance of the policy program",
+    "attach (needs CAP_BPF+CAP_PERFMON+CAP_MAC_ADMIN)",
+    "runtime enforcement and overhead"
+  ],
+  "prerequisites_missing": [],
+  "sysctl": {
+    "kernel.unprivileged_bpf_disabled": "2",
+    "net.core.bpf_jit_enable": "1",
+    "net.core.bpf_jit_harden": {
+      "error": "PermissionError: Permission denied"
+    }
+  }
+}
