@@ -15,21 +15,34 @@
 //!       "ca_pem_file": null }
 //!   ],
 //!   "profiles": { "shell": { "program": "/bin/sh", "args": ["-c", "..."] } },
+//!   "agent_spawn_profiles": { "1": { "profile": "shell", "baseline": [] } },
+//!   "limits": { "max_children_per_agent": 8, "max_spawn_depth": 2,
+//!               "max_domain_agents": 16, "max_in_flight_per_agent": 64,
+//!               "agent_rate_per_sec": 100, "agent_rate_burst": 200 },
+//!   "audit_fsync": "every-event",
 //!   "launcher": { "init_path": "/usr/libexec/tessera/tessera-sandbox-init",
+//!                 "cgroup_group": "tesserad",
 //!                 "cgroup_opt_out_reason": null, "landlock": "required" }
 //! }
 //! ```
 //!
+//! `audit_fsync`: `every-event` (default), `every:N` or `never`.
+//! `agent_spawn_profiles` maps the `LaunchProfileId` agents send in `Spawn`
+//! to a trusted profile name and the child's baseline grants; absent means
+//! agents cannot spawn. The launcher's `cgroup_group` must be private to
+//! this broker: on start every leftover sandbox cgroup in it is killed and
+//! removed (refusing to start if that fails).
+//!
 //! Secrets are read from files named here and are never journaled or
 //! audited.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::entry::EndpointSpec;
-use crate::spawner::ProfileSpec;
+use crate::spawner::{AgentSpawnProfile, ProfileSpec};
 
 /// Secret header source.
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +83,27 @@ pub struct LauncherSection {
     /// `required` (default), `best_effort` or `disabled`.
     #[serde(default)]
     pub landlock: Option<String>,
+    /// cgroup group (directory under the delegation root) private to this
+    /// broker; default `tesserad`.
+    #[serde(default)]
+    pub cgroup_group: Option<String>,
+}
+
+/// Optional per-principal limits (defaults from `BrokerConfig`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LimitsSection {
+    /// Children one principal may spawn per epoch.
+    pub max_children_per_agent: Option<u32>,
+    /// Spawn depth below an operator-created principal.
+    pub max_spawn_depth: Option<u32>,
+    /// Principals per orchestration domain.
+    pub max_domain_agents: Option<u32>,
+    /// Requests in flight per principal.
+    pub max_in_flight_per_agent: Option<usize>,
+    /// Sustained requests per second per principal.
+    pub agent_rate_per_sec: Option<u32>,
+    /// Burst per principal.
+    pub agent_rate_burst: Option<u32>,
 }
 
 /// Daemon configuration.
@@ -92,6 +126,15 @@ pub struct DaemonConfig {
     /// Trusted launch profiles.
     #[serde(default)]
     pub profiles: HashMap<String, ProfileSpec>,
+    /// Profiles agents may spawn, by `LaunchProfileId`.
+    #[serde(default)]
+    pub agent_spawn_profiles: BTreeMap<u64, AgentSpawnProfile>,
+    /// Per-principal limits.
+    #[serde(default)]
+    pub limits: LimitsSection,
+    /// Audit log fsync policy (`every-event`, `every:N`, `never`).
+    #[serde(default)]
+    pub audit_fsync: Option<String>,
     /// Launcher.
     #[serde(default)]
     pub launcher: LauncherSection,
@@ -104,10 +147,21 @@ impl DaemonConfig {
         serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// Check that every agent spawn profile names a configured profile.
+    pub fn check(&self) -> Result<(), String> {
+        for (id, p) in &self.agent_spawn_profiles {
+            if !self.profiles.contains_key(&p.profile) {
+                return Err(format!(
+                    "agent_spawn_profiles.{id}: unknown profile {:?}",
+                    p.profile
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve endpoints (reads secrets and CA files).
-    pub fn resolved_endpoints(
-        &self,
-    ) -> Result<Vec<crate::entry::ConfiguredEndpoint>, String> {
+    pub fn resolved_endpoints(&self) -> Result<Vec<crate::entry::ConfiguredEndpoint>, String> {
         let mut out = Vec::new();
         for e in &self.endpoints {
             let mut spec = e.spec.clone();

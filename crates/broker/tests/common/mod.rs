@@ -254,7 +254,18 @@ impl Agent {
         c
     }
 
+    /// Next final message (interim `GrantPending` notices are skipped).
     pub fn recv(&self) -> Option<ServerMessage> {
+        loop {
+            let m = self.recv_any()?;
+            if !matches!(m.response, Response::GrantPending { .. }) {
+                return Some(m);
+            }
+        }
+    }
+
+    /// Next message of any kind.
+    pub fn recv_any(&self) -> Option<ServerMessage> {
         let p = recv_packet(self.fd.as_fd(), limits()).ok()??;
         Some(decode_server(&p, limits().max_frame()).unwrap())
     }
@@ -301,6 +312,7 @@ impl Agent {
             budget: WireBudget::Finite(budget),
             depth: WireDepth::Finite(depth),
             expiry: WireExpiry::Inherit,
+            untrusted_description: None,
         })
     }
 }

@@ -51,6 +51,14 @@ pub enum BindingResult {
     Dropped(CapabilityId),
     /// REVOKE applied.
     Revoked(CapabilityId),
+    /// SPAWN created this child principal.
+    Spawned(AgentId),
+    /// The request reached a final denial (a grant request denied or timed
+    /// out, a spawn that failed). Kept *in memory only* so that a repeat of
+    /// the id gets the same answer for the rest of the epoch; never
+    /// journaled (nothing was created, and every restart ends the epoch and
+    /// with it every principal that could repeat the id).
+    Denied(tessera_protocol::ErrorCode),
 }
 
 impl BindingResult {
@@ -65,6 +73,9 @@ impl BindingResult {
             E::Transferred { capability, .. } => BindingResult::Transferred(*capability),
             E::Dropped { capability, .. } => BindingResult::Dropped(*capability),
             E::Revoked { capability } => BindingResult::Revoked(*capability),
+            // Only bound when the command carried a binding, i.e. an
+            // agent-initiated SPAWN (operator-created principals have none).
+            E::PrincipalCreated { agent } => BindingResult::Spawned(*agent),
             _ => return None,
         })
     }

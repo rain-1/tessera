@@ -56,7 +56,7 @@ pub mod softkey;
 pub mod spawner;
 
 pub use admin::{AdminClient, AdminRequest, AdminResponse};
-pub use audit::{AuditEvent, AuditLog};
+pub use audit::{AuditCheckpoint, AuditEvent, AuditLog, AuditSync};
 pub use broker::Broker;
 pub use clock::{ManualClock, MonotonicClock, TickSource};
 pub use entry::EndpointSpec;
@@ -64,4 +64,4 @@ pub use executor::{
     AdapterExecutor, DispatchJob, ExecResult, Executor, JobOperation, MAX_INLINE_CONTENT,
 };
 pub use reactor::{BrokerConfig, FaultHook, FaultPoint, Services, StartError, StopReason};
-pub use spawner::{LauncherSpawner, ProfileSpec, SandboxSpawner};
+pub use spawner::{AgentSpawnProfile, BaselineGrant, LauncherSpawner, ProfileSpec, SandboxSpawner};

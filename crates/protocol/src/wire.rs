@@ -32,6 +32,14 @@ pub const MAX_HEADER_NAME: usize = 128;
 pub const MAX_HEADER_VALUE: usize = 8192;
 /// Maximum length of a free-form diagnostic string in an error response.
 pub const MAX_DETAIL: usize = 256;
+/// Maximum length (bytes) of the agent's untrusted grant description. It is
+/// shown to the operator only inside a block labelled UNTRUSTED, escaped and
+/// truncated (`tessera_approval::render::escape_untrusted`), and never audited
+/// verbatim (length and digest only).
+pub const MAX_DESCRIPTION: usize = 512;
+/// Maximum capability views in one `Capabilities` response (paginate with
+/// `ListCapabilities { after }`).
+pub const MAX_LIST: usize = 64;
 
 /// Client-chosen request identifier. Scoped by the broker to the
 /// authenticated principal and authority epoch.
@@ -230,6 +238,11 @@ pub enum Request {
         depth: WireDepth,
         /// Expiry asked for.
         expiry: WireExpiry,
+        /// Free text for the operator. **Untrusted**: never a basis for any
+        /// decision, not part of what the operator signs, rendered escaped
+        /// under an UNTRUSTED label (spec §8.1). Part of the canonical request
+        /// bytes, so it is bound to the request id like every other field.
+        untrusted_description: Option<BoundedString<MAX_DESCRIPTION>>,
     },
     /// Consume one unit to perform `operation`.
     Consume {
@@ -300,12 +313,21 @@ pub enum Request {
         /// Trusted profile.
         launch_profile: LaunchProfileId,
     },
-    /// Revoke a capability subtree (admin or designated revoker only).
+    /// Revoke a capability subtree the caller owns (or a descendant of one
+    /// it owns); the operator revokes anything on the admin endpoint.
     Revoke {
         /// Request id.
         request_id: RequestId,
         /// Capability.
         cap_id: CapId,
+    },
+    /// List metadata of the capabilities the *caller* currently owns, in
+    /// ascending id order, starting after `after`. Read-only, no request id.
+    /// This is how a recipient discovers delegated or transferred
+    /// capabilities without out-of-band id passing.
+    ListCapabilities {
+        /// Exclusive lower bound (pagination cursor).
+        after: Option<CapId>,
     },
 }
 
@@ -321,7 +343,7 @@ impl Request {
             | Request::Drop { request_id, .. }
             | Request::Spawn { request_id, .. }
             | Request::Revoke { request_id, .. } => Some(*request_id),
-            Request::Inspect { .. } => None,
+            Request::Inspect { .. } | Request::ListCapabilities { .. } => None,
         }
     }
 }
@@ -540,6 +562,28 @@ pub enum Response {
         code: ErrorCode,
         /// Non-sensitive diagnostic.
         detail: BoundedString<MAX_DETAIL>,
+    },
+    /// Interim answer to `RequestGrant`: the request is queued for the human
+    /// operator. Sent under the same correlation id *before* the final
+    /// `GrantIssued`/`Error`, so a client can tell "waiting for a human" from
+    /// "broker not answering" and use a short timeout for the first reply.
+    /// Repeating the `RequestGrant` with the same request id while it is
+    /// pending yields another `GrantPending` (a status query) and attaches to
+    /// the same approval: one prompt, one mint.
+    GrantPending {
+        /// Request id.
+        request_id: RequestId,
+        /// Milliseconds (broker monotonic clock) until the approval request
+        /// expires; the final answer comes no later than this (plus
+        /// scheduling).
+        expires_in_millis: u64,
+    },
+    /// Capabilities owned by the caller (`ListCapabilities`).
+    Capabilities {
+        /// Views in ascending id order.
+        caps: BoundedVec<WireCapabilityView, MAX_LIST>,
+        /// Whether more capabilities follow the last one listed.
+        more: bool,
     },
 }
 

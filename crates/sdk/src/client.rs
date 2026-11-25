@@ -132,6 +132,11 @@ fn unexpected(resp: Response, wanted: &str) -> Error {
     }
 }
 
+/// An interim response: a final one follows on the same correlation id.
+fn is_interim(r: &Response) -> bool {
+    matches!(r, Response::GrantPending { .. })
+}
+
 fn response_kind(r: &Response) -> &'static str {
     match r {
         Response::GrantIssued { .. } => "GrantIssued",
@@ -145,6 +150,8 @@ fn response_kind(r: &Response) -> &'static str {
         Response::Spawned { .. } => "Spawned",
         Response::Revoked { .. } => "Revoked",
         Response::Error { .. } => "Error",
+        Response::GrantPending { .. } => "GrantPending",
+        Response::Capabilities { .. } => "Capabilities",
     }
 }
 
@@ -158,9 +165,10 @@ fn response_request_id(r: &Response) -> Option<RequestId> {
         | Response::Transferred { request_id, .. }
         | Response::Dropped { request_id }
         | Response::Spawned { request_id, .. }
+        | Response::GrantPending { request_id, .. }
         | Response::Revoked { request_id } => Some(*request_id),
         Response::Error { request_id, .. } => *request_id,
-        Response::Inspected(_) => None,
+        Response::Inspected(_) | Response::Capabilities { .. } => None,
     }
 }
 
@@ -237,10 +245,26 @@ impl Client {
     ///
     /// This is the low-level entry point under every typed method. It checks
     /// the correlation id and, where present, the echoed request id. It does
-    /// *not* turn `Response::Error` into `Err`.
+    /// *not* turn `Response::Error` into `Err`. An interim
+    /// `Response::GrantPending` is returned as the response; the final answer
+    /// that follows it on the same correlation id is then discarded when it
+    /// arrives (repeat the `RequestGrant` with the same request id to wait
+    /// for it).
     pub fn call_raw(&self, request: Request, timeout: Duration) -> Result<Response> {
+        self.exchange(request, Instant::now() + timeout, &mut |_| None)
+    }
+
+    /// Send `request`, then receive until a response for it arrives or
+    /// `deadline` passes. For an interim response, `on_interim` may return a
+    /// new deadline to keep waiting for the final one; `None` returns the
+    /// interim response (and abandons the correlation id).
+    fn exchange(
+        &self,
+        request: Request,
+        mut deadline: Instant,
+        on_interim: &mut dyn FnMut(&Response) -> Option<Instant>,
+    ) -> Result<Response> {
         let rid = request.request_id();
-        let deadline = Instant::now() + timeout;
         let send_limits = FrameLimits::new(self.config.max_send_frame);
         let recv_limits = FrameLimits::new(self.config.max_recv_frame);
         let mut conn = self.lock();
@@ -263,15 +287,18 @@ impl Client {
             .send(&payload, send_limits, deadline)
             .map_err(|e| with_request_id(e, rid))?;
 
+        let abandon = |conn: &mut Conn| {
+            if conn.abandoned.len() == MAX_ABANDONED {
+                conn.abandoned.pop_front();
+            }
+            conn.abandoned.push_back(correlation_id);
+        };
         loop {
             let p = match conn.transport.recv(recv_limits, deadline) {
                 Ok(p) => p,
                 Err(e) => {
                     if matches!(e, Error::Timeout { .. }) {
-                        if conn.abandoned.len() == MAX_ABANDONED {
-                            conn.abandoned.pop_front();
-                        }
-                        conn.abandoned.push_back(correlation_id);
+                        abandon(&mut conn);
                     }
                     return Err(with_request_id(e, rid));
                 }
@@ -280,8 +307,12 @@ impl Client {
                 .map_err(|e| Error::Protocol(format!("undecodable broker message: {e}")))?;
             if msg.correlation_id != correlation_id {
                 if let Some(pos) = conn.abandoned.iter().position(|c| *c == msg.correlation_id) {
-                    // Late answer to a request that timed out earlier.
-                    conn.abandoned.remove(pos);
+                    // Late answer to a request that timed out earlier. An
+                    // interim answer may be followed by a final one, so the
+                    // id stays remembered for that.
+                    if !is_interim(&msg.response) {
+                        conn.abandoned.remove(pos);
+                    }
                     continue;
                 }
                 return Err(Error::Protocol(format!(
@@ -298,6 +329,13 @@ impl Client {
                     )));
                 }
             }
+            if is_interim(&msg.response) {
+                if let Some(d) = on_interim(&msg.response) {
+                    deadline = d;
+                    continue;
+                }
+                abandon(&mut conn);
+            }
             return Ok(msg.response);
         }
     }
@@ -311,14 +349,20 @@ impl Client {
     /// Ask for a new root capability. The broker shows its own normalized
     /// rendering of `terms` to the human operator, who approves, narrows or
     /// denies it on the trusted approval UI (with a security-key touch).
-    /// This call blocks until then, or until
-    /// [`ClientConfig::approval_timeout`].
     ///
-    /// `untrusted_description` is free text for the operator's benefit. It
-    /// is **untrusted** by definition (§8.1) and must never be the basis of
-    /// a decision. *Protocol v1 has no field for it, so it is not sent at
-    /// present*; the parameter is reserved so that callers need not change
-    /// when a later protocol version carries it.
+    /// The broker first answers `GrantPending` (queued for the operator);
+    /// that must arrive within [`ClientConfig::call_timeout`], otherwise
+    /// this returns [`Error::Timeout`] (the broker is not answering). After
+    /// it, this call waits for the decision until
+    /// [`ClientConfig::approval_timeout`] (counted from the start), then
+    /// returns [`Error::ApprovalPending`]: the request is still queued and a
+    /// repeat with the same request id resumes waiting for it.
+    ///
+    /// `untrusted_description` (at most [`tessera_protocol::MAX_DESCRIPTION`]
+    /// bytes) is free text for the operator. It is **untrusted** by
+    /// definition (§8.1): the approval UI shows it escaped, in a separate
+    /// block labelled UNTRUSTED; it is not part of what the operator signs,
+    /// and the audit log records only its length and digest.
     ///
     /// Granted terms may be narrower than requested; call
     /// [`Client::inspect`] to see what was issued.
@@ -330,23 +374,62 @@ impl Client {
         self.request_grant_with_id(new_request_id()?, terms, untrusted_description)
     }
 
-    /// [`Client::request_grant`] with an explicit request id (for retry).
+    /// [`Client::request_grant`] with an explicit request id. Repeating it
+    /// with the same id and arguments while the grant is pending is a status
+    /// query: it attaches to the same approval (one prompt, one mint) and
+    /// returns its outcome; after the decision it returns the same
+    /// capability id, or the same denial.
     pub fn request_grant_with_id(
         &self,
         request_id: RequestId,
         terms: Terms,
-        _untrusted_description: Option<&str>,
+        untrusted_description: Option<&str>,
     ) -> Result<CapId> {
+        self.request_grant_with_progress(request_id, terms, untrusted_description, &mut |_| {})
+    }
+
+    /// [`Client::request_grant_with_id`], calling `on_pending` with the time
+    /// left until the broker's approval request expires each time the
+    /// broker reports the request as queued for the operator.
+    pub fn request_grant_with_progress(
+        &self,
+        request_id: RequestId,
+        terms: Terms,
+        untrusted_description: Option<&str>,
+        on_pending: &mut dyn FnMut(Duration),
+    ) -> Result<CapId> {
+        let untrusted_description = untrusted_description
+            .map(|d| bounded_str("untrusted_description", d))
+            .transpose()?;
         let req = Request::RequestGrant {
             request_id,
             requested_scope: terms.scope,
             budget: terms.budget,
             depth: terms.depth,
             expiry: terms.expiry,
+            untrusted_description,
         };
-        match self.call_raw(req, self.config.approval_timeout)? {
-            Response::GrantIssued { cap_id, .. } => Ok(cap_id),
-            other => Err(unexpected(other, "GrantIssued")),
+        let start = Instant::now();
+        let mut pending = false;
+        let r = self.exchange(
+            req,
+            start + self.config.call_timeout.min(self.config.approval_timeout),
+            &mut |resp| {
+                if let Response::GrantPending {
+                    expires_in_millis, ..
+                } = resp
+                {
+                    pending = true;
+                    on_pending(Duration::from_millis(*expires_in_millis));
+                }
+                Some(start + self.config.approval_timeout)
+            },
+        );
+        match r {
+            Ok(Response::GrantIssued { cap_id, .. }) => Ok(cap_id),
+            Ok(other) => Err(unexpected(other, "GrantIssued")),
+            Err(Error::Timeout { .. }) if pending => Err(Error::ApprovalPending { request_id }),
+            Err(e) => Err(e),
         }
     }
 
@@ -644,15 +727,58 @@ impl Client {
         }
     }
 
-    /// Launch a child sandbox from a trusted launch profile. The child is a
-    /// separate principal with baseline authority only. Returns its id, to
-    /// use as a delegation recipient.
+    /// List metadata of every capability this principal currently owns
+    /// (all statuses), in ascending id order. This is how a recipient finds
+    /// capabilities delegated or transferred to it; ids need not be passed
+    /// out of band. Pages through the broker's `ListCapabilities` (at most
+    /// 4096 entries).
+    pub fn list_capabilities(&self) -> Result<Vec<CapabilityView>> {
+        const MAX_PAGES: usize = 64;
+        let mut out: Vec<CapabilityView> = Vec::new();
+        let mut after: Option<CapId> = None;
+        for _ in 0..MAX_PAGES {
+            match self.call(Request::ListCapabilities { after })? {
+                Response::Capabilities { caps, more } => {
+                    for v in caps.into_inner() {
+                        // Ids must strictly increase (also across pages):
+                        // a broken broker cannot make this loop forever.
+                        if out.last().is_some_and(|l| v.cap_id <= l.cap_id)
+                            || after.is_some_and(|a| v.cap_id <= a)
+                        {
+                            return Err(Error::Protocol(
+                                "capability list is not in ascending id order".into(),
+                            ));
+                        }
+                        out.push(v);
+                    }
+                    match (more, out.last()) {
+                        (true, Some(l)) => after = Some(l.cap_id),
+                        (true, None) => {
+                            return Err(Error::Protocol("empty page claims more".into()));
+                        }
+                        (false, _) => return Ok(out),
+                    }
+                }
+                other => return Err(unexpected(other, "Capabilities")),
+            }
+        }
+        Err(Error::Protocol("capability list exceeds 64 pages".into()))
+    }
+
+    /// Launch a child sandbox from an operator-configured agent launch
+    /// profile. The child is a separate principal in this principal's
+    /// orchestration domain, subject to the broker's quotas (children per
+    /// principal, spawn depth, domain size: `RateLimited` /
+    /// `PermissionDenied`), with only the profile's baseline authority,
+    /// nothing from the parent. Returns its id, to use as a delegation
+    /// recipient. Terminating this principal also terminates its children.
     pub fn spawn(&self, profile: LaunchProfileId) -> Result<AgentId> {
         self.spawn_with_id(new_request_id()?, profile)
     }
 
     /// [`Client::spawn`] with an explicit request id. A retry with the same
-    /// id must not launch a second sandbox.
+    /// id never launches a second sandbox: it returns the same child (or the
+    /// same failure), waiting for the launch if it is still in progress.
     pub fn spawn_with_id(
         &self,
         request_id: RequestId,
@@ -667,8 +793,10 @@ impl Client {
         }
     }
 
-    /// Revoke `cap` and its whole subtree. Only an administrator or a
-    /// designated revoker may do this; other callers get `PermissionDenied`.
+    /// Revoke `cap` and its whole subtree. An agent may revoke a capability
+    /// it owns or any descendant of one it owns (ADR-0014 as amended); the
+    /// operator revokes anything on the admin endpoint. Authorizations
+    /// committed before the revoke stand; none after it.
     pub fn revoke(&self, cap: CapId) -> Result<()> {
         self.revoke_with_id(new_request_id()?, cap)
     }

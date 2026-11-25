@@ -127,16 +127,32 @@ fn run_cli(
     stdin: &[u8],
     reply: impl FnOnce(&ClientMessage) -> Response + Send + 'static,
 ) -> (i32, String, String, Option<ClientMessage>) {
+    run_cli_multi(cli_args, stdin, std::time::Duration::ZERO, move |m| {
+        vec![reply(m)]
+    })
+}
+
+/// Like [`run_cli`], answering the first request with several responses
+/// (e.g. an interim `GrantPending` and then the final answer).
+fn run_cli_multi(
+    cli_args: &str,
+    stdin: &[u8],
+    hold_open: std::time::Duration,
+    reply: impl FnOnce(&ClientMessage) -> Vec<Response> + Send + 'static,
+) -> (i32, String, String, Option<ClientMessage>) {
     let (client_fd, server_fd) = seqpacket_pair().unwrap();
     let broker = thread::spawn(move || {
         let p = recv_packet(&server_fd, FrameLimits::default()).ok()??;
         let msg = decode_client(&p, 1 << 20).unwrap();
-        let resp = encode_server(&ServerMessage {
-            correlation_id: msg.correlation_id,
-            response: reply(&msg),
-        })
-        .unwrap();
-        send_packet(&server_fd, &resp, FrameLimits::default()).unwrap();
+        for response in reply(&msg) {
+            let resp = encode_server(&ServerMessage {
+                correlation_id: msg.correlation_id,
+                response,
+            })
+            .unwrap();
+            send_packet(&server_fd, &resp, FrameLimits::default()).unwrap();
+        }
+        thread::sleep(hold_open);
         Some(msg)
     });
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tessera"));
@@ -266,19 +282,94 @@ fn binary_denial_exit_code_and_json_error() {
 }
 
 #[test]
-fn binary_request_announces_approval_wait() {
-    let (code, out, err, msg) = run_cli(
+fn binary_request_sends_description_and_reports_pending() {
+    let (code, out, err, msg) = run_cli_multi(
         "request --file 3 --budget 1 --description please",
         b"",
-        |m| Response::GrantIssued {
-            request_id: m.request.request_id().unwrap(),
-            cap_id: 0xbeef,
+        std::time::Duration::ZERO,
+        |m| {
+            let request_id = m.request.request_id().unwrap();
+            vec![
+                Response::GrantPending {
+                    request_id,
+                    expires_in_millis: 120_000,
+                },
+                Response::GrantIssued {
+                    request_id,
+                    cap_id: 0xbeef,
+                },
+            ]
         },
     );
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "{err}");
     assert!(err.contains("waiting for operator approval"), "{err}");
+    assert!(err.contains("expires in 120s"), "{err}");
     assert!(out.contains(&format!("{:032x}", 0xbeef)));
-    assert!(matches!(msg.unwrap().request, Request::RequestGrant { .. }));
+    match msg.unwrap().request {
+        Request::RequestGrant {
+            untrusted_description,
+            ..
+        } => assert_eq!(untrusted_description.unwrap().as_str(), "please"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn binary_request_pending_then_client_timeout_is_uncertain() {
+    // Acknowledged (GrantPending) but no decision before the approval
+    // timeout: exit 3 with the id to repeat, not a "broker hung" timeout.
+    let (code, out, err, _) = run_cli_multi(
+        "--json --approval-timeout 300ms request --file 3 --budget 1",
+        b"",
+        std::time::Duration::from_secs(2),
+        |m| {
+            vec![Response::GrantPending {
+                request_id: m.request.request_id().unwrap(),
+                expires_in_millis: 60_000,
+            }]
+        },
+    );
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("still waiting for the operator"), "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["error"]["outcome_uncertain"], true);
+}
+
+#[test]
+fn binary_list_capabilities() {
+    let (code, out, err, msg) = run_cli("--json list", b"", |_| Response::Capabilities {
+        caps: tessera_protocol::bounded::BoundedVec::new(vec![
+            tessera_protocol::WireCapabilityView {
+                cap_id: 0x77,
+                root_id: 0x70,
+                parent: Some(0x71),
+                owner: tessera_protocol::WireAgentId {
+                    epoch: 1,
+                    serial: 2,
+                },
+                scope: WireScope::File {
+                    object_id: 3,
+                    rights: WireFileRights {
+                        read_snapshot: true,
+                        replace_content: false,
+                    },
+                },
+                budget_remaining: WireBudget::Finite(2),
+                depth: WireDepth::Finite(0),
+                expires_in_millis: None,
+                status: tessera_protocol::WireCapStatus::Live,
+            },
+        ])
+        .unwrap(),
+        more: false,
+    });
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["caps"][0]["cap_id"], format!("{:032x}", 0x77));
+    assert!(matches!(
+        msg.unwrap().request,
+        Request::ListCapabilities { after: None }
+    ));
 }
 
 #[test]
