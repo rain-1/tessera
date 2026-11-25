@@ -53,14 +53,19 @@ struct Model {
     next_serial: u64,
     principals: BTreeMap<AgentId, bool>,
     caps: BTreeMap<u128, MCap>,
-    roots: u64,
+    next_cap: u128,
+    /// Epoch of every root record still held.
+    root_epochs: Vec<u64>,
     nonces: BTreeSet<Nonce>,
     requests: BTreeMap<(AgentId, RequestId), (u128, Operation, u64)>,
-    reservations: Vec<ReservationStatus>,
+    reservations: BTreeMap<u64, (AgentId, ReservationStatus)>,
+    next_reservation: u64,
     // Global conservation counters, maintained independently of pools.
     total_initial: u128,
     total_consumed: u128,
     total_discarded: u128,
+    /// Finite balances held by records that compaction removed.
+    retired_stranded: u128,
 }
 
 impl Model {
@@ -72,13 +77,16 @@ impl Model {
             next_serial: 0,
             principals: BTreeMap::new(),
             caps: BTreeMap::new(),
-            roots: 0,
+            next_cap: 0,
+            root_epochs: Vec::new(),
             nonces: BTreeSet::new(),
             requests: BTreeMap::new(),
-            reservations: Vec::new(),
+            reservations: BTreeMap::new(),
+            next_reservation: 0,
             total_initial: 0,
             total_consumed: 0,
             total_discarded: 0,
+            retired_stranded: 0,
         }
     }
 
@@ -120,7 +128,8 @@ impl Model {
     }
 
     fn new_cap(&mut self, owner: AgentId, parent: Option<u128>, generation: u32, t: Terms) {
-        let id = self.caps.len() as u128;
+        let id = self.next_cap;
+        self.next_cap += 1;
         self.caps.insert(
             id,
             MCap {
@@ -179,14 +188,14 @@ impl Model {
         if !self.active(recipient)
             || !Self::issuable(&t, now)
             || Self::full(self.caps.len(), self.limits.max_capabilities)
-            || Self::full(self.roots as usize, self.limits.max_roots)
+            || Self::full(self.root_epochs.len(), self.limits.max_roots)
         {
             return false;
         }
         if let Budget::Finite(n) = t.budget {
             self.total_initial += n as u128;
         }
-        self.roots += 1;
+        self.root_epochs.push(self.epoch);
         self.new_cap(recipient, None, 0, t);
         true
     }
@@ -215,11 +224,26 @@ impl Model {
                 for v in self.principals.values_mut() {
                     *v = false;
                 }
-                for r in &mut self.reservations {
+                for (_, r) in self.reservations.values_mut() {
                     if *r == ReservationStatus::Reserved {
                         *r = ReservationStatus::Abandoned;
                     }
                 }
+                true
+            }
+            AdminCommand::CompactEpoch => {
+                // Specification: forget everything owned in an earlier epoch.
+                let e = self.epoch;
+                self.principals.retain(|a, _| a.epoch() >= e);
+                for c in self.caps.values() {
+                    if let (true, Budget::Finite(b)) = (c.owner.epoch() < e, c.budget) {
+                        self.retired_stranded += b as u128;
+                    }
+                }
+                self.caps.retain(|_, c| c.owner.epoch() >= e);
+                self.root_epochs.retain(|r| *r >= e);
+                self.reservations.retain(|_, (a, _)| a.epoch() >= e);
+                self.requests.retain(|(a, _), _| a.epoch() >= e);
                 true
             }
             AdminCommand::Mint { approval } => {
@@ -242,8 +266,8 @@ impl Model {
             AdminCommand::RecordOutcome {
                 reservation,
                 outcome,
-            } => match self.reservations.get_mut(reservation.to_raw() as usize) {
-                Some(r @ ReservationStatus::Reserved) => {
+            } => match self.reservations.get_mut(&reservation.to_raw()) {
+                Some((_, r @ ReservationStatus::Reserved)) => {
                     *r = match outcome {
                         Outcome::Completed => ReservationStatus::Completed,
                         Outcome::Failed => ReservationStatus::Failed,
@@ -334,11 +358,12 @@ impl Model {
                     }
                     Budget::Unlimited => {}
                 }
-                self.requests.insert(
-                    (caller, request_id),
-                    (id, operation, self.reservations.len() as u64),
-                );
-                self.reservations.push(ReservationStatus::Reserved);
+                let rid = self.next_reservation;
+                self.next_reservation += 1;
+                self.requests
+                    .insert((caller, request_id), (id, operation, rid));
+                self.reservations
+                    .insert(rid, (caller, ReservationStatus::Reserved));
                 true
             }
             AgentCommand::Split { capability, terms } => {
@@ -469,9 +494,11 @@ fn compare(s: &State, m: &Model, now: u64) -> Result<(), TestCaseError> {
             id
         );
     }
-    for (i, st) in m.reservations.iter().enumerate() {
+    prop_assert_eq!(s.reservations().count(), m.reservations.len());
+    prop_assert_eq!(s.roots().count(), m.root_epochs.len());
+    for (i, (_, st)) in &m.reservations {
         prop_assert_eq!(
-            s.reservation(ReservationId::from_raw(i as u64))
+            s.reservation(ReservationId::from_raw(*i))
                 .map(|r| r.status()),
             Some(*st)
         );
@@ -487,12 +514,16 @@ fn compare(s: &State, m: &Model, now: u64) -> Result<(), TestCaseError> {
             Budget::Unlimited => 0,
         })
         .sum();
-    prop_assert_eq!(sum(|a| a.initial), m.total_initial);
-    prop_assert_eq!(sum(|a| a.consumed), m.total_consumed);
-    prop_assert_eq!(sum(|a| a.discarded_explicit), m.total_discarded);
+    let retired = s.retired();
+    prop_assert_eq!(sum(|a| a.initial) + retired.initial, m.total_initial);
+    prop_assert_eq!(sum(|a| a.consumed) + retired.consumed, m.total_consumed);
+    prop_assert_eq!(
+        sum(|a| a.discarded_explicit) + retired.discarded,
+        m.total_discarded + m.retired_stranded
+    );
     prop_assert_eq!(
         m.total_initial,
-        m.total_consumed + m.total_discarded + balances
+        m.total_consumed + m.total_discarded + balances + m.retired_stranded
     );
     prop_assert_eq!(sum(|a| a.live) + sum(|a| a.discarded_stranded), balances);
     for a in &accts {
@@ -571,6 +602,31 @@ proptest! {
         cmds in prop::collection::vec((arb_sym(), 0..3u8, prop::bool::weighted(0.05)), 1..80)
     ) {
         run(Limits::default(), cmds)?;
+    }
+
+    /// ADR-0031: `CompactEpoch` anywhere in the history (not only right after
+    /// a bump) agrees with the model's specification "forget everything
+    /// owned in an earlier epoch", preserves every invariant and the global
+    /// N = U + L + D identity (pruned pools move to `State::retired`).
+    #[test]
+    fn core_refines_reference_model_with_compaction(
+        cmds in prop::collection::vec((arb_sym_with_compaction(), 0..3u8, prop::bool::weighted(0.05)), 1..120)
+    ) {
+        run(Limits::default(), cmds)?;
+    }
+
+    #[test]
+    fn core_refines_reference_model_with_compaction_tight_limits(
+        cmds in prop::collection::vec((arb_sym_with_compaction(), 0..3u8, prop::bool::weighted(0.05)), 1..120)
+    ) {
+        let limits = Limits {
+            max_capabilities: 8,
+            max_principals: 4,
+            max_roots: 3,
+            max_reservations: 6,
+            max_lineage_length: 2,
+        };
+        run(limits, cmds)?;
     }
 
     #[test]

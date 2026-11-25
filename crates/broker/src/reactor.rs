@@ -29,8 +29,8 @@ use tessera_approval as ap;
 use tessera_capability_core::{
     AdminCommand, AgentCommand, AgentId, AuthenticatedCommand, Budget, CapabilityId, Denial,
     EndpointId, Expiry, FileRight, Limits, ObjectId, Operation, Outcome, PrincipalStatus,
-    RequestId, ReservationId, ReservationStatus, RootKind, Scope, State, Tick, check_invariant,
-    step, validate_command,
+    RequestId, ReservationId, ReservationStatus, RootId, RootKind, Scope, State, Tick,
+    check_invariant, step, validate_command,
 };
 use tessera_journal::{Journal, JournalError, RecordKind, Storage};
 use tessera_protocol::{
@@ -102,6 +102,12 @@ pub struct BrokerConfig {
     pub agent_max_frame: usize,
     /// Adapter worker threads.
     pub dispatch_workers: usize,
+    /// Adapter jobs one principal may have on the workers at once; further
+    /// jobs of that principal wait in the broker (not yet marked
+    /// dispatched) and are released round-robin across principals. Keeps
+    /// one principal's slow endpoint from holding every worker. Values
+    /// below 1 count as 1.
+    pub max_dispatch_per_agent: usize,
     /// Endpoints from the daemon configuration `(id, spec, secret header)`.
     pub endpoints: Vec<crate::entry::ConfiguredEndpoint>,
     /// Profiles agents may name in `Spawn`, by `LaunchProfileId` (§9.2).
@@ -153,6 +159,7 @@ impl Default for BrokerConfig {
             require_user_verification: false,
             agent_max_frame: 128 * 1024,
             dispatch_workers: 4,
+            max_dispatch_per_agent: 2,
             endpoints: Vec::new(),
             spawn_profiles: BTreeMap::new(),
             max_children_per_agent: 8,
@@ -324,6 +331,18 @@ struct PendingDispatch {
     root: u128,
 }
 
+/// Bound on an archived lineage walk (the ledger's own bound is
+/// `Limits::max_lineage_length`).
+const MAX_ARCHIVED_LINEAGE: usize = 1024;
+
+/// A reservation left `Reserved` by the previous epoch (reported at start).
+struct UnresolvedReservation {
+    id: ReservationId,
+    owner: AgentId,
+    capability: CapabilityId,
+    root: RootId,
+}
+
 struct ReplayedReplacement {
     reservation: ReservationId,
     intent: FileReplaceIntent,
@@ -354,6 +373,12 @@ pub(crate) struct Reactor<S: Storage> {
     bindings: HashMap<(AgentId, RequestId), ([u8; 32], BindingResult)>,
     dispatched: BTreeSet<ReservationId>,
     pending_dispatch: HashMap<ReservationId, PendingDispatch>,
+    /// Jobs per principal currently handed to the workers.
+    running_dispatch: HashMap<AgentId, usize>,
+    /// Jobs per principal waiting for a worker slot (reserved, not marked).
+    deferred_dispatch: BTreeMap<AgentId, VecDeque<DispatchJob>>,
+    /// Round-robin position among principals with deferred jobs.
+    last_released: Option<AgentId>,
     principals: BTreeSet<AgentId>,
     channels: HashMap<AgentId, ChannelHandle>,
     next_conn: u64,
@@ -376,6 +401,12 @@ pub(crate) struct Reactor<S: Storage> {
     spawning: HashMap<(AgentId, RequestId), SpawnWait>,
     denied: HashMap<AgentId, usize>,
     audit_failed: Option<String>,
+    /// Display-only views of the records the startup compaction pruned
+    /// (the epoch(s) that ended with the last stop), kept for operator
+    /// reconciliation after a crash (ADR-0031). Not ledger state: they
+    /// authorize nothing and do not count against any capacity.
+    archived_caps: Vec<CapView>,
+    archived_reservations: Vec<ReservationView>,
 }
 
 fn journal_err(e: JournalError) -> Stop {
@@ -551,11 +582,16 @@ impl<S: Storage> Reactor<S> {
         // Reservations still unresolved in the previous epoch: never
         // re-dispatched; reported as abandoned (no marker) or unknown
         // (dispatched, outcome lost).
-        let unresolved: Vec<ReservationId> = (0u64..)
-            .map(ReservationId::from_raw)
-            .map_while(|id| state.reservation(id).map(|r| (id, r.status())))
-            .filter(|(_, s)| *s == ReservationStatus::Reserved)
-            .map(|(id, _)| id)
+        // Captured before compaction prunes their records.
+        let unresolved: Vec<UnresolvedReservation> = state
+            .reservations()
+            .filter(|r| r.status() == ReservationStatus::Reserved)
+            .map(|r| UnresolvedReservation {
+                id: r.id(),
+                owner: r.owner(),
+                capability: r.capability(),
+                root: r.root(),
+            })
             .collect();
 
         // Fail closed across restart: new epoch, fresh clock.
@@ -575,6 +611,7 @@ impl<S: Storage> Reactor<S> {
         }
         let epoch = state.epoch();
         bindings.retain(|(a, _), _| a.epoch() == epoch);
+        principals.retain(|a| a.epoch() == epoch);
 
         let mut r = Reactor {
             clock: Clock::new(services.clock),
@@ -590,6 +627,9 @@ impl<S: Storage> Reactor<S> {
             bindings,
             dispatched,
             pending_dispatch: HashMap::new(),
+            running_dispatch: HashMap::new(),
+            deferred_dispatch: BTreeMap::new(),
+            last_released: None,
             principals,
             channels: HashMap::new(),
             next_conn: 0,
@@ -611,6 +651,8 @@ impl<S: Storage> Reactor<S> {
             spawning: HashMap::new(),
             denied: HashMap::new(),
             audit_failed: None,
+            archived_caps: Vec::new(),
+            archived_reservations: Vec::new(),
         };
         r.record(AuditEvent {
             principal: "broker".into(),
@@ -623,19 +665,20 @@ impl<S: Storage> Reactor<S> {
             )),
             ..r.ev()
         });
-        for id in unresolved {
-            let rec = r.state.reservation(id);
+        for u in unresolved {
+            let id = u.id;
+            let rec = Some(&u);
             let effect = if r.dispatched.contains(&id) {
                 "unknown-dispatched-before-restart"
             } else {
                 "abandoned-not-dispatched"
             };
             let ev = AuditEvent {
-                principal: rec.map(|x| agent_str(x.owner())).unwrap_or_default(),
+                principal: rec.map(|x| agent_str(x.owner)).unwrap_or_default(),
                 kind: "recovery".into(),
                 reservation: Some(id.to_raw()),
-                capability: rec.map(|x| x.capability().to_raw()),
-                root: rec.map(|x| x.root().to_raw()),
+                capability: rec.map(|x| x.capability.to_raw()),
+                root: rec.map(|x| x.root.to_raw()),
                 outcome: "ok".into(),
                 effect: Some(effect.into()),
                 detail: Some("never re-dispatched".into()),
@@ -643,6 +686,7 @@ impl<S: Storage> Reactor<S> {
             };
             r.record(ev);
         }
+        r.archive_and_compact()?;
         // Registries (re-registration checks every file identity).
         for (_, f) in files {
             let pending = replacements.remove(&f.object).filter(|r| !r.resolved);
@@ -674,6 +718,82 @@ impl<S: Storage> Reactor<S> {
             r.install_enrollment(e);
         }
         Ok(r)
+    }
+
+    /// ADR-0031: keep display views of every record of earlier epochs, then
+    /// prune them from the ledger. `CompactEpoch` is journaled before it is
+    /// applied, like every other transition, so replay reproduces it.
+    fn archive_and_compact(&mut self) -> Result<(), StartError> {
+        let epoch = self.state.epoch();
+        let old_caps: Vec<CapabilityId> = self
+            .state
+            .capabilities()
+            .filter(|c| c.owner().epoch() < epoch)
+            .map(|c| c.id())
+            .collect();
+        self.archived_caps = old_caps
+            .into_iter()
+            .filter_map(|id| self.cap_view(id))
+            .collect();
+        self.archived_reservations = self
+            .reservation_views(false)
+            .into_iter()
+            .filter(|r| r.owner.epoch() < epoch)
+            .collect();
+        let compact = AuthenticatedCommand::operator(AdminCommand::CompactEpoch);
+        let tick = self.state.clock();
+        validate_command(&self.state, &compact, tick)
+            .map_err(|d| StartError::Replay(format!("compaction: {d:?}")))?;
+        self.journal
+            .append(
+                &Entry::Command {
+                    tick,
+                    command: compact,
+                    binding: None,
+                    file_identity: None,
+                }
+                .encode(),
+            )
+            .map_err(StartError::Journal)?;
+        let effect = step(&mut self.state, compact, tick)
+            .map_err(|d| StartError::Replay(format!("compaction: {d:?}")))?;
+        check_invariant(&self.state).map_err(|v| StartError::Replay(format!("{v:?}")))?;
+        let epoch_now = self.state.epoch();
+        self.dispatched.retain(|id| {
+            self.state
+                .reservation(*id)
+                .is_some_and(|r| r.owner().epoch() == epoch_now)
+        });
+        if let tessera_capability_core::Effect::EpochCompacted {
+            principals,
+            capabilities,
+            roots,
+            pools,
+            reservations,
+            initial,
+            consumed,
+            discarded,
+        } = effect
+        {
+            let retired = self.state.retired();
+            self.record(AuditEvent {
+                principal: "broker".into(),
+                kind: "epoch-compaction".into(),
+                outcome: "ok".into(),
+                detail: Some(format!(
+                    "pruned principals={principals} capabilities={capabilities} roots={roots} \
+                     pools={pools} reservations={reservations}; pruned pools N={initial} U={consumed} \
+                     D={discarded}; cumulative pools={} N={} U={} D={}; roots below {} retired",
+                    retired.pools,
+                    retired.initial,
+                    retired.consumed,
+                    retired.discarded,
+                    self.state.retired_roots_below()
+                )),
+                ..self.ev()
+            });
+        }
+        Ok(())
     }
 
     fn restore_file(
@@ -1696,17 +1816,6 @@ impl<S: Storage> Reactor<S> {
                 let root = reservation.root().to_raw();
                 self.record(ev);
                 self.fault(FaultPoint::AfterConsumeCommit)?;
-                // Durable dispatch-started marker, then hand off.
-                self.journal
-                    .append(
-                        &Entry::Dispatched {
-                            reservation: res_id,
-                        }
-                        .encode(),
-                    )
-                    .map_err(journal_err)?;
-                self.dispatched.insert(res_id);
-                self.fault(FaultPoint::AfterDispatchMarker)?;
                 self.pending_dispatch.insert(
                     res_id,
                     PendingDispatch {
@@ -1721,8 +1830,13 @@ impl<S: Storage> Reactor<S> {
                     reservation,
                     operation: job_op,
                 };
-                if let Some(j) = &self.jobs {
-                    let _ = j.send(job);
+                if self.running_dispatch.get(&agent).copied().unwrap_or(0) < self.dispatch_cap() {
+                    self.release_job(agent, job)?;
+                } else {
+                    self.deferred_dispatch
+                        .entry(agent)
+                        .or_default()
+                        .push_back(job);
                 }
             }
             Ok((other, _)) => {
@@ -1747,9 +1861,134 @@ impl<S: Storage> Reactor<S> {
         Ok(())
     }
 
+    fn dispatch_cap(&self) -> usize {
+        self.cfg.max_dispatch_per_agent.max(1)
+    }
+
+    /// Durable dispatch-started marker, then hand the job to a worker.
+    fn release_job(&mut self, agent: AgentId, job: DispatchJob) -> Flow {
+        let res_id = job.id();
+        self.journal
+            .append(
+                &Entry::Dispatched {
+                    reservation: res_id,
+                }
+                .encode(),
+            )
+            .map_err(journal_err)?;
+        self.dispatched.insert(res_id);
+        self.fault(FaultPoint::AfterDispatchMarker)?;
+        *self.running_dispatch.entry(agent).or_insert(0) += 1;
+        if let Some(j) = &self.jobs {
+            let _ = j.send(job);
+        }
+        Ok(())
+    }
+
+    /// Release deferred jobs, one per principal per turn, round-robin in
+    /// principal order after the last one served, while slots are free.
+    fn release_deferred(&mut self) -> Flow {
+        let cap = self.dispatch_cap();
+        loop {
+            let ready = |a: &AgentId| self.running_dispatch.get(a).copied().unwrap_or(0) < cap;
+            let next = self
+                .deferred_dispatch
+                .keys()
+                .filter(|a| ready(a))
+                .min_by_key(|a| (Some(**a) <= self.last_released, **a))
+                .copied();
+            let Some(agent) = next else {
+                return Ok(());
+            };
+            let Some(queue) = self.deferred_dispatch.get_mut(&agent) else {
+                return Ok(());
+            };
+            let job = queue.pop_front();
+            if queue.is_empty() {
+                self.deferred_dispatch.remove(&agent);
+            }
+            let Some(job) = job else { continue };
+            self.last_released = Some(agent);
+            // Revocation, expiry and termination also stop what is not yet
+            // dispatched: a deferred job is released only while its
+            // capability is still live, so no dispatch marker ever follows
+            // the record that ended its authority.
+            match self
+                .state
+                .live(job.reservation.capability(), self.clock.now())
+            {
+                Ok(_) => self.release_job(agent, job)?,
+                Err(n) => {
+                    let code = cv::denial_code(Denial::NotLive(n));
+                    self.fail_job(agent, job, code, &format!("not dispatched: {n:?}"))?;
+                }
+            }
+        }
+    }
+
+    /// Resolve a never-dispatched job as failed (no effect happened; the
+    /// budget stays spent, as for every failed dispatch) and tell the agent.
+    fn fail_job(&mut self, agent: AgentId, job: DispatchJob, code: ErrorCode, why: &str) -> Flow {
+        let reservation = job.id();
+        drop(job);
+        let pending = self.pending_dispatch.remove(&reservation);
+        let r = self.commit(
+            AuthenticatedCommand::operator(AdminCommand::RecordOutcome {
+                reservation,
+                outcome: Outcome::Failed,
+            }),
+            None,
+            None,
+        )?;
+        let ev = AuditEvent {
+            principal: agent_str(agent),
+            kind: "effect".into(),
+            journal_seq: r.as_ref().ok().map(|(_, j)| *j),
+            reservation: Some(reservation.to_raw()),
+            outcome: match &r {
+                Ok(_) => "ok".into(),
+                Err(d) => format!("not-recorded:{d:?}"),
+            },
+            effect: Some("failed".into()),
+            detail: Some(why.into()),
+            ..self.ev()
+        };
+        self.record(ev);
+        if let Some(p) = pending {
+            let rid = p.request_id.to_raw();
+            self.reply(agent, p.correlation, error(Some(rid), code, why));
+        }
+        Ok(())
+    }
+
+    /// A terminated principal's jobs that never reached a worker are not
+    /// dispatched.
+    fn fail_deferred(&mut self, agent: AgentId) -> Flow {
+        let Some(jobs) = self.deferred_dispatch.remove(&agent) else {
+            return Ok(());
+        };
+        for job in jobs {
+            self.fail_job(
+                agent,
+                job,
+                ErrorCode::Revoked,
+                "not dispatched: principal terminated",
+            )?;
+        }
+        Ok(())
+    }
+
     fn on_dispatched(&mut self, reservation: ReservationId, result: ExecResult) -> Flow {
         self.fault(FaultPoint::AfterDispatchBeforeOutcome)?;
         let pending = self.pending_dispatch.remove(&reservation);
+        if let Some(p) = &pending
+            && let Some(n) = self.running_dispatch.get_mut(&p.agent)
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.running_dispatch.remove(&p.agent);
+            }
+        }
         let (outcome, effect, fid) = match &result {
             ExecResult::Completed { new_identity, .. } => {
                 (Outcome::Completed, "completed", *new_identity)
@@ -1800,7 +2039,9 @@ impl<S: Storage> Reactor<S> {
         }
         self.record(ev);
         self.fault(FaultPoint::AfterOutcomeBeforeResponse)?;
-        let Some(p) = pending else { return Ok(()) };
+        let Some(p) = pending else {
+            return self.release_deferred();
+        };
         let rid = p.request_id.to_raw();
         let resp = if r.is_err() {
             // The reservation was abandoned meanwhile (emergency stop).
@@ -1823,7 +2064,7 @@ impl<S: Storage> Reactor<S> {
             }
         };
         self.reply(p.agent, p.correlation, resp);
-        Ok(())
+        self.release_deferred()
     }
 
     // ------------------------------------------------------------------
@@ -2654,6 +2895,7 @@ impl<S: Storage> Reactor<S> {
         }
         self.queue.retain(|p| p.agent != agent);
         self.approval_begins.remove(&agent);
+        self.fail_deferred(agent)?;
         // Pending spawns of this principal: their children are in `children`
         // already and are terminated below; drop the waiters.
         self.spawning.retain(|(p, _), _| *p != agent);
@@ -3023,6 +3265,27 @@ impl<S: Storage> Reactor<S> {
             AdminRequest::Lineage { capability } => {
                 let id = CapabilityId::from_raw(capability);
                 let mut ids: Vec<CapabilityId> = self.state.lineage(id);
+                if ids.is_empty() {
+                    // Archived (compacted) record: walk the archived views.
+                    let mut cur = self.cap_view(id);
+                    while let Some(c) = cur.filter(|_| ids.len() <= MAX_ARCHIVED_LINEAGE) {
+                        ids.push(CapabilityId::from_raw(c.id));
+                        cur = c
+                            .parent
+                            .and_then(|p| self.cap_view(CapabilityId::from_raw(p)));
+                    }
+                    ids.reverse();
+                    let mut frontier = vec![capability];
+                    while let Some(p) = frontier.pop() {
+                        for c in self.archived_caps.iter().filter(|c| c.parent == Some(p)) {
+                            ids.push(CapabilityId::from_raw(c.id));
+                            frontier.push(c.id);
+                        }
+                    }
+                    return Ok(Some(AdminResponse::Caps(
+                        ids.into_iter().filter_map(|i| self.cap_view(i)).collect(),
+                    )));
+                }
                 ids.reverse();
                 // Subtree (descendants), breadth-first in id order.
                 let mut frontier = vec![id];
@@ -3035,12 +3298,14 @@ impl<S: Storage> Reactor<S> {
                 AdminResponse::Caps(ids.into_iter().filter_map(|i| self.cap_view(i)).collect())
             }
             AdminRequest::Tree => AdminResponse::Caps(
-                self.state
-                    .capabilities()
-                    .map(|c| c.id())
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .filter_map(|i| self.cap_view(i))
+                self.archived_caps
+                    .iter()
+                    .cloned()
+                    .chain(
+                        self.state
+                            .capabilities()
+                            .filter_map(|c| self.ledger_cap_view(c.id())),
+                    )
                     .collect(),
             ),
             AdminRequest::Accounts => AdminResponse::Accounts(
@@ -3102,6 +3367,14 @@ impl<S: Storage> Reactor<S> {
         agents.extend(self.spawning.values().map(|w| w.child));
         self.channels.clear();
         self.spawning.clear();
+        // Never-dispatched jobs of the old epoch: their reservations were
+        // just abandoned by the bump (no dispatch marker, so recovery and
+        // the operator see them as not dispatched).
+        for (_, jobs) in std::mem::take(&mut self.deferred_dispatch) {
+            for job in jobs {
+                self.pending_dispatch.remove(&job.id());
+            }
+        }
         self.orch.clear();
         self.domain_size.clear();
         self.spawned.clear();
@@ -3165,7 +3438,18 @@ impl<S: Storage> Reactor<S> {
         v
     }
 
+    /// The ledger's view of `id`, or the archived view if a startup
+    /// compaction pruned it.
     fn cap_view(&self, id: CapabilityId) -> Option<CapView> {
+        self.ledger_cap_view(id).or_else(|| {
+            self.archived_caps
+                .binary_search_by_key(&id.to_raw(), |c| c.id)
+                .ok()
+                .map(|i| self.archived_caps[i].clone())
+        })
+    }
+
+    fn ledger_cap_view(&self, id: CapabilityId) -> Option<CapView> {
         let c = self.state.capability(id)?;
         let now = self.clock.now();
         Some(CapView {
@@ -3196,10 +3480,21 @@ impl<S: Storage> Reactor<S> {
         })
     }
 
+    /// Archived views (pruned earlier epochs) first, then the ledger's.
     fn reservation_views(&self, only_uncertain: bool) -> Vec<ReservationView> {
-        (0u64..)
-            .map(ReservationId::from_raw)
-            .map_while(|id| self.state.reservation(id))
+        let archived = self
+            .archived_reservations
+            .iter()
+            .filter(|r| !only_uncertain || !matches!(r.status.as_str(), "completed" | "failed"))
+            .cloned();
+        archived
+            .chain(self.ledger_reservation_views(only_uncertain))
+            .collect()
+    }
+
+    fn ledger_reservation_views(&self, only_uncertain: bool) -> Vec<ReservationView> {
+        self.state
+            .reservations()
             .filter_map(|r| {
                 let id = r.id();
                 let status = match r.status() {
@@ -3451,10 +3746,9 @@ mod tests {
                     b"original"
                 }
             );
-            assert_ne!(
-                r.state.reservation(job.id()).unwrap().status(),
-                ReservationStatus::Completed
-            );
+            // The outcome never became durable as Completed; the reservation
+            // belonged to the previous epoch and was compacted (ADR-0031).
+            assert_eq!(r.state.reservation(job.id()).map(|x| x.status()), None);
             drop(r);
             let r = open(root.path(), storage);
             assert!(r.file_ok.contains(&object));
@@ -3646,9 +3940,12 @@ mod tests {
         );
 
         drop(r);
+        // Replay applied the journaled split regardless of the quota, then
+        // the restart compacted the previous epoch (ADR-0031).
         let r = open(root_dir.path(), storage);
-        assert_eq!(r.state.capability(child).unwrap().owner(), other);
+        assert!(r.state.capability(child).is_none());
         assert!(!r.state.is_active(other));
+        assert!(r.state.retired().pools > 0);
     }
 
     #[test]

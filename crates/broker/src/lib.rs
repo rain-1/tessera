@@ -66,4 +66,6 @@ pub use executor::{
 };
 pub use ledger_quota::LedgerQuotas;
 pub use reactor::{BrokerConfig, FaultHook, FaultPoint, Services, StartError, StopReason};
-pub use spawner::{AgentSpawnProfile, BaselineGrant, LauncherSpawner, ProfileSpec, SandboxSpawner};
+pub use spawner::{
+    AgentSpawnProfile, BaselineGrant, CgroupLimit, LauncherSpawner, ProfileSpec, SandboxSpawner,
+};

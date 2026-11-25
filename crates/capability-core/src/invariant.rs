@@ -59,6 +59,9 @@ pub enum InvariantViolation {
     Reservation(ReservationId),
     /// Pool consumed counter disagrees with its reservation count.
     ConsumedMismatch(PoolId),
+    /// Pruned-pool totals do not balance, or the pruned-root floor is
+    /// inconsistent with the root records or the root counter.
+    Retired,
 }
 
 /// Check every structural and accounting invariant:
@@ -74,7 +77,10 @@ pub enum InvariantViolation {
 /// * pool membership and conservation `N = U + D_explicit + Σ balances`,
 ///   and the derived `N = U + L + D` at the recorded clock;
 /// * U equals the number of reservations charged to the pool;
-/// * nonce table ↔ approved roots is a bijection (each nonce once).
+/// * nonce table ↔ approved roots is a bijection (each nonce once), except
+///   that a nonce may name a root below `retired_roots_below` that
+///   `CompactEpoch` pruned;
+/// * retired (pruned) pool totals balance: `initial = consumed + discarded`.
 pub fn check_invariant(s: &State) -> Result<(), InvariantViolation> {
     use InvariantViolation as V;
 
@@ -196,10 +202,20 @@ pub fn check_invariant(s: &State) -> Result<(), InvariantViolation> {
         }
     }
 
+    // -- retired (compacted) records ----------------------------------------------
+    if s.retired_roots_below > s.next_root
+        || s.retired.consumed.checked_add(s.retired.discarded) != Some(s.retired.initial)
+    {
+        return Err(V::Retired);
+    }
+
     // -- roots and nonces -------------------------------------------------------
     for (k, r) in &s.roots {
         if *k != r.id || r.id.to_raw() >= s.next_root {
             return Err(V::KeyMismatch);
+        }
+        if r.id.to_raw() < s.retired_roots_below {
+            return Err(V::Retired);
         }
         let c = s
             .capabilities
@@ -218,9 +234,11 @@ pub fn check_invariant(s: &State) -> Result<(), InvariantViolation> {
         }
     }
     for (n, rid) in &s.spent_nonces {
-        let r = s.roots.get(rid).ok_or(V::Nonce(*n))?;
-        if r.kind != (RootKind::Approved { nonce: *n }) {
-            return Err(V::Nonce(*n));
+        match s.roots.get(rid) {
+            Some(r) if r.kind == (RootKind::Approved { nonce: *n }) => {}
+            // Redeemed by a root that CompactEpoch pruned: stays spent.
+            None if rid.to_raw() < s.retired_roots_below => {}
+            _ => return Err(V::Nonce(*n)),
         }
     }
 

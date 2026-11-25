@@ -33,6 +33,9 @@ pub enum Sym {
     Terminate(Who),
     Advance,
     Bump(u64),
+    /// `CompactEpoch` (only from [`arb_sym_with_compaction`]; the Verus
+    /// mirror does not model it).
+    Compact,
     Mint {
         nonce: u8,
         wrong_epoch: bool,
@@ -175,15 +178,29 @@ pub fn arb_sym() -> impl Strategy<Value = Sym> {
     ]
 }
 
+/// [`arb_sym`] plus `CompactEpoch` (ADR-0031). Not used by the Verus
+/// differential test: compaction is outside the mirrored command set.
+pub fn arb_sym_with_compaction() -> impl Strategy<Value = Sym> {
+    prop_oneof![
+        12 => arb_sym(),
+        1 => Just(Sym::Compact),
+    ]
+}
+
 pub struct Ctx<'a> {
     pub s: &'a State,
     pub now: u64,
 }
 
 impl Ctx<'_> {
+    /// The `n`-th existing capability, or (one slot in `count + 1`) an id
+    /// that does not exist. With dense ids this is `n % (count + 1)`.
     fn cap(&self, n: u8) -> CapabilityId {
-        let count = self.s.capabilities().count() as u128;
-        CapabilityId::from_raw(n as u128 % (count + 1))
+        let ids: Vec<CapabilityId> = self.s.capabilities().map(|c| c.id()).collect();
+        let i = n as usize % (ids.len() + 1);
+        ids.get(i)
+            .copied()
+            .unwrap_or_else(|| CapabilityId::from_raw(ids.last().map_or(0, |c| c.to_raw() + 1)))
     }
     fn who(&self, w: &Who, cap: Option<CapabilityId>) -> AgentId {
         let e = self.s.epoch();
@@ -278,6 +295,7 @@ impl Ctx<'_> {
             }),
             Sym::Advance => op(A::AdvanceClock),
             Sym::Bump(_) => op(A::BumpEpoch),
+            Sym::Compact => op(A::CompactEpoch),
             Sym::Mint {
                 nonce,
                 wrong_epoch,

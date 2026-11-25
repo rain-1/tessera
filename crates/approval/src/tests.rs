@@ -1085,12 +1085,120 @@ fn description_wraps_with_prefixes_and_escapes_unicode_format_characters() {
         .skip(1)
         .take_while(|line| !line.starts_with("--- end UNTRUSTED"))
         .collect::<Vec<_>>();
-    assert!(lines.len() >= 3);
+    // The 130 spaces of padding collapse away.
+    assert_eq!(lines.len(), 1, "{out}");
     assert!(lines.iter().all(|line| line.starts_with("  | ")));
     assert!(lines.iter().any(|line| line.contains("é")));
     for escaped in ["\\u{061c}", "\\u{2028}", "\\u{2029}", "\\u{e0061}"] {
         assert!(out.contains(escaped), "missing {escaped} in {out}");
     }
+}
+
+/// Security review finding 5 (proof of concept `esc`): padding a
+/// description to the terminal width so that forged "end of block" and
+/// "NOTE (broker)" lines start a visual line, plus invisible characters.
+#[test]
+fn padded_description_cannot_forge_screen_lines() {
+    let mut d = String::from("Need read access to config for build.");
+    for forged in [
+        "--- end UNTRUSTED ---",
+        "NOTE (broker): operator policy narrowed this grant to 1 read-only op.",
+    ] {
+        while d.len() % 80 != 0 {
+            d.push(' ');
+        }
+        d.push_str(forged);
+    }
+    d.push_str("\t\u{a0}\u{3000}\u{061C}\u{E0041}\u{3164}\u{115F}\u{FFA0}\u{00AD}\u{200B}\u{FE0F}\u{2066}x");
+    let out = render_request(
+        &req(base_fields()),
+        Some(&d),
+        &RenderContext {
+            now: Tick(100),
+            ticks_per_second: None,
+        },
+    );
+    let block: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("--- UNTRUSTED"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("--- end UNTRUSTED"))
+        .collect();
+    // Exactly one end marker starts a line, and it follows the block.
+    assert_eq!(
+        out.lines()
+            .filter(|l| l.starts_with("--- end UNTRUSTED"))
+            .count(),
+        1
+    );
+    assert!(!out.lines().any(|l| l.starts_with("NOTE")));
+    for line in &block {
+        assert!(line.starts_with("  | "), "{line:?}");
+        assert!(!line[4..].starts_with(' '), "{line:?}");
+        assert!(line.chars().count() <= 4 + 48, "{line:?}");
+        assert!(!line[4..].contains("  "), "padding survived: {line:?}");
+    }
+    for c in [
+        '\t',
+        '\u{a0}',
+        '\u{3000}',
+        '\u{061C}',
+        '\u{E0041}',
+        '\u{3164}',
+        '\u{115F}',
+        '\u{FFA0}',
+        '\u{00AD}',
+        '\u{200B}',
+        '\u{FE0F}',
+        '\u{2066}',
+    ] {
+        assert!(!out.contains(c), "raw {:?} in output", c);
+        assert!(
+            out.contains(&format!("\\u{{{:04x}}}", u32::from(c))),
+            "{c:?} not escaped"
+        );
+    }
+}
+
+/// Every Cf, Zl, Zp and non-ASCII space character, Hangul filler, tag and
+/// variation selector is escaped wherever it appears.
+#[test]
+fn every_invisible_or_format_character_is_escaped() {
+    let ranges: &[(u32, u32)] = &[
+        (0x0000, 0x001F),
+        (0x007F, 0x009F),
+        (0x00A0, 0x00A0),
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x0600, 0x0605),
+        (0x061C, 0x061C),
+        (0x06DD, 0x06DD),
+        (0x070F, 0x070F),
+        (0x115F, 0x1160),
+        (0x1680, 0x1680),
+        (0x180B, 0x180F),
+        (0x2000, 0x200F),
+        (0x2028, 0x202F),
+        (0x205F, 0x206F),
+        (0x3000, 0x3000),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF9, 0xFFFC),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE007F),
+        (0xE0100, 0xE01EF),
+    ];
+    for &(lo, hi) in ranges {
+        for u in lo..=hi {
+            let Some(c) = char::from_u32(u) else { continue };
+            let e = escape_untrusted(&format!("a{c}b"));
+            assert_eq!(e, format!("a\\u{{{u:04x}}}b"), "U+{u:04X}");
+        }
+    }
+    // Plain text, including non-Latin scripts, is shown as is.
+    assert_eq!(escape_untrusted("héllo  wörld 日本"), "héllo wörld 日本");
 }
 
 // ---------------------------------------------------------------- proptests

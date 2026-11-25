@@ -173,6 +173,23 @@ pub enum AdminCommand {
         /// Outcome.
         outcome: Outcome,
     },
+    /// Appended last: the journal encodes commands by variant index.
+    ///
+    /// Prune every record that belongs to an earlier epoch (ADR-0031):
+    /// principals of earlier epochs, roots issued in earlier epochs with
+    /// their whole capability trees, pools and reservations, and the
+    /// request-id index entries of those reservations. Such records can never
+    /// authorize again (their owners are terminated and stale), so pruning
+    /// them changes no answer about current authority; it only frees the
+    /// configured record capacity for the current epoch.
+    ///
+    /// Kept: every spent nonce (T7), the id allocation counters (ids are
+    /// never reused), and cumulative totals of the pruned pools
+    /// ([`crate::State::retired`]): `initial = consumed + discarded`, where
+    /// `discarded` includes the balances stranded in the pruned records.
+    /// The broker journals this command at startup, right after `BumpEpoch`,
+    /// so replay reproduces it.
+    CompactEpoch,
 }
 
 /// A command together with its externally established caller.
@@ -334,6 +351,26 @@ pub enum Effect {
         reservation: ReservationId,
         /// New status.
         status: ReservationStatus,
+    },
+    /// [`AdminCommand::CompactEpoch`]: what was pruned. The unit totals are
+    /// those of the pruned pools only; `initial == consumed + discarded`.
+    EpochCompacted {
+        /// Principal records removed.
+        principals: u64,
+        /// Capability records removed.
+        capabilities: u64,
+        /// Root records removed.
+        roots: u64,
+        /// Pools removed.
+        pools: u64,
+        /// Reservation records (and request-id entries) removed.
+        reservations: u64,
+        /// N of the pruned pools.
+        initial: u128,
+        /// U of the pruned pools.
+        consumed: u128,
+        /// D of the pruned pools (explicit and stranded).
+        discarded: u128,
     },
 }
 

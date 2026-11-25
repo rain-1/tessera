@@ -36,6 +36,8 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0022](0022-broker.md) | Broker: single writer, journal entries, dispatch marker, request-id binding, channel identity, admin endpoint | §5.2, §9, §11, WP3 | Accepted, implemented (tested); gaps closed by 0024 |
 | [0023](0023-bpf-lsm-direct-grants.md) | BPF LSM direct grants: not in MVP; read-only subtree class, libbpf-rs, lease-gated generation protocol | §10.2, §10.3, WP7 | Accepted (no direct grants in MVP); P6 design Proposed, modelled, not kernel-tested |
 | [0024](0024-broker-hardening.md) | Broker hardening: protocol v2 (description, `GrantPending`, `ListCapabilities`), agent spawn in orchestration domains, denial bindings, admission control, hash-chained audit, startup cgroup sweep | §8.1, §9.1, §9.2, §11 | Accepted, implemented (tested) |
+| [0031](0031-epoch-compaction.md) | Ledger compaction at the epoch boundary (`CompactEpoch`), retired-pool accounting, archived admin views | §4.4, §6.1, §11; review finding 3 | Accepted, implemented (tested; outside the Verus mirror) |
+| [0032](0032-review-remediation.md) | Review remediation: per-principal workspace retention, explicit `"unlimited"` limits, approval-screen escaping, HTTPS path rules, per-principal dispatch fairness | §8.1, §9.1, §9.4, §11; review findings 1, 2, 5 | Accepted, implemented (tested) |
 
 ## Specification inconsistencies and gaps found in WP0
 

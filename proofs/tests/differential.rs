@@ -158,6 +158,11 @@ fn command(c: core::AuthenticatedCommand) -> m::AuthenticatedCommand {
             }
             A::AdvanceClock => m::AdminCommand::AdvanceClock,
             A::BumpEpoch => m::AdminCommand::BumpEpoch,
+            // ADR-0031: compaction renumbers nothing but leaves sparse ids,
+            // which the mirror's index-as-id representation cannot express.
+            // The generator used here (`arb_sym`) never emits it; it is
+            // covered by the production model test instead.
+            A::CompactEpoch => unreachable!("CompactEpoch is outside the mirrored command set"),
             A::Mint { approval } => {
                 let r = approval.request();
                 m::AdminCommand::Mint {
@@ -332,6 +337,7 @@ fn effect(e: &core::Effect) -> m::Effect {
             terminated_principals: *terminated_principals,
             abandoned_reservations: *abandoned_reservations,
         },
+        E::EpochCompacted { .. } => unreachable!("CompactEpoch is never generated here"),
         E::RootCreated {
             root,
             capability,

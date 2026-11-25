@@ -576,9 +576,16 @@ fn file_backed_journal_restart_resurrects_nothing() {
 
     let b = start(&h);
     assert_eq!(status(&b).epoch, 2);
+    // The previous epoch was compacted out of the ledger (ADR-0031); the
+    // operator still sees it as an archived view, and in the audit log.
     let old = common::cap(&b, cap);
     assert_eq!(old.budget, "4", "history preserved");
     assert!(old.status.contains("StaleEpoch"), "{}", old.status);
+    assert_eq!(
+        status(&b).capabilities,
+        0,
+        "nothing of it left in the ledger"
+    );
     // The file slot is re-registered after an identity check and usable.
     let mut n = Agent::attach(&b);
     let c2 = baseline(&b, n.id, obj, 1, 0);
@@ -595,6 +602,24 @@ fn file_backed_journal_restart_resurrects_nothing() {
         })
         .collect();
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
+    let events: Vec<tessera_broker::AuditEvent> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "consume" && e.capability == Some(cap))
+    );
+    let compaction = events
+        .iter()
+        .rfind(|e| e.kind == "epoch-compaction")
+        .expect("compaction audited");
+    let detail = compaction.detail.as_deref().unwrap();
+    assert!(
+        detail.contains("capabilities=1") && detail.contains("N=5 U=1 D=4"),
+        "{detail}"
+    );
 }
 
 #[test]

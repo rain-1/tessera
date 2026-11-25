@@ -97,6 +97,6 @@ pub use scope::{
 };
 pub use state::{
     Capability, Limits, NotLive, Outcome, PoolAccount, PrincipalStatus, ReplayError,
-    ReservationRecord, ReservationStatus, RootKind, RootRecord, State, Status, Terms,
+    ReservationRecord, ReservationStatus, RetiredPools, RootKind, RootRecord, State, Status, Terms,
 };
 pub use step::{step, validate_command};

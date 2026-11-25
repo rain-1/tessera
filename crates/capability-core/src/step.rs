@@ -16,6 +16,8 @@
 // variants would only add allocation and indirection for the verifier.
 #![allow(clippy::large_enum_variant)]
 
+use std::collections::BTreeSet;
+
 use crate::budget::{Budget, Depth, Tick};
 use crate::command::{
     AdminCommand, AgentCommand, AuthenticatedCommand, Denial, Effect, Reservation, Resource,
@@ -24,8 +26,8 @@ use crate::command::{
 use crate::ids::{AgentId, CapabilityId, Nonce, PoolId, RequestId, ReservationId, RootId};
 use crate::scope::{Operation, is_subset, permits};
 use crate::state::{
-    Capability, Outcome, Pool, PrincipalStatus, ReservationRecord, ReservationStatus, RootKind,
-    RootRecord, State, Status, Terms,
+    Capability, Outcome, Pool, PrincipalStatus, ReservationRecord, ReservationStatus, RetiredPools,
+    RootKind, RootRecord, State, Status, Terms,
 };
 
 /// Apply one authenticated command at trusted time `now`.
@@ -84,6 +86,20 @@ struct NewRoot {
     next_pool: u64,
 }
 
+/// Precomputed `CompactEpoch`: the sets to remove and the new totals.
+struct Compaction {
+    principals: BTreeSet<AgentId>,
+    roots: BTreeSet<RootId>,
+    capabilities: BTreeSet<CapabilityId>,
+    pools: BTreeSet<PoolId>,
+    reservations: BTreeSet<ReservationId>,
+    retired_roots_below: u128,
+    retired: RetiredPools,
+    initial: u128,
+    consumed: u128,
+    discarded: u128,
+}
+
 enum Change {
     CreatePrincipal {
         agent: AgentId,
@@ -98,6 +114,7 @@ enum Change {
         terminated: u64,
         abandoned: u64,
     },
+    CompactEpoch(Compaction),
     NewRoot(NewRoot),
     Consume {
         capability: CapabilityId,
@@ -186,6 +203,7 @@ fn plan_admin(s: &State, cmd: &AdminCommand, now: Tick) -> Result<Change, Denial
         AdminCommand::TerminatePrincipal { agent } => plan_terminate(s, *agent),
         AdminCommand::AdvanceClock => Ok(Change::AdvanceClock),
         AdminCommand::BumpEpoch => plan_bump_epoch(s),
+        AdminCommand::CompactEpoch => plan_compact_epoch(s),
         AdminCommand::Mint { approval } => plan_mint(s, approval, now),
         AdminCommand::InstallBaseline { recipient, terms } => {
             plan_new_root(s, *recipient, *terms, RootKind::Baseline, None, now)
@@ -363,6 +381,121 @@ fn plan_bump_epoch(s: &State) -> Result<Change, Denial> {
         terminated: u64::try_from(terminated).map_err(|_| Denial::ArithmeticOverflow)?,
         abandoned: u64::try_from(abandoned).map_err(|_| Denial::ArithmeticOverflow)?,
     })
+}
+
+/// COMPACT (ADR-0031). Prunes exactly the records of earlier epochs:
+/// principals whose epoch is older, roots issued in an older epoch with
+/// every capability, pool and reservation of their lineage, and the
+/// request-id entries of those reservations.
+///
+/// Soundness argument (checked by `check_invariant` and the model test):
+/// a capability's owner is always a principal of the epoch its root was
+/// issued in (MINT/baseline recipients, DELEGATE and TRANSFER recipients
+/// must be active, i.e. of the current epoch, and every derivation needs a
+/// live parent). Hence no retained record refers to a pruned one, and no
+/// pruned record is live. Root ids grow with epochs, so the pruned roots
+/// are exactly the ids below `retired_roots_below`.
+///
+/// ensures: Ok ==> spent nonces, epoch and every id counter are unchanged.
+fn plan_compact_epoch(s: &State) -> Result<Change, Denial> {
+    let epoch = s.epoch;
+    let principals: BTreeSet<AgentId> = s
+        .principals
+        .keys()
+        .filter(|a| a.epoch() < epoch)
+        .copied()
+        .collect();
+    let roots: BTreeSet<RootId> = s
+        .roots
+        .values()
+        .filter(|r| r.epoch < epoch)
+        .map(|r| r.id)
+        .collect();
+    let retired_roots_below = s
+        .roots
+        .values()
+        .filter(|r| r.epoch >= epoch)
+        .map(|r| r.id.to_raw())
+        .min()
+        .unwrap_or(s.next_root)
+        .max(s.retired_roots_below);
+    let capabilities: BTreeSet<CapabilityId> = s
+        .capabilities
+        .values()
+        .filter(|c| roots.contains(&c.root))
+        .map(|c| c.id)
+        .collect();
+    let pools: BTreeSet<PoolId> = s
+        .pools
+        .values()
+        .filter(|p| roots.contains(&p.root))
+        .map(|p| p.id)
+        .collect();
+    let reservations: BTreeSet<ReservationId> = s
+        .reservations
+        .values()
+        .filter(|r| roots.contains(&r.root))
+        .map(|r| r.id)
+        .collect();
+    let overflow = |_| Denial::ArithmeticOverflow;
+    let mut initial: u128 = 0;
+    let mut consumed: u128 = 0;
+    let mut discarded: u128 = 0;
+    for id in &pools {
+        let p = &s.pools[id];
+        initial = initial
+            .checked_add(u128::from(p.initial))
+            .ok_or(Denial::ArithmeticOverflow)?;
+        consumed = consumed
+            .checked_add(u128::from(p.consumed))
+            .ok_or(Denial::ArithmeticOverflow)?;
+        discarded = discarded
+            .checked_add(u128::from(p.discarded))
+            .ok_or(Denial::ArithmeticOverflow)?;
+    }
+    // Balances stranded in pruned records join D.
+    for id in &capabilities {
+        if let Budget::Finite(b) = s.capabilities[id].budget {
+            discarded = discarded
+                .checked_add(u128::from(b))
+                .ok_or(Denial::ArithmeticOverflow)?;
+        }
+    }
+    let count = |n: usize| u64::try_from(n).map_err(overflow);
+    let retired = RetiredPools {
+        pools: s
+            .retired
+            .pools
+            .checked_add(count(pools.len())?)
+            .ok_or(Denial::ArithmeticOverflow)?,
+        initial: s
+            .retired
+            .initial
+            .checked_add(initial)
+            .ok_or(Denial::ArithmeticOverflow)?,
+        consumed: s
+            .retired
+            .consumed
+            .checked_add(consumed)
+            .ok_or(Denial::ArithmeticOverflow)?,
+        discarded: s
+            .retired
+            .discarded
+            .checked_add(discarded)
+            .ok_or(Denial::ArithmeticOverflow)?,
+    };
+    Ok(Change::CompactEpoch(Compaction {
+        principals,
+        roots,
+        capabilities,
+        pools,
+        reservations,
+        retired_roots_below,
+        retired,
+        initial,
+        consumed,
+        discarded,
+    }))
 }
 
 /// MINT. requires: approval verified by the trusted approval service (A3).
@@ -871,6 +1004,27 @@ fn commit(s: &mut State, sequence: u64, now: Tick, change: Change) -> Effect {
                 terminated_principals: terminated,
                 abandoned_reservations: abandoned,
             }
+        }
+        Change::CompactEpoch(c) => {
+            let effect = Effect::EpochCompacted {
+                principals: c.principals.len() as u64,
+                capabilities: c.capabilities.len() as u64,
+                roots: c.roots.len() as u64,
+                pools: c.pools.len() as u64,
+                reservations: c.reservations.len() as u64,
+                initial: c.initial,
+                consumed: c.consumed,
+                discarded: c.discarded,
+            };
+            s.principals.retain(|a, _| !c.principals.contains(a));
+            s.roots.retain(|id, _| !c.roots.contains(id));
+            s.capabilities.retain(|id, _| !c.capabilities.contains(id));
+            s.pools.retain(|id, _| !c.pools.contains(id));
+            s.reservations.retain(|id, _| !c.reservations.contains(id));
+            s.requests.retain(|_, r| !c.reservations.contains(r));
+            s.retired_roots_below = c.retired_roots_below;
+            s.retired = c.retired;
+            effect
         }
         Change::NewRoot(nr) => {
             let effect = Effect::RootCreated {

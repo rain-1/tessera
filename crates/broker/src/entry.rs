@@ -257,6 +257,32 @@ mod tests {
     use super::*;
     use tessera_capability_core::AdminCommand;
 
+    /// Journals written by earlier versions must keep decoding: commands are
+    /// encoded by variant index, so new variants are only ever appended.
+    #[test]
+    fn command_variant_tags_are_stable() {
+        let tag = |c: AdminCommand| {
+            postcard::to_allocvec(&AuthenticatedCommand::operator(c)).unwrap()[..2].to_vec()
+        };
+        assert_eq!(tag(AdminCommand::CreatePrincipal), [1, 0]);
+        assert_eq!(tag(AdminCommand::AdvanceClock), [1, 2]);
+        assert_eq!(tag(AdminCommand::BumpEpoch), [1, 3]);
+        assert_eq!(
+            tag(AdminCommand::Revoke {
+                capability: CapabilityId::from_raw(0)
+            }),
+            [1, 6]
+        );
+        assert_eq!(
+            tag(AdminCommand::RecordOutcome {
+                reservation: ReservationId::from_raw(0),
+                outcome: tessera_capability_core::Outcome::Failed
+            }),
+            [1, 7]
+        );
+        assert_eq!(tag(AdminCommand::CompactEpoch), [1, 8]);
+    }
+
     #[test]
     fn roundtrip() {
         let e = Entry::Command {

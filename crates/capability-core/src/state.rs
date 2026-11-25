@@ -272,6 +272,24 @@ impl PoolAccount {
     }
 }
 
+/// Cumulative accounting of the pools pruned by
+/// [`crate::AdminCommand::CompactEpoch`] (ADR-0031). Every pruned pool had no
+/// live member (all of its holders belonged to an earlier epoch), so its
+/// N = U + L + D identity had L = 0; the balances still held by its records
+/// are added to `discarded` (they were already counted as stranded D).
+/// Checked by [`crate::check_invariant`]: `initial == consumed + discarded`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredPools {
+    /// Number of pools pruned.
+    pub pools: u64,
+    /// Σ N of the pruned pools.
+    pub initial: u128,
+    /// Σ U of the pruned pools.
+    pub consumed: u128,
+    /// Σ D (explicit and stranded) of the pruned pools.
+    pub discarded: u128,
+}
+
 /// Dispatch status of a reservation. No transition ever refunds budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReservationStatus {
@@ -409,6 +427,11 @@ pub struct State {
     pub(crate) reservations: BTreeMap<ReservationId, ReservationRecord>,
     #[serde(with = "seq_map")]
     pub(crate) requests: BTreeMap<(AgentId, RequestId), ReservationId>,
+    /// Every root id below this was pruned by `CompactEpoch`; their spent
+    /// nonces remain in `spent_nonces`.
+    pub(crate) retired_roots_below: u128,
+    /// Accounting of pruned pools.
+    pub(crate) retired: RetiredPools,
 }
 
 /// Unchecked mirror of [`State`] used only for deserialization.
@@ -437,6 +460,8 @@ struct StateRepr {
     reservations: BTreeMap<ReservationId, ReservationRecord>,
     #[serde(with = "seq_map")]
     requests: BTreeMap<(AgentId, RequestId), ReservationId>,
+    retired_roots_below: u128,
+    retired: RetiredPools,
 }
 
 impl<'de> Deserialize<'de> for State {
@@ -461,6 +486,8 @@ impl<'de> Deserialize<'de> for State {
             spent_nonces: r.spent_nonces,
             reservations: r.reservations,
             requests: r.requests,
+            retired_roots_below: r.retired_roots_below,
+            retired: r.retired,
         };
         check_invariant(&s)
             .map_err(|v| serde::de::Error::custom(format!("invariant violation: {v:?}")))?;
@@ -504,6 +531,8 @@ impl State {
             spent_nonces: BTreeMap::new(),
             reservations: BTreeMap::new(),
             requests: BTreeMap::new(),
+            retired_roots_below: 0,
+            retired: RetiredPools::default(),
         }
     }
 
@@ -566,6 +595,18 @@ impl State {
     /// Has this approval nonce been redeemed (in any epoch)?
     pub fn is_nonce_spent(&self, nonce: &Nonce) -> bool {
         self.spent_nonces.contains_key(nonce)
+    }
+    /// All reservation records in id order.
+    pub fn reservations(&self) -> impl Iterator<Item = &ReservationRecord> {
+        self.reservations.values()
+    }
+    /// Root ids below this value were pruned by `CompactEpoch`.
+    pub fn retired_roots_below(&self) -> u128 {
+        self.retired_roots_below
+    }
+    /// Cumulative accounting of pools pruned by `CompactEpoch`.
+    pub fn retired(&self) -> RetiredPools {
+        self.retired
     }
     /// Reservation record.
     pub fn reservation(&self, id: ReservationId) -> Option<&ReservationRecord> {
