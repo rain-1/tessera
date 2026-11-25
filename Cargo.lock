@@ -1390,6 +1390,12 @@ dependencies = [
 [[package]]
 name = "tessera-cli"
 version = "0.1.0"
+dependencies = [
+ "command-fds",
+ "serde_json",
+ "tessera-protocol",
+ "tessera-sdk",
+]
 
 [[package]]
 name = "tessera-journal"
@@ -1431,6 +1437,11 @@ dependencies = [
 [[package]]
 name = "tessera-sdk"
 version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tessera-protocol",
+ "thiserror",
+]
 
 [[package]]
 name = "thiserror"

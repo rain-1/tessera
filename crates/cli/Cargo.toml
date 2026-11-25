@@ -2,5 +2,21 @@
 name = "tessera-cli"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+rust-version.workspace = true
+description = "In-sandbox agent CLI for the Tessera capability broker (untrusted client)"
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
 
 [dependencies]
+tessera-sdk = { path = "../sdk" }
+serde_json = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tessera-protocol = { path = "../protocol" }
+command-fds = "0.3"

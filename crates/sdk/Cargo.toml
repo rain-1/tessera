@@ -2,5 +2,18 @@
 name = "tessera-sdk"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+rust-version.workspace = true
+description = "Untrusted client SDK for the Tessera capability broker"
 
 [dependencies]
+tessera-protocol = { path = "../protocol" }
+rustix = { version = "1.1.6", features = ["net", "fs", "rand"] }
+thiserror = "2.0.21"
+
+[lints]
+workspace = true
+
+[[example]]
+name = "swarm_demo"
+path = "examples/swarm_demo.rs"
