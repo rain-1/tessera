@@ -1,0 +1,77 @@
+# cargo-deny policy for Tessera (spec WP8: supply chain).
+# Run: `cargo deny check` (or `just deny`).
+
+[graph]
+# The broker runs only on Linux; don't pull in other platforms' dependency
+# trees (and their licenses/advisories) for evaluation.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# RustSec advisory DB. Any vulnerability, or an unmaintained/unsound crate
+# anywhere in the graph, fails the check unless explicitly ignored here with
+# a justification.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = [
+    # crypto-bigint 0.5.5 (via p256 0.13 -> elliptic-curve 0.13): secret-
+    # dependent branches in "constant-time" arithmetic. No 0.5.x fix; the
+    # fixed line (0.7.6+) requires the p256/elliptic-curve 0.14 series.
+    # Exposure: production brokers only *verify* ES256 signatures (public
+    # inputs). Secret-key operations happen only in the development software
+    # authenticator (softkey.rs, FileAuthenticator), which must not be used
+    # in production. Remove this entry when p256 is upgraded.
+    { id = "RUSTSEC-2026-0387", reason = "verify-only use in production; tracked for p256 0.14 upgrade" },
+]
+
+[licenses]
+# Permissive licenses compatible with Apache-2.0 distribution.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# ring: OpenSSL/ISC-style license text that cargo-deny cannot always classify.
+[[licenses.clarify]]
+crate = "ring"
+expression = "Apache-2.0 AND ISC"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# Workspace crates use `path = ...` dependencies without versions. cargo-deny
+# treats those as wildcards unless the crate is `publish = false`; the crate
+# manifests do not set that yet (owned by the crate work packages), so this
+# is a warning, not an error. Registry wildcards are still visible here.
+# TODO: set `publish = false` in every workspace crate and change to "deny".
+wildcards = "warn"
+allow-wildcard-paths = true
+highlight = "all"
+# Crates we never want in the trusted computing base.
+deny = [
+    # Tessera uses rustls; a second TLS stack in the TCB is a review burden.
+    { crate = "openssl", reason = "use rustls" },
+    { crate = "openssl-sys", reason = "use rustls" },
+    { crate = "native-tls", reason = "use rustls" },
+]
+
+[sources]
+# Only crates.io; no git dependencies or alternative registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

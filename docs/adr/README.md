@@ -19,7 +19,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design) |
 | [0006](0006-fido2-verification.md) | RustCrypto verification, libfido2 transport | §8, changes WP4 wording | Accepted (design) |
 | [0007](0007-https-client.md) | HTTPS client: no redirects/retries, own DNS | §9.4 | Accepted (design) |
-| [0008](0008-verification-strategy.md) | Verus target; tests/proptest/model meanwhile | §16 Verification | Accepted; Verus not installed |
+| [0008](0008-verification-strategy.md) | Verus target; tests/proptest/model meanwhile | §16 Verification | Accepted; amended 2026-11-25: Verus pinned, mirrored core verified (`proofs/`) |
 | [0009](0009-project-name-and-brand.md) | Name and mark: Tessera | — | Accepted |
 | [0010](0010-product-boundary.md) | External platform, not a harness | §16 Product boundary | Accepted |
 | [0011](0011-scope-language.md) | Small typed exact-resource scopes | §16 Scope | Accepted |
@@ -27,13 +27,14 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0013](0013-delegation.md) | Single owner, split/transfer, bounded depth | §16 Delegation | Accepted |
 | [0014](0014-revocation.md) | Recursive prospective revocation; operator, or agent within its own subtree | §16 Revocation | Accepted, implemented (amended by 0022) |
 | [0015](0015-attenuation.md) | Non-retroactive attenuation | §16 Attenuation | Accepted |
-| [0016](0016-enforcement-split.md) | Brokered finite enforcement; BPF LSM deferred | §16 Finite/Direct enforcement, open Q BPF toolchain | Accepted / Deferred |
+| [0016](0016-enforcement-split.md) | Brokered finite enforcement; BPF LSM deferred | §16 Finite/Direct enforcement, open Q BPF toolchain | Accepted / Deferred (refined by 0023) |
 | [0017](0017-human-approval-and-ui.md) | FIDO2 UP/UV, isolated approval UI | §16 Human approval, open Q UI deployment | Proposed |
 | [0018](0018-target-host-and-isolation.md) | Pinned kernel/distro | §16 Isolation, open Q kernel | Proposed |
 | [0019](0019-file-object-identity.md) | Logical file slots | open Q file slot identity | Proposed |
 | [0020](0020-model-api-credentials.md) | Model API proxy and credentials | open Q model API | Proposed |
 | [0021](0021-independent-review.md) | Independent review | open Q review resources | Open |
 | [0022](0022-broker.md) | Broker: single writer, journal entries, dispatch marker, request-id binding, channel identity, admin endpoint | §5.2, §9, §11, WP3 | Accepted, implemented (tested) |
+| [0023](0023-bpf-lsm-direct-grants.md) | BPF LSM direct grants: not in MVP; read-only subtree class, libbpf-rs, lease-gated generation protocol | §10.2, §10.3, WP7 | Accepted (no direct grants in MVP); P6 design Proposed, modelled, not kernel-tested |
 
 ## Specification inconsistencies and gaps found in WP0
 

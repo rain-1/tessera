@@ -1375,6 +1375,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-bpf-manager"
+version = "0.1.0"
+
+[[package]]
 name = "tessera-broker"
 version = "0.1.0"
 dependencies = [

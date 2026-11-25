@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0afcff14eaba613929aca6464bd497eef061d18f3384070dce1152ca2c9683bb # shrinks to cmds = [(Create, 0, false), (Mint { nonce: 0, wrong_epoch: false, req_exp: 1, recipient: Serial(0), terms: STerms { scope: None, budget: Some(Finite(1)), depth: None, expiry: None } }, 0, false), (Delegate { caller: OwnerOf, cap: 8, recipient: Serial(0), terms: STerms { scope: None, budget: None, depth: None, expiry: None } }, 0, false)]
+cc 28a9788716bd5dfa3933a92de3668e51812a1ffaef6392f9884145545fd54c35 # shrinks to cmds = [(Create, 0, false), (Mint { nonce: 2, wrong_epoch: false, req_exp: 1, recipient: Serial(0), terms: STerms { scope: None, budget: None, depth: None, expiry: None } }, 0, false), (Mint { nonce: 0, wrong_epoch: false, req_exp: 1, recipient: Serial(0), terms: STerms { scope: None, budget: None, depth: None, expiry: None } }, 0, false), (Split { caller: OwnerOf, cap: 15, terms: STerms { scope: None, budget: None, depth: None, expiry: None } }, 0, false), (RepeatLast, 0, false)]
