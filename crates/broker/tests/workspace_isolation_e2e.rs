@@ -118,6 +118,7 @@ fn sandboxes_from_one_profile_share_no_workspace_socket_or_file() {
         memory_max_bytes: Some(CgroupLimit::Max(256 << 20)),
         pids_max: Some(CgroupLimit::Max(64)),
         piped_stdio: true,
+        model_route: None,
     };
     let mut spawner = match LauncherSpawner::new(lc, HashMap::from([("agent".into(), profile)])) {
         Ok(s) => s,
