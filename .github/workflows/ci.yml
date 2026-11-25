@@ -131,6 +131,9 @@ jobs:
       - name: Verify (pinned, checksum-verified Verus release)
         if: steps.present.outputs.run == 'true'
         run: proofs/run_verus.sh
+      - name: Differential test (Verus mirror vs production core)
+        if: steps.present.outputs.run == 'true'
+        run: cd proofs && cargo test --locked
 
   supply-chain:
     name: cargo-deny + cargo-audit + SBOM drift

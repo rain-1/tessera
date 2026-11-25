@@ -41,6 +41,7 @@ tlc: ## TLC on models/Dispatch.tla (downloads a pinned tla2tools.jar; needs java
 verus: ## Verus proofs (needs proofs/run_verus.sh from the verification branch)
 	@if [ -x proofs/run_verus.sh ]; then proofs/run_verus.sh; \
 	 else echo "proofs/run_verus.sh not present; nothing to verify" >&2; exit 2; fi
+	cd proofs && $(CARGO) test --locked # differential test: mirror vs production core
 
 fuzz-build: ## Build all cargo-fuzz targets (nightly + cargo-fuzz)
 	cd fuzz && $(CARGO) +$(NIGHTLY) fuzz build
