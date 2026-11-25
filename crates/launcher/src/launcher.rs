@@ -209,6 +209,19 @@ fn check_host_exposure(what: &str, canon: &Path) -> Result<(), LaunchError> {
     Ok(())
 }
 
+fn check_protected_paths(source: &Path, protected: &[PathBuf]) -> Result<(), LaunchError> {
+    for path in protected {
+        if source.starts_with(path) || path.starts_with(source) {
+            return Err(LaunchError::InvalidProfile(format!(
+                "mount source {} overlaps protected host path {}",
+                source.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn sealed_memfd(name: &str, data: &[u8]) -> Result<OwnedFd, LaunchError> {
     let fd = memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)
         .map_err(io::Error::from)?;
@@ -275,7 +288,33 @@ impl Launcher {
         if !missing.is_empty() {
             return Err(LaunchError::MissingMandatoryControl(missing));
         }
+        Self::check_runtime_exposure(&config.protected_host_paths)?;
         Ok(Self { config, report })
+    }
+
+    /// Refuse paths that would be exposed by the launcher's built-in binds.
+    pub fn check_runtime_exposure(paths: &[PathBuf]) -> Result<(), LaunchError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let runtime = runtime_args();
+        for source in runtime
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|arg| arg[0] == "--ro-bind")
+            .map(|arg| Path::new(&arg[1]))
+        {
+            check_protected_paths(&fs::canonicalize(source)?, paths)?;
+        }
+        for source in ETC_FILES {
+            match fs::canonicalize(source) {
+                Ok(canon) => check_protected_paths(&canon, paths)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     pub fn report(&self) -> &FeatureReport {
@@ -354,6 +393,7 @@ impl Launcher {
                     )));
                 }
                 check_host_exposure("workspace", &canon)?;
+                check_protected_paths(&canon, &self.config.protected_host_paths)?;
                 Some(canon)
             }
             None => None,
@@ -363,6 +403,7 @@ impl Launcher {
             let canon = fs::canonicalize(&b.host)
                 .map_err(|e| invalid(format!("bind source {}: {e}", b.host.display())))?;
             check_host_exposure("bind source", &canon)?;
+            check_protected_paths(&canon, &self.config.protected_host_paths)?;
             if !normalized_abs(&b.sandbox) || b.sandbox == Path::new("/") {
                 return Err(invalid(format!(
                     "bind target {} invalid",

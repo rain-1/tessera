@@ -123,7 +123,8 @@ pub enum Closed {
 pub struct ApprovalSession {
     enrollment: Enrollment,
     policy: VerifierPolicy,
-    config: SessionConfig,
+    approval_timeout: u64,
+    rate_limit: Option<SessionConfig>,
     pending: Option<PendingApproval>,
     recent_begins: VecDeque<Tick>,
     seen_nonces: HashSet<Nonce>,
@@ -132,10 +133,29 @@ pub struct ApprovalSession {
 
 impl ApprovalSession {
     pub fn new(enrollment: Enrollment, policy: VerifierPolicy, config: SessionConfig) -> Self {
+        Self::with_rate_limit(enrollment, policy, config.approval_timeout, Some(config))
+    }
+
+    /// Use when the caller enforces admission independently of this session.
+    pub fn with_external_rate_limit(
+        enrollment: Enrollment,
+        policy: VerifierPolicy,
+        approval_timeout: u64,
+    ) -> Self {
+        Self::with_rate_limit(enrollment, policy, approval_timeout, None)
+    }
+
+    fn with_rate_limit(
+        enrollment: Enrollment,
+        policy: VerifierPolicy,
+        approval_timeout: u64,
+        rate_limit: Option<SessionConfig>,
+    ) -> Self {
         ApprovalSession {
             enrollment,
             policy,
-            config,
+            approval_timeout,
+            rate_limit,
             pending: None,
             recent_begins: VecDeque::new(),
             seen_nonces: HashSet::new(),
@@ -189,25 +209,29 @@ impl ApprovalSession {
         if self.pending.is_some() {
             return Err(SessionError::Busy);
         }
-        let window_start = now.0.saturating_sub(self.config.rate_window);
-        while self
-            .recent_begins
-            .front()
-            .is_some_and(|t| t.0 < window_start)
-        {
-            self.recent_begins.pop_front();
-        }
-        if self.recent_begins.len() >= self.config.max_requests_per_window as usize {
-            return Err(SessionError::RateLimited);
+        if let Some(limit) = self.rate_limit {
+            let window_start = now.0.saturating_sub(limit.rate_window);
+            while self
+                .recent_begins
+                .front()
+                .is_some_and(|t| t.0 < window_start)
+            {
+                self.recent_begins.pop_front();
+            }
+            if self.recent_begins.len() >= limit.max_requests_per_window as usize {
+                return Err(SessionError::RateLimited);
+            }
         }
         if self.seen_nonces.contains(request.nonce()) {
             return Err(SessionError::NonceReused);
         }
         check_request_context(&self.enrollment, &self.policy, &request, now)
             .map_err(SessionError::InvalidRequest)?;
-        self.recent_begins.push_back(now);
+        if self.rate_limit.is_some() {
+            self.recent_begins.push_back(now);
+        }
         self.remember(*request.nonce());
-        let deadline = Tick(now.0.saturating_add(self.config.approval_timeout))
+        let deadline = Tick(now.0.saturating_add(self.approval_timeout))
             .min(request.fields().request_expires_at);
         Ok(self.pending.insert(PendingApproval {
             original: request.clone(),

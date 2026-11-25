@@ -458,6 +458,14 @@ fn copied_capability_id_by_other_principal_denied() {
     assert_eq!(h.consume(ghost, cap, get(1)), Err(Denial::UnknownPrincipal));
     let stale = AgentId::new(5, a.serial());
     assert_eq!(h.consume(stale, cap, get(1)), Err(Denial::StaleEpoch));
+
+    let revoke = AgentCommand::Revoke { capability: cap };
+    assert_eq!(
+        h.agent_cmd(a, revoke),
+        Ok(Effect::Revoked { capability: cap })
+    );
+    assert_eq!(h.agent_cmd(b, revoke), Err(Denial::NotAuthorizedToRevoke));
+    assert_eq!(h.agent_cmd(a, revoke), Err(Denial::AlreadyRevoked));
 }
 
 #[test]

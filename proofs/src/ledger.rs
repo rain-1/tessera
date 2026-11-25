@@ -1415,12 +1415,12 @@ impl State {
                 if capability >= self.capabilities.len() as u128 {
                     return Err(Denial::UnknownCapability);
                 }
-                if let Status::Revoked = self.capabilities[capability as usize].status {
-                    return Err(Denial::AlreadyRevoked);
-                }
                 let authorized = self.may_revoke(caller, capability);
                 if !authorized {
                     return Err(Denial::NotAuthorizedToRevoke);
+                }
+                if let Status::Revoked = self.capabilities[capability as usize].status {
+                    return Err(Denial::AlreadyRevoked);
                 }
                 self.commit_revoke(capability, sequence, now);
                 Ok(Effect::Revoked { capability })

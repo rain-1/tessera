@@ -779,9 +779,6 @@ fn plan_transfer(
 /// removes authority, so this cannot amplify.
 fn plan_agent_revoke(s: &State, caller: AgentId, id: CapabilityId) -> Result<Change, Denial> {
     let target = s.capabilities.get(&id).ok_or(Denial::UnknownCapability)?;
-    if target.status == Status::Revoked {
-        return Err(Denial::AlreadyRevoked);
-    }
     let mut cur = Some(id);
     let mut steps: u32 = 0;
     while let Some(c) = cur {
@@ -790,6 +787,9 @@ fn plan_agent_revoke(s: &State, caller: AgentId, id: CapabilityId) -> Result<Cha
             .get(&c)
             .ok_or(Denial::NotAuthorizedToRevoke)?;
         if rec.owner == caller {
+            if target.status == Status::Revoked {
+                return Err(Denial::AlreadyRevoked);
+            }
             return Ok(Change::Revoke { capability: id });
         }
         if steps >= s.limits.max_lineage_length {

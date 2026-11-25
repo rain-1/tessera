@@ -11,6 +11,7 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Arc;
 
+use tessera_broker::admin::prepare_socket_path;
 use tessera_broker::config::DaemonConfig;
 use tessera_broker::{
     AdapterExecutor, AuditLog, AuditSync, Broker, BrokerConfig, LauncherSpawner, MonotonicClock,
@@ -62,6 +63,8 @@ fn run() -> Result<(), String> {
         std::fs::set_permissions(&cfg.state_dir, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
     }
+    let admin_socket =
+        prepare_socket_path(&cfg.admin_socket).map_err(|e| format!("admin socket: {e}"))?;
 
     let journal = Journal::open_with(
         &cfg.state_dir.join("journal"),
@@ -90,6 +93,13 @@ fn run() -> Result<(), String> {
         None
     } else {
         let mut lc = LauncherConfig::default();
+        for path in std::iter::once(&cfg.state_dir).chain(&cfg.file_root) {
+            lc.protected_host_paths.push(
+                path.canonicalize()
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            );
+        }
+        lc.protected_host_paths.push(admin_socket.clone());
         if let Some(p) = &cfg.launcher.bwrap_path {
             lc.bwrap_path = p.clone();
         }
@@ -141,6 +151,7 @@ fn run() -> Result<(), String> {
             .unwrap_or(d.max_in_flight_per_agent),
         agent_rate_per_sec: l.agent_rate_per_sec.unwrap_or(d.agent_rate_per_sec),
         agent_rate_burst: l.agent_rate_burst.unwrap_or(d.agent_rate_burst),
+        ledger_quotas: l.ledger_quotas,
         ..d
     };
     let broker = Broker::start(

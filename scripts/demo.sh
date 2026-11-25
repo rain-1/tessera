@@ -61,9 +61,7 @@ touch /workspace/done
 sleep 600
 EOF
 
-# Bind a *directory*: binding single files makes the Landlock ruleset
-# "partial" (file rules cannot carry directory rights), which the launcher
-# refuses under landlock=required.
+# Install the SDK CLI next to the read-only demo script.
 cp "$bin/tessera" "$work/agent/tessera"
 
 cat > "$work/tesserad.json" <<EOF
@@ -116,11 +114,13 @@ obj=$(admin register-file notes.txt --max-read 4096 --max-write 0 | sed -n 's/^i
 echo "object id: $obj"
 
 step "launch an agent sandbox from the trusted profile 'demo'"
-admin create-principal demo
+agent=$(admin create-principal demo | sed -n 's/^agent \([^ ]*\) .*/\1/p')
+[ -n "$agent" ] || { echo "no principal was created" >&2; exit 1; }
+ws="$work/ws/$agent"
 admin principals
 
 step "agent asks for a capability; operator reviews and approves"
-echo "$obj" > "$work/ws/obj"
+echo "$obj" > "$ws/obj"
 ticket=""
 for _ in $(seq 200); do
     ticket=$(admin pending 2>/dev/null | sed -n 's/^ticket \([0-9]*\) (awaiting touch).*/\1/p' | head -1)
@@ -131,16 +131,16 @@ done
 admin pending
 admin approve "$ticket" --key "$work/operator.key" --yes
 
-for _ in $(seq 200); do [ -e "$work/ws/done" ] && break; sleep 0.1; done
-[ -e "$work/ws/done" ] || { echo "agent did not finish" >&2; exit 1; }
+for _ in $(seq 200); do [ -e "$ws/done" ] && break; sleep 0.1; done
+[ -e "$ws/done" ] || { echo "agent did not finish" >&2; exit 1; }
 step "agent results"
-echo "request:      $(cat "$work/ws/request.json")"
-echo "first read:   $(cat "$work/ws/read1.json") (exit $(cat "$work/ws/read1.rc"))"
-echo "second read:  $(cat "$work/ws/read2.json") (exit $(cat "$work/ws/read2.rc"))"
-grep -q '"body_utf8":"top secret notes' "$work/ws/read1.json"
-[ "$(cat "$work/ws/read2.rc")" = 1 ]
-grep -q InsufficientBudget "$work/ws/read2.json"
-cap=$(sed -n 's/.*"cap_id":"\([0-9a-f]*\)".*/\1/p' "$work/ws/request.json")
+echo "request:      $(cat "$ws/request.json")"
+echo "first read:   $(cat "$ws/read1.json") (exit $(cat "$ws/read1.rc"))"
+echo "second read:  $(cat "$ws/read2.json") (exit $(cat "$ws/read2.rc"))"
+grep -q '"body_utf8":"top secret notes' "$ws/read1.json"
+[ "$(cat "$ws/read2.rc")" = 1 ]
+grep -q InsufficientBudget "$ws/read2.json"
+cap=$(sed -n 's/.*"cap_id":"\([0-9a-f]*\)".*/\1/p' "$ws/request.json")
 
 step "inspect authority and audit"
 admin tree

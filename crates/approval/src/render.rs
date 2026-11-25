@@ -13,6 +13,7 @@ use crate::request::{BudgetAmount, Depth, GrantRequest, Scope, Tick};
 
 /// Max characters of untrusted description shown.
 pub const MAX_UNTRUSTED_CHARS: usize = 400;
+const DESCRIPTION_LINE_WIDTH: usize = 48;
 
 /// Rendering context supplied by the trusted UI.
 #[derive(Clone, Copy, Debug)]
@@ -47,32 +48,46 @@ fn duration(ctx: &RenderContext, from: Tick, to: Tick) -> String {
 
 /// Escapes everything that could alter terminal state or mislead visually.
 pub fn escape_untrusted(s: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i >= MAX_UNTRUSTED_CHARS {
-            out.push_str(" …[truncated]");
-            break;
-        }
-        let suspicious = c.is_control()
-            || matches!(c,
-                '\u{200B}'..='\u{200F}'   // zero-width, LRM/RLM
-                | '\u{202A}'..='\u{202E}' // bidi embeddings/overrides
-                | '\u{2028}' | '\u{2029}' // line/paragraph separators
-                | '\u{2060}'..='\u{2069}' // word joiner, bidi isolates
-                | '\u{FEFF}'              // BOM / ZWNBSP
-                | '\u{FFF9}'..='\u{FFFB}')
-            || c == '\\';
-        if suspicious {
-            if c == '\\' {
-                out.push_str("\\\\");
-            } else {
-                let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
+    untrusted_tokens(s).collect()
+}
+
+fn untrusted_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.chars()
+        .take(MAX_UNTRUSTED_CHARS + 1)
+        .enumerate()
+        .map(|(i, c)| {
+            if i >= MAX_UNTRUSTED_CHARS {
+                return " …[truncated]".into();
             }
-        } else {
-            out.push(c);
+            match c {
+                '\\' => "\\\\".into(),
+                // Rust's debug escaping covers Unicode format and separator
+                // characters, including bidi marks and supplementary-plane tags.
+                c if !matches!(c, '\'' | '"') && c.escape_debug().next() == Some('\\') => {
+                    format!("\\u{{{:04x}}}", u32::from(c))
+                }
+                c => c.to_string(),
+            }
+        })
+}
+
+fn write_description(out: &mut String, description: &str) {
+    let mut width = 0;
+    out.push_str("  | ");
+    for token in untrusted_tokens(description) {
+        // Count every non-ASCII character as up to two terminal cells.
+        let columns = token
+            .chars()
+            .map(|c| if c.is_ascii() { 1 } else { 2 })
+            .sum::<usize>();
+        if width + columns > DESCRIPTION_LINE_WIDTH {
+            out.push_str("\n  | ");
+            width = 0;
         }
+        out.push_str(&token);
+        width += columns;
     }
-    out
+    out.push('\n');
 }
 
 /// Renders the approval screen text.
@@ -194,7 +209,7 @@ pub fn render_request(
             o,
             "--- UNTRUSTED agent-supplied description (not verified; may be false) ---"
         );
-        let _ = writeln!(o, "{}", escape_untrusted(desc));
+        write_description(&mut o, desc);
         let _ = writeln!(o, "--- end UNTRUSTED ---");
     }
     let _ = writeln!(

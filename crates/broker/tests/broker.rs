@@ -148,11 +148,16 @@ fn copied_capability_id_from_another_principal_is_denied() {
     }
     assert_eq!(h.calls.load(Ordering::SeqCst), 0);
     assert_eq!(cap_budget(&b, cap), "3");
-    // And an unknown id looks exactly the same.
+    assert_eq!(m.read(9, cap), m.read(9, 999_999));
     assert_eq!(
-        code(&m.read(9, 999_999)),
-        Some(ErrorCode::UnknownCapability)
+        b.admin(AdminRequest::Revoke { capability: cap }),
+        AdminResponse::Ok
     );
+    let revoke = |cap_id| Request::Revoke {
+        request_id: 10,
+        cap_id,
+    };
+    assert_eq!(m.call(revoke(cap)), m.call(revoke(999_999)));
 }
 
 #[test]

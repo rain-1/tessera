@@ -51,6 +51,7 @@ pub(crate) mod conn;
 pub mod convert;
 pub mod entry;
 pub mod executor;
+mod ledger_quota;
 pub mod reactor;
 pub mod softkey;
 pub mod spawner;
@@ -63,5 +64,6 @@ pub use entry::EndpointSpec;
 pub use executor::{
     AdapterExecutor, DispatchJob, ExecResult, Executor, JobOperation, MAX_INLINE_CONTENT,
 };
+pub use ledger_quota::LedgerQuotas;
 pub use reactor::{BrokerConfig, FaultHook, FaultPoint, Services, StartError, StopReason};
 pub use spawner::{AgentSpawnProfile, BaselineGrant, LauncherSpawner, ProfileSpec, SandboxSpawner};

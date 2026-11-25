@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 128" role="img" aria-labelledby="t">
+  <title id="t">Tessera</title>
+  <g fill="#E8ECF4">
+    <rect x="14" y="14" width="44" height="44" rx="7"/>
+    <rect x="64" y="14" width="44" height="44" rx="7"/>
+    <rect x="14" y="64" width="44" height="44" rx="7"/>
+  </g>
+  <rect x="64" y="64" width="44" height="44" rx="7" fill="none"
+        stroke="#E8ECF4" stroke-width="3" stroke-dasharray="6 5" opacity="0.45"/>
+  <rect x="74" y="74" width="40" height="40" rx="7" fill="#F2A541"/>
+  <text x="140" y="82" fill="#E8ECF4"
+        font-family="Inter, 'Helvetica Neue', Arial, sans-serif"
+        font-size="62" font-weight="700" letter-spacing="-1">tessera</text>
+  <text x="143" y="110" fill="#E8ECF4" opacity="0.75"
+        font-family="Inter, 'Helvetica Neue', Arial, sans-serif"
+        font-size="17" font-weight="500" letter-spacing="2.5">AUTHORITY YOU CAN COUNT</text>
+</svg>

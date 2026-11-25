@@ -92,7 +92,7 @@ pub struct LauncherSection {
     pub cgroup_group: Option<String>,
 }
 
-/// Optional per-principal limits (defaults from `BrokerConfig`).
+/// Optional broker limits (defaults from `BrokerConfig`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
@@ -108,6 +108,9 @@ pub struct LimitsSection {
     pub agent_rate_per_sec: Option<u32>,
     /// Burst per principal.
     pub agent_rate_burst: Option<u32>,
+    /// Limits on ledger records allocated by agents.
+    #[serde(default)]
+    pub ledger_quotas: crate::LedgerQuotas,
 }
 
 /// Daemon configuration.
@@ -134,7 +137,7 @@ pub struct DaemonConfig {
     /// Profiles agents may spawn, by `LaunchProfileId`.
     #[serde(default)]
     pub agent_spawn_profiles: BTreeMap<u64, AgentSpawnProfile>,
-    /// Per-principal limits.
+    /// Broker admission limits.
     #[serde(default)]
     pub limits: LimitsSection,
     /// Audit log fsync policy (`every-event`, `every:N`, `never`).
@@ -230,6 +233,7 @@ mod tests {
             r#"{"state_dir": "/s", "admin_socket": "/a", "audit_fsyn": "never"}"#,
             r#"{"state_dir": "/s", "admin_socket": "/a", "launcher": {"landlok": "disabled"}}"#,
             r#"{"state_dir": "/s", "admin_socket": "/a", "limits": {"max_childs": 1}}"#,
+            r#"{"state_dir": "/s", "admin_socket": "/a", "limits": {"ledger_quotas": {"derived_per_user": 1}}}"#,
             r#"{"state_dir": "/s", "admin_socket": "/a",
                 "profiles": {"p": {"program": "/bin/sh", "argz": []}}}"#,
             r#"{"state_dir": "/s", "admin_socket": "/a",
@@ -244,5 +248,19 @@ mod tests {
         )
         .unwrap();
         assert!(c.check().is_err());
+    }
+
+    #[test]
+    fn ledger_quota_overrides_keep_other_defaults() {
+        let c = parse(
+            r#"{"state_dir": "/s", "admin_socket": "/a",
+            "limits": {"ledger_quotas": {"derived_per_root": 12}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.limits.ledger_quotas.derived_per_root, 12);
+        assert_eq!(
+            c.limits.ledger_quotas.reservations_per_root,
+            crate::LedgerQuotas::default().reservations_per_root
+        );
     }
 }

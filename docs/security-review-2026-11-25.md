@@ -1,7 +1,11 @@
 # Independent security review — 2026-11-25 (main @ 7df594b)
 
 No ledger-level authority amplification and no FIDO2-approval bypass were found.
-The confirmed findings are all in the code around the core. **All findings below are OPEN.**
+The table records the original findings. Changes addressing findings 1, 2,
+4–9 are described in [ADR-0024](adr/0024-broker-hardening.md). Finding 10
+is addressed in [ADR-0019](adr/0019-file-object-identity.md). Finding 3
+has per-principal and per-root admission limits in [ADR-0024](adr/0024-broker-hardening.md#admission-control).
+It remains open for historical ledger compaction across epochs.
 
 | # | Sev | Where | Finding | Fix |
 |---|---|---|---|---|
