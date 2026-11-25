@@ -2,7 +2,9 @@
 # Regenerate the CycloneDX SBOMs in docs/sbom/ (one per workspace crate).
 #
 # Requires: cargo install cargo-cyclonedx --locked
-# Uses the last commit time as SOURCE_DATE_EPOCH so the timestamp is stable.
+# SOURCE_DATE_EPOCH defaults to the commit time of the last change to
+# Cargo.lock, so the output only changes when the dependency graph does
+# (needs full git history; CI checks out with fetch-depth: 0).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
@@ -10,7 +12,7 @@ command -v cargo-cyclonedx >/dev/null || {
     echo "cargo-cyclonedx not found: cargo install cargo-cyclonedx --locked" >&2
     exit 2
 }
-export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct -- Cargo.lock)}"
 out="$root/docs/sbom"
 mkdir -p "$out"
 rm -f "$out"/*.cdx.json
