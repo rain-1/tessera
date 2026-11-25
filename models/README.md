@@ -181,3 +181,19 @@ RESULT: as expected (correct protocol safe, every bug variant caught)
   in which a reservation committed *before* a revoke is dispatched *after* it.
   This is allowed by 5.2. The audit log must show such effects as "authorized
   before revocation" so that they are not mistaken for a bypass.
+
+## TLC results (TLA+ spec)
+
+Checked with TLC v1.7.4 (`models/run_tlc.sh`, jar pinned by SHA-256) on 2026-11-25.
+Bounds as in `Dispatch.cfg` (Budget=2, MaxCrashes=1, MaxMsgs=3, MaxMintReplays=2).
+`CHECK_DEADLOCK FALSE` because the bounded model has terminal states by design.
+
+| Variant | Result |
+|---|---|
+| none (correct protocol) | No error; 621,239 states generated, 130,352 distinct, depth 21 |
+| refund-on-failure | `NoOverspend` violated |
+| replay-after-crash | `NoReplayAfterCrash` violated |
+| dispatch-before-commit | `DispatchAfterDurableCommit` violated |
+| no-epoch-bump | `RestartInvalidatesGrants` violated |
+
+The Python checker and TLC agree on every variant checked.
