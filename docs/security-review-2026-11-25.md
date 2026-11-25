@@ -1,13 +1,19 @@
 # Independent security review — 2026-11-25 (main @ 7df594b)
 
 No ledger-level authority amplification and no FIDO2-approval bypass were found.
-The table records the original findings. Changes addressing findings 1, 2,
-4–9 are described in [ADR-0024](adr/0024-broker-hardening.md). Finding 10
-is addressed in [ADR-0019](adr/0019-file-object-identity.md). Finding 3
-has per-principal and per-root admission limits in [ADR-0024](adr/0024-broker-hardening.md#admission-control).
-It remains open for historical ledger compaction across epochs.
+The first table records the original findings. The status table records
+how each was resolved, the commit and the regression test. Every proof of
+concept the reviewer supplied is now a test in the repository; the
+broker-level ones are in `crates/broker/tests/review_regressions.rs`.
+Decisions: [ADR-0024](adr/0024-broker-hardening.md) (commit fb583ba),
+[ADR-0019](adr/0019-file-object-identity.md),
+[ADR-0031](adr/0031-epoch-compaction.md) (ledger compaction) and
+[ADR-0032](adr/0032-review-remediation.md) (the remaining remediation,
+branch `wp/secfix`).
 
-| # | Sev | Where | Finding | Fix |
+## Findings as reported
+
+| # | Sev | Where | Finding | Suggested fix |
 |---|---|---|---|---|
 | 1 | High | broker/src/spawner.rs:140 | Every principal launched from one profile shares one writable workspace. That gives a Unix-socket IPC channel, which allows SCM_RIGHTS transfer of fd 3 (identity theft) and planted scripts. Reproduced. | Per-principal workspace subdirectory; add a corpus probe |
 | 2 | Med | broker/src/spawner.rs:151 | A profile with `None` limits overrides the launcher's memory and pid defaults, leaving the sandbox unlimited. Reproduced. | Keep the defaults unless the profile explicitly says "unlimited" |
@@ -21,3 +27,21 @@ It remains open for historical ledger compaction across epochs.
 | 10 | Low | broker executor.rs / on_dispatched | The new file identity can be lost after a replace fails or an emergency stop interrupts it, leaving the slot unusable. Code trace only. | Journal the identity before the exchange |
 
 Unconfirmed: HTTPS prefix bypass via `..;` or `%25xx` against normalizing backends (reject `;` and `%25`); the seccomp denylist misses newer syscalls (open_tree_attr, file_getattr/file_setattr, listns) and allows modify_ldt (consider an allowlist); a slow HTTPS endpoint can starve the 4 dispatch workers.
+
+## Status
+
+| # | Status | Fix | Commit | Regression test |
+|---|---|---|---|---|
+| 1 | **FIXED** | Fresh 0700 `<workspace>/e<epoch>.s<serial>` per principal, operator-created or agent-spawned, created exclusively by the broker; never reused; retained after termination (ADR-0032 retention policy). Workspace parents checked (owner, mode, no overlap with protected paths, other workspaces or binds). | fb583ba; test 60f416f | `crates/broker/tests/workspace_isolation_e2e.rs` with corpus probes `tests/adversarial/cross_principal/{sender,receiver}.py` (real sandboxes from one profile: A offers fd 3 on workspace, `/tmp`, `/dev/shm` and abstract sockets and plants scripts; B reaches none; the same receiver inside A must detect them). Verified to fail on a shared directory (B received fd 3). Also `sandbox_e2e` (spawned child), `spawner::tests::each_workspace_is_created_fresh`. |
+| 2 | **FIXED** | Omitted/`null` limits keep the launcher defaults (fb583ba); only the explicit string `"unlimited"` removes a limit, anything else is a configuration error (`CgroupLimit`). | fb583ba, 60f416f | `spawner::tests::only_an_explicit_unlimited_removes_a_limit` (the `limits` PoC's profile JSON), `omitted_limits_inherit_launcher_defaults` |
+| 3 | **FIXED** (ledger); journal file not compacted | Per-principal and per-root quotas (ADR-0024, fb583ba). `AdminCommand::CompactEpoch`, journaled at every start after the epoch bump, prunes every earlier-epoch record; spent nonces and id counters kept; pruned pools accounted in `State::retired` and audited (ADR-0031). The journal file itself is not rewritten (history and audit lineage intact; growth per epoch bounded by the quotas). | 299c7d4, 60f416f | `review_regressions::finding3_record_exhaustion_does_not_survive_restart` (the `exhaust` PoC: after the attacker fills the previous epoch, a fresh principal is served after restart, twice); core `compaction_frees_capacity_filled_by_a_previous_epoch`, `compaction_keeps_the_current_epoch`, `compacted_snapshot_is_checked`, model `core_refines_reference_model_with_compaction{,_tight_limits}` |
+| 4 | **FIXED** | At most 2 pending approvals per principal (active + queued), shared queue 16, round-robin activation across principals, per-principal rate window. | fb583ba | `review_regressions::finding4_one_agent_cannot_fill_the_approval_queue` (the `queue` PoC), `hardening::approval_queue_rotates_and_rate_limits_are_per_principal` |
+| 5 | **FIXED** | Untrusted block: padding collapsed, Cf (explicit table)/Zl/Zp/non-ASCII spaces/Hangul fillers/tags/variation selectors escaped, every line `  | `-prefixed and ≤ 48 cells; `tessera-admin` shows the broker's rendering made with the broker's clock. | fb583ba, a882e99 | approval `padded_description_cannot_forge_screen_lines` (the `esc` PoC), `every_invisible_or_format_character_is_escaped`; `hardening::approval_queue_rotates_and_rate_limits_are_per_principal` (relative time from the broker clock) |
+| 6 | Launcher work package (not in this branch) | — | — | — |
+| 7 | **FIXED** | Expired queued grants get `fail_grant(ApprovalTimeout)` for every attached correlation, are bound as denied and release their in-flight slots. | fb583ba | `review_regressions::finding7_expired_queued_grants_are_answered_and_release_slots` (the `poc` main), `hardening::queued_grant_timeout_replies_to_every_waiter_and_releases_slots` |
+| 8 | **FIXED** | One code and detail (`UnknownCapability`) for unknown and not-owned targets. | fb583ba | `review_regressions::finding8_non_owner_sees_one_answer_for_every_foreign_or_unknown_target` (the `oracle` PoC extended to Consume, Delegate, Attenuate, Transfer, Drop, Revoke, Inspect × unknown, live, revoked, dropped, ancestor-revoked, expired, owner-terminated) |
+| 9 | **FIXED** | The rate window (`approval_begins`) is broker state, outside the authenticator session. | fb583ba | `review_regressions::finding9_rate_window_survives_credential_rotation`, `hardening::approval_queue_rotates_and_rate_limits_are_per_principal` (session reset by termination) |
+| 10 | **FIXED** | `FileReplacePrepared` journals both identities before the exchange; recovery accepts only those two and journals `FileIdentityRecovered` (ADR-0019). | fb583ba | `reactor::tests::interrupted_replacement_restores_the_verified_occupant` (crash before and after the exchange), `emergency_stop_after_prepare_preserves_the_exchanged_identity`, `replacement_stops_when_the_intent_cannot_be_synced`, `late_outcome_cannot_override_a_newer_file_identity`, `recovery_rejects_a_foreign_displaced_inode` |
+| HTTPS `..;` / `%25xx` | **FIXED** (hardening; not confirmed exploitable) | Refuse `;` in the path, malformed escapes, and segments that after one decoding still contain an escape or are dot segments. | 6050055 | `adapters/https` `path_rules` |
+| seccomp gaps | Launcher work package | — | — | — |
+| Dispatch starvation | **FIXED** | `max_dispatch_per_agent` (2 of 4 workers): further jobs wait unmarked and are released round-robin; a waiting job whose authority ended (revoke, expiry, termination) is failed, not dispatched. | 60f416f | `review_regressions::slow_principal_cannot_hold_every_dispatch_worker`, `terminating_a_principal_fails_its_undispatched_jobs`, `hardening::revoke_vs_consume_race_matches_a_serial_order` |

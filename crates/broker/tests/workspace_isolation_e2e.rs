@@ -203,7 +203,7 @@ fn sandboxes_from_one_profile_share_no_workspace_socket_or_file() {
     let (_, log) = a.sh("cat /workspace/sender.log");
     assert_eq!(log.matches("BREACH-SENT").count(), sent_to_self, "{log}");
 
-    // Retention policy (ADR-0031): the directories stay after termination,
+    // Retention policy (ADR-0032): the directories stay after termination,
     // are never reused, and a restart's principals get new ones.
     for agent in [a_id, b_id] {
         assert_eq!(

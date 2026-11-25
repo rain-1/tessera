@@ -31,9 +31,9 @@ the core, or the system, as verified on the basis of this document.
 | Artifact | What it checks |
 |---|---|
 | `src/invariant.rs` `check_invariant` | Executable statement of the ledger invariant (intended Verus `spec fn inv`). Run after **every** step in all tests, and on every snapshot deserialization. |
-| `tests/rules.rs` (29 tests) | One or more tests per core-level rule of spec §15, §5, §12.1 and the §12.2 swarm example. Every command goes through a harness that asserts invariant preservation and that denials leave the state unchanged. |
+| `tests/rules.rs` (32 tests) | One or more tests per core-level rule of spec §15, §5, §12.1 and the §12.2 swarm example. Every command goes through a harness that asserts invariant preservation and that denials leave the state unchanged. |
 | `tests/scope.rs` (6 unit + 3 proptests, 2,000 cases each) | Every rights/method bit, body-size boundary, mismatched resource kinds, undefined-bit rejection; subset soundness, reflexivity/transitivity, and exact agreement of `is_subset` with denotational inclusion over a finite universe. |
-| `tests/model.rs` (2 proptests, 512 cases each by default, up to 80 commands per case; plus a generator coverage check) | Random command sequences, including clock regression, epoch bumps, stale/forged callers and request-id repeats, executed against both the core and an independent naive reference model. After each step: accept/deny agreement, `check_invariant`, no mutation on denial/duplicate, per-capability field and liveness agreement, an independently maintained global conservation identity, and liveness monotonicity. One run uses tight limits to exercise capacity/lineage denials. Soak: `PROPTEST_CASES=20000 cargo test --release -p tessera-capability-core --test model` passed. |
+| `tests/model.rs` (4 proptests, 512 cases each by default, up to 80 (120 with compaction) commands per case; plus a generator coverage check) | Random command sequences, including clock regression, epoch bumps, `CompactEpoch` at random points (two of the runs; ADR-0031), stale/forged callers and request-id repeats, executed against both the core and an independent naive reference model. The model specifies compaction independently ("forget everything owned in an earlier epoch") and keeps its own retired-balance counter, so the global identity is checked across compactions against `State::retired`. After each step: accept/deny agreement, `check_invariant`, no mutation on denial/duplicate, per-capability field and liveness agreement, an independently maintained global conservation identity, and liveness monotonicity. One run uses tight limits to exercise capacity/lineage denials. Soak: `PROPTEST_CASES=20000 cargo test --release -p tessera-capability-core --test model` passed. |
 | doctest in `src/lib.rs` | End-to-end mint / consume / deny example of the public API. |
 | `proofs/src/{quantity,scope,ledger}.rs` (Verus) | Verified mirror of `budget.rs`, `scope.rs`, `ids.rs`, `command.rs`, `state.rs` (queries) and `step.rs` (the whole `step`). `inv` (T1 per-pool identity, pool membership, T2 edges, current within origin, T7 nonces) is preserved by every transition. A denial leaves the state unchanged. Lemmas cover subset soundness, transitivity, no overspend, lineage containment and nonce uniqueness. 132 verified, 0 errors. Run: `proofs/run_verus.sh`. |
 | `proofs/tests/differential.rs` (5 tests, 512 cases × 2 configurations by default; soak 20,000 passed) | The erased build of the Verus mirror against the core on random command sequences (shared generator `tests/common/sym.rs`). After every step it requires identical `Denial`/`Effect`, every field of every principal, capability, root, pool, reservation and spent nonce, and `live()` with its exact reason. It also compares the pure scope/quantity functions on arbitrary inputs and runs boundary scenarios. |
@@ -51,7 +51,7 @@ the core, or the system, as verified on the basis of this document.
 | T7 | Each approval nonce redeemed at most once; exact request binding preserved. | MINT inserts the nonce in the same commit that creates the root; `spent_nonces` ↔ approved roots is a bijection in `check_invariant` and survives `BumpEpoch`; the root's terms equal `request.terms` exactly. Tests: `nonce_reuse_and_binding`, `mint_rejects_wrong_epoch_expired_request_and_bad_terms`, epoch test. | **machine-checked (Verus 0.2026.11.02.8bf68ee, mirrored model)**, ledger part: spent nonces are distinct and append-only; every approved root has its nonce entry (`nonces_ok`); MINT succeeds only for an unspent nonce and binds the request's terms and recipient exactly; `lemma_roots_distinct_nonces`. **tested-only**: survival across `BumpEpoch` as a bijection with roots (`check_invariant`). Out of core scope: crypto binding | A3, A9, A10–A13 |
 | T8 | Denial, invalid input and arithmetic overflow cannot increase authority. | `plan` (pure, total, all checked arithmetic) / `commit` (infallible, no arithmetic) split; no `unsafe` (`#![forbid(unsafe_code)]`); snapshot deserialization re-checks the invariant. Every test asserts the state is unchanged after a denial. Tests: `exhausted_counters_deny_without_mutation`, `capacity_and_lineage_bounds_deny`, `corrupt_snapshot_is_rejected`, model tests. | **machine-checked (Verus 0.2026.11.02.8bf68ee, mirrored model)**: `r is Err ⇒ new == old` and duplicate ⇒ unchanged, for every command (`post`); Verus proves no overflow or out-of-bounds access in any transition. **tested-only**: snapshot deserialization re-check, production `#![forbid(unsafe_code)]` | A1, A10–A13 |
 | T9 | Concurrent requests refine a serial trace; no double spend. | `step` takes `&mut State`, so Rust aliasing rules allow only one writer at a time. A serial 1,000-attempt test shows at most one reservation. | out of core scope (broker single-writer queue and model checking) | A5 |
-| T10 | Crash recovery never resurrects spent authority or re-dispatches uncertain reservations. | `BumpEpoch` invalidates every live grant, abandons `Reserved` reservations, keeps nonces; `State::replay` rebuilds from a log of successful commands and fails closed on any denial; `Reservation` is not `Clone`/`Deserialize`. Tests: `replay_rebuilds_identical_state`, epoch test. | out of core scope (journal protocol, fault injection) | A6 |
+| T10 | Crash recovery never resurrects spent authority or re-dispatches uncertain reservations. | `BumpEpoch` invalidates every live grant, abandons `Reserved` reservations, keeps nonces; `CompactEpoch` (ADR-0031) then prunes only earlier-epoch records and keeps every nonce (`compaction_frees_capacity_filled_by_a_previous_epoch`: a pruned approval's nonce is still `NonceReused`); `State::replay` rebuilds from a log of successful commands and fails closed on any denial; `Reservation` is not `Clone`/`Deserialize`. Tests: `replay_rebuilds_identical_state`, epoch test. | out of core scope (journal protocol, fault injection) | A6 |
 | T11 | Every claimed protected effect has a matching authorized reservation. | CONSUME returns a single `Reservation` bound to `(owner, request_id, capability, root, operation)`; repeated request ids return the earlier status and never a second reservation (`repeated_request_id_returns_previous_status_without_new_reservation`). | out of core scope (per-adapter refinement, Linux mediation) | A7, A8 |
 
 ## Trusted assumptions
@@ -71,7 +71,7 @@ the core, or the system, as verified on the basis of this document.
 | A11 | The trusted specifications that ship inside `vstd` for `Vec` (`new`, `push`, `set`, `len`, indexing and `view`) and for primitive integer and bit-vector operations are correct. They are Verus's own `external_body`/`assume_specification` items, not ours. | Toolchain trust (vstd) |
 | A12 | `global size_of usize == 8` in `proofs/src/ledger.rs`: the target has 64-bit `usize`. Verus emits a compile-time check for this, and the core makes the same assumption (`usize -> u64` in `require_capacity`). | Platform (x86_64 Linux) |
 | A14 | **The workspace's only `unsafe` code** is one call, `OwnedFd::from_raw_fd(fd)` in `crates/sdk/src/env_fd.rs` (agent side, untrusted SDK): descriptor `fd` (> 2, from `TESSERA_BROKER_FD`) is open, is the launcher-installed broker channel, and has no other owner in the process. Kept because no safe route exists inside a sandbox: `pidfd_getfd` is denied by the launcher's seccomp filter (and allowing it would let a process lift descriptors), `/proc/self/fd/N` cannot be opened for sockets (`ENXIO`), stdio cannot carry the channel, and "safe" inherited-fd crates contain the same call. Guarded by a once-per-process claim, a `/proc` socket check where readable and an `SO_TYPE` check (released unclosed on failure). It is not in the broker's trust base: a broken SDK can only hurt its own sandbox. Every other crate has `#![forbid(unsafe_code)]` or the workspace `unsafe_code = "deny"` lint; `crates/sdk/tests/unsafe_inventory.rs` fails if any other `unsafe` appears. | SDK review; `unsafe_inventory` test |
-| A13 | **Model–code correspondence.** The production functions behave like their mirrors in `proofs/src` (table in `proofs/README.md`). This is checked by the differential test, not proved. Representation choices it relies on: dense identifiers (`BTreeMap` ↔ `Vec`), `requests` ↔ linear search, `Nonce` ↔ two `u128`, plan/commit ↔ check-then-write. The erased build uses `vstd 0.0.0-2026-11-01-0251` from crates.io, not the verifier's bundled `vstd`. This affects only the differential test, because erasure removes all ghost code. | `proofs/tests/differential.rs`, review rule in `proofs/README.md` |
+| A13 | **Model–code correspondence.** The production functions behave like their mirrors in `proofs/src` (table in `proofs/README.md`). This is checked by the differential test, not proved. **Exception: `AdminCommand::CompactEpoch` (ADR-0031) has no mirror** (pruning leaves sparse ids, which the mirror's index-as-id representation cannot express); the differential test never generates it, so no proof result covers a state reached through a compaction. Such states are covered by `check_invariant` (run by the broker after every compaction) and the production model test. Representation choices it relies on: dense identifiers (`BTreeMap` ↔ `Vec`), `requests` ↔ linear search, `Nonce` ↔ two `u128`, plan/commit ↔ check-then-write. The erased build uses `vstd 0.0.0-2026-11-01-0251` from crates.io, not the verifier's bundled `vstd`. This affects only the differential test, because erasure removes all ghost code. | `proofs/tests/differential.rs`, review rule in `proofs/README.md` |
 
 ### Escape hatches in our proof code
 
@@ -132,6 +132,11 @@ finds nothing. Any new escape hatch must be added to this table.
 9. **Epoch bump** terminates every principal, abandons `Reserved`
    reservations, keeps all records, spent nonces and history, and does not
    reset id counters. Ids are never recycled, even across epochs.
+   **Compaction** (`CompactEpoch`, ADR-0031; the broker issues it at every
+   start right after the bump) then removes every record of earlier epochs
+   except spent nonces; pruned pools are summed into `State::retired` with
+   `initial = consumed + discarded`, stranded balances counted as
+   discarded.
 10. **Issuance validity.** New grants (roots and children) must have a
     non-empty scope, an expiry not already elapsed, and a nonzero budget.
     ATTENUATE may reduce a budget to zero.
@@ -144,8 +149,9 @@ finds nothing. Any new escape hatch must be added to this table.
     and `now < request.request_expires`, then mints exactly `request.terms`
     to `request.recipient`. A denied mint does not spend the nonce.
 13. **Bounds.** Limits on capability records, principals, roots,
-    reservations and lineage length are enforced as denials. Records are
-    never garbage-collected (see gaps).
+    reservations and lineage length are enforced as denials. Records of
+    earlier epochs are pruned by `CompactEpoch` (decision 9); within an
+    epoch nothing is garbage-collected.
 
 ## Known gaps and future work
 
@@ -168,10 +174,10 @@ finds nothing. Any new escape hatch must be added to this table.
   (attenuating a parent's expiry below a live child's). A deterministic
   differential scenario covers that case. The core's own `tests/model.rs`
   does not.
-- Records are never compacted, so a long-lived installation eventually hits
-  `max_capabilities` or `max_reservations`. Possible remedy: compaction at
-  epoch bump, which would need its own invariant argument (nonces must be
-  kept).
+- `CompactEpoch` (ADR-0031) is tested (model refinement, rules,
+  `check_invariant`), not proved: the Verus mirror would need sparse
+  identifiers (an id-to-index map) to express it. The journal *file* is not
+  compacted; replay time grows with total history.
 - `check_invariant` is O(n · lineage) and is not run on the hot path.
 - Agent revocation authority is a core policy choice (decision 6) that the
   spec leaves to the implementation ("explicitly authorized revoker"). It
