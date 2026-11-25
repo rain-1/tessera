@@ -318,6 +318,18 @@ fn audit_verify(o: &BTreeMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+fn active_pending(
+    c: &mut AdminClient,
+    ticket: u64,
+) -> Result<tessera_broker::admin::PendingView, String> {
+    let AdminResponse::Pending(p) = call(c, AdminRequest::ListPending)? else {
+        return Err("unexpected response".into());
+    };
+    p.into_iter()
+        .find(|p| p.ticket == ticket && p.active)
+        .ok_or(format!("ticket {ticket} is not awaiting a touch"))
+}
+
 fn approve(
     c: &mut AdminClient,
     ticket: &str,
@@ -325,15 +337,9 @@ fn approve(
     yes: bool,
 ) -> Result<AdminResponse, String> {
     let ticket: u64 = ticket.parse().map_err(|_| "TICKET: number")?;
-    let AdminResponse::Pending(p) = call(c, AdminRequest::ListPending)? else {
-        return Err("unexpected response".into());
-    };
-    let pv = p
-        .iter()
-        .find(|p| p.ticket == ticket && p.active)
-        .ok_or(format!("ticket {ticket} is not awaiting a touch"))?;
     // Optional narrowing (never widening; the broker re-checks).
     if o.contains_key("budget") || o.contains_key("depth") {
+        let pv = active_pending(c, ticket)?;
         let req = ap::GrantRequest::decode(&pv.request).map_err(|e| format!("{e:?}"))?;
         let mut f = req.fields().clone();
         if let Some(b) = num(o, "budget")? {
@@ -354,21 +360,13 @@ fn approve(
     let AdminResponse::Challenge(ch) = call(c, AdminRequest::Challenge { ticket })? else {
         return Err("unexpected response".into());
     };
-    let shown = ap::GrantRequest::decode(&ch.request).map_err(|e| format!("{e:?}"))?;
-    if shown.digest().0 != ch.client_data_hash {
+    let pv = active_pending(c, ticket)?;
+    let shown = ap::GrantRequest::decode(&pv.request).map_err(|e| format!("{e:?}"))?;
+    if pv.request != ch.request || shown.digest().0 != ch.client_data_hash {
         return Err("challenge digest does not match the request shown; refusing".into());
     }
-    let ctx = ap::RenderContext {
-        now: ap::Tick(0),
-        ticks_per_second: std::num::NonZeroU64::new(1000),
-    };
-    // The agent's description (if any) is printed by the renderer in a
-    // separate block labelled UNTRUSTED, escaped and truncated. It is not
-    // part of what the key signs.
-    println!(
-        "{}",
-        ap::render_request(&shown, pv.untrusted_description.as_deref(), &ctx)
-    );
+    // The broker renders these exact terms using its epoch-relative clock.
+    print!("{}", pv.rendered);
     println!("digest: {}", hex(&ch.client_data_hash));
     if !yes {
         print!("Approve exactly this grant? Type 'yes': ");

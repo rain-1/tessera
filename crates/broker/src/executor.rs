@@ -16,7 +16,7 @@ use tessera_protocol::bounded::{BoundedBytes, BoundedString, BoundedVec};
 use tessera_protocol::{ErrorCode, WireHeader, WireHttpsRequest, WireOperationResult};
 
 use crate::convert::hex;
-use crate::entry::{EndpointSpec, FileIdentityRec};
+use crate::entry::{EndpointSpec, FileIdentityRec, FileReplaceIntent, FileSlotRec};
 
 /// Largest file snapshot / HTTP response body / replacement carried inline in
 /// one agent channel datagram. `SOCK_SEQPACKET` datagrams are bounded by the
@@ -134,6 +134,26 @@ pub trait Executor: Send + Sync + 'static {
     ) -> Result<(), String>;
     /// Perform exactly one dispatch.
     fn execute(&self, job: &DispatchJob) -> ExecResult;
+
+    /// Perform one dispatch, recording a file replacement before the exchange.
+    /// Executors that wrap the file adapter must propagate `record` to it.
+    fn execute_with_file_intent(
+        &self,
+        job: &DispatchJob,
+        _record: &mut dyn FnMut(FileReplaceIntent) -> bool,
+    ) -> ExecResult {
+        self.execute(job)
+    }
+
+    /// Re-register the verified occupant of a slot with a durable intent.
+    fn restore_file_replacement(
+        &self,
+        _slot: &FileSlotRec,
+        _reservation: ReservationId,
+        _intent: FileReplaceIntent,
+    ) -> Result<FileIdentityRec, String> {
+        Err("executor does not support recovering prepared replacements".into())
+    }
 }
 
 /// The real adapters.
@@ -210,6 +230,13 @@ fn content(bytes: Vec<u8>) -> Option<tessera_protocol::ContentBytes> {
     BoundedBytes::new(bytes).ok()
 }
 
+fn slot_policy(max_read_bytes: u64, max_write_bytes: u64) -> fa::SlotPolicy {
+    fa::SlotPolicy {
+        max_read_bytes: max_read_bytes.min(MAX_INLINE_CONTENT),
+        max_write_bytes: max_write_bytes.min(MAX_INLINE_CONTENT),
+    }
+}
+
 impl Executor for AdapterExecutor {
     fn register_file(
         &self,
@@ -223,16 +250,34 @@ impl Executor for AdapterExecutor {
             .files
             .as_ref()
             .ok_or("no trusted file root configured")?;
-        let policy = fa::SlotPolicy {
-            max_read_bytes: max_read_bytes.min(MAX_INLINE_CONTENT),
-            max_write_bytes: max_write_bytes.min(MAX_INLINE_CONTENT),
-        };
+        let policy = slot_policy(max_read_bytes, max_write_bytes);
         let oid = fa::ObjectId(u128::from(object.to_raw()));
         let r = match expected {
             None => files.register(oid, name, policy),
             Some(e) => files.register_with_identity(oid, name, policy, id_adapter(e)),
         };
         r.map(id_rec).map_err(|e| e.to_string())
+    }
+
+    fn restore_file_replacement(
+        &self,
+        slot: &FileSlotRec,
+        reservation: ReservationId,
+        intent: FileReplaceIntent,
+    ) -> Result<FileIdentityRec, String> {
+        self.files
+            .as_ref()
+            .ok_or("no trusted file root configured")?
+            .recover_replacement(
+                fa::ObjectId(u128::from(slot.object.to_raw())),
+                &slot.name,
+                slot_policy(slot.max_read_bytes, slot.max_write_bytes),
+                fa::ReservationId(u128::from(reservation.to_raw())),
+                id_adapter(intent.before),
+                id_adapter(intent.after),
+            )
+            .map(id_rec)
+            .map_err(|e| e.to_string())
     }
 
     fn register_endpoint(
@@ -277,6 +322,14 @@ impl Executor for AdapterExecutor {
     }
 
     fn execute(&self, job: &DispatchJob) -> ExecResult {
+        self.execute_with_file_intent(job, &mut |_| true)
+    }
+
+    fn execute_with_file_intent(
+        &self,
+        job: &DispatchJob,
+        record: &mut dyn FnMut(FileReplaceIntent) -> bool,
+    ) -> ExecResult {
         let rid = u128::from(job.id().to_raw());
         match &job.operation {
             JobOperation::FileRead { object, max_bytes } => self.file(
@@ -285,6 +338,7 @@ impl Executor for AdapterExecutor {
                 fa::FileOperation::ReadSnapshot {
                     max_bytes: (*max_bytes).min(MAX_INLINE_CONTENT),
                 },
+                record,
             ),
             JobOperation::FileReplace { object, bytes } => self.file(
                 rid,
@@ -292,6 +346,7 @@ impl Executor for AdapterExecutor {
                 fa::FileOperation::ReplaceContent {
                     bytes: bytes.clone(),
                 },
+                record,
             ),
             JobOperation::Https { endpoint, request } => self.http(rid, *endpoint, request),
         }
@@ -299,7 +354,13 @@ impl Executor for AdapterExecutor {
 }
 
 impl AdapterExecutor {
-    fn file(&self, rid: u128, object: ObjectId, op: fa::FileOperation) -> ExecResult {
+    fn file(
+        &self,
+        rid: u128,
+        object: ObjectId,
+        op: fa::FileOperation,
+        record: &mut dyn FnMut(FileReplaceIntent) -> bool,
+    ) -> ExecResult {
         let Some(files) = self.files.as_ref() else {
             return ExecResult::Failed {
                 code: ErrorCode::AdapterFailed,
@@ -312,7 +373,13 @@ impl AdapterExecutor {
             object: fa::ObjectId(u128::from(object.to_raw())),
             operation: op,
         };
-        match files.dispatch(&res) {
+        match files.dispatch_with_replace_intent(&res, |before, after| {
+            record(FileReplaceIntent {
+                object,
+                before: id_rec(before),
+                after: id_rec(after),
+            })
+        }) {
             Ok(fa::FileOutcome::Snapshot { effect, bytes }) => {
                 let summary = format!(
                     "file read object={} target={} bytes={} sha256={}",
@@ -353,6 +420,11 @@ impl AdapterExecutor {
             },
             Err(fa::FileError::Io { stage, errno }) if is_replace => ExecResult::Unknown {
                 summary: format!("file replace i/o failure at {stage}: {errno:?}"),
+            },
+            Err(fa::FileError::Integrity(fa::IntegrityViolation::ReplaceTargetChanged {
+                reverted: false,
+            })) => ExecResult::Unknown {
+                summary: "file replace: target changed and rollback could not be verified".into(),
             },
             Err(e) => ExecResult::Failed {
                 code: ErrorCode::AdapterFailed,

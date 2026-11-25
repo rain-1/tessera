@@ -183,6 +183,9 @@ fn create(b: &Broker, pipes: &Pipes) -> (AgentId, Sandbox) {
 fn two_real_sandboxes_read_delegate_revoke_via_tessera_cli() {
     let bin = target_dir();
     ensure_bins(&bin);
+    let workspaces = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(workspaces.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let lc = LauncherConfig {
         init_path: bin.join("tessera-sandbox-init"),
         ..LauncherConfig::default()
@@ -197,7 +200,7 @@ fn two_real_sandboxes_read_delegate_revoke_via_tessera_cli() {
     let profile = ProfileSpec {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],
-        workspace: None,
+        workspace: Some(workspaces.path().to_path_buf()),
         ro_binds: vec![(bin.join("tessera"), "/opt/tessera/tessera".into())],
         env: vec![],
         memory_max_bytes: Some(256 << 20),
@@ -385,6 +388,12 @@ fn two_real_sandboxes_read_delegate_revoke_via_tessera_cli() {
     assert_eq!((code, j["error"]["code"].as_str()), (1, Some("Revoked")));
 
     // ---- Isolation: admin socket and the other sandbox's channel --------
+    assert_eq!(a.sh("printf first > /workspace/marker").0, 0);
+    assert_eq!(bb.sh("test ! -e /workspace/marker").0, 0);
+    assert_eq!(c.sh("test ! -e /workspace/marker").0, 0);
+    assert_eq!(bb.sh("printf second > /workspace/marker").0, 0);
+    assert_eq!(a.sh("cat /workspace/marker").1.trim(), "first");
+    assert_eq!(bb.sh("cat /workspace/marker").1.trim(), "second");
     let sock = admin_sock.display().to_string();
     let (code, out) = a.sh(&format!("test -e '{sock}' && echo VISIBLE || echo HIDDEN"));
     assert_eq!((code, out.trim()), (0, "HIDDEN"), "admin socket visible");

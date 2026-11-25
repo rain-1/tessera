@@ -1068,6 +1068,31 @@ fn rendering_shows_normalized_fields_and_consequences() {
     assert!(escape_untrusted(&long).ends_with("[truncated]"));
 }
 
+#[test]
+fn description_wraps_with_prefixes_and_escapes_unicode_format_characters() {
+    let description = format!("{}é\u{061c}\u{2028}\u{2029}\u{e0061}", " ".repeat(130));
+    let out = render_request(
+        &req(base_fields()),
+        Some(&description),
+        &RenderContext {
+            now: Tick(100),
+            ticks_per_second: None,
+        },
+    );
+    let lines = out
+        .lines()
+        .skip_while(|line| !line.starts_with("--- UNTRUSTED"))
+        .skip(1)
+        .take_while(|line| !line.starts_with("--- end UNTRUSTED"))
+        .collect::<Vec<_>>();
+    assert!(lines.len() >= 3);
+    assert!(lines.iter().all(|line| line.starts_with("  | ")));
+    assert!(lines.iter().any(|line| line.contains("é")));
+    for escaped in ["\\u{061c}", "\\u{2028}", "\\u{2029}", "\\u{e0061}"] {
+        assert!(out.contains(escaped), "missing {escaped} in {out}");
+    }
+}
+
 // ---------------------------------------------------------------- proptests
 
 fn arb_fields() -> impl Strategy<Value = GrantRequestFields> {

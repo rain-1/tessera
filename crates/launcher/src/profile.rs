@@ -47,6 +47,9 @@ pub struct LauncherConfig {
     pub landlock: LandlockRequirement,
     /// Name of the launcher-owned cgroup created below the delegation root.
     pub cgroup_group_name: String,
+    /// Canonical host paths that must stay outside sandbox mounts. A socket
+    /// path may be supplied before the socket is bound.
+    pub protected_host_paths: Vec<PathBuf>,
 }
 
 impl Default for LauncherConfig {
@@ -61,6 +64,7 @@ impl Default for LauncherConfig {
             cgroup: CgroupRequirement::Required,
             landlock: LandlockRequirement::Required,
             cgroup_group_name: "tessera.launcher".to_string(),
+            protected_host_paths: Vec::new(),
         }
     }
 }

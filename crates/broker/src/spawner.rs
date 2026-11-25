@@ -14,15 +14,17 @@
 //! launch must not block the single writer.
 
 use std::collections::HashMap;
+use std::fs::{self, DirBuilder};
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
 use tessera_capability_core::AgentId;
 use tessera_launcher::{
-    AGENT_ID_ENV, AgentLabel, LaunchProfile, Launcher, LauncherConfig, LoopbackShim, ModelRoute,
-    ResourceLimits, SandboxHandle, StdioMode,
+    AGENT_ID_ENV, AgentLabel, LaunchError, LaunchProfile, Launcher, LauncherConfig, LoopbackShim,
+    ModelRoute, ResourceLimits, SandboxHandle, StdioMode,
 };
 
 use crate::convert::agent_label;
@@ -45,7 +47,7 @@ pub struct ProfileSpec {
     /// Arguments.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Host workspace directory (bound at `/workspace`).
+    /// Broker-owned host directory for fresh per-principal workspaces.
     #[serde(default)]
     pub workspace: Option<PathBuf>,
     /// Extra read-only binds `(host, sandbox)`.
@@ -54,10 +56,10 @@ pub struct ProfileSpec {
     /// Extra environment.
     #[serde(default)]
     pub env: Vec<(String, String)>,
-    /// cgroup memory limit.
+    /// cgroup memory limit. Omitted or null uses the launcher default.
     #[serde(default)]
     pub memory_max_bytes: Option<u64>,
-    /// cgroup pids limit.
+    /// cgroup pids limit. Omitted or null uses the launcher default.
     #[serde(default)]
     pub pids_max: Option<u64>,
     /// Pipe stdio to the spawner (tests) instead of inheriting `/dev/null`.
@@ -155,8 +157,9 @@ impl LauncherSpawner {
     /// Probe the host and refuse if a mandatory control is missing (R10).
     pub fn new(
         config: LauncherConfig,
-        profiles: HashMap<String, ProfileSpec>,
-    ) -> Result<Self, tessera_launcher::LaunchError> {
+        mut profiles: HashMap<String, ProfileSpec>,
+    ) -> Result<Self, LaunchError> {
+        prepare_profiles(&mut profiles, &config.protected_host_paths)?;
         Ok(LauncherSpawner {
             launcher: Launcher::new(config)?,
             profiles,
@@ -173,6 +176,106 @@ impl LauncherSpawner {
     }
 }
 
+fn overlapping(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+fn prepare_profiles(
+    profiles: &mut HashMap<String, ProfileSpec>,
+    protected: &[PathBuf],
+) -> Result<(), LaunchError> {
+    let mut workspace_roots = Vec::new();
+    for (name, profile) in profiles.iter_mut() {
+        if let Some(root) = &mut profile.workspace {
+            let canon = fs::canonicalize(&root).map_err(|e| {
+                LaunchError::InvalidProfile(format!(
+                    "profile {name} workspace {}: {e}",
+                    root.display()
+                ))
+            })?;
+            let md = fs::metadata(&canon)?;
+            if !md.is_dir()
+                || md.uid() != rustix::process::geteuid().as_raw()
+                || md.mode() & 0o022 != 0
+            {
+                return Err(LaunchError::InvalidProfile(format!(
+                    "profile {name} workspace {} must be a broker-owned directory without group or world write access",
+                    canon.display()
+                )));
+            }
+            if let Some(path) = protected.iter().find(|p| overlapping(&canon, p)) {
+                return Err(LaunchError::InvalidProfile(format!(
+                    "profile {name} workspace {} overlaps protected host path {}",
+                    canon.display(),
+                    path.display()
+                )));
+            }
+            workspace_roots.push(canon.clone());
+            *root = canon;
+        }
+    }
+    Launcher::check_runtime_exposure(&workspace_roots)?;
+    for (name, profile) in profiles.iter_mut() {
+        for (host, _) in &mut profile.ro_binds {
+            let canon = fs::canonicalize(&host).map_err(|e| {
+                LaunchError::InvalidProfile(format!(
+                    "profile {name} bind source {}: {e}",
+                    host.display()
+                ))
+            })?;
+            if let Some(path) = protected
+                .iter()
+                .chain(&workspace_roots)
+                .find(|p| overlapping(&canon, p))
+            {
+                return Err(LaunchError::InvalidProfile(format!(
+                    "profile {name} bind source {} overlaps protected host path or workspace root {}",
+                    canon.display(),
+                    path.display()
+                )));
+            }
+            *host = canon;
+        }
+        // Compat-mode model route: the socket and netshim must not be (or
+        // lie inside) a protected path such as the admin socket.
+        if let Some(m) = &profile.model_route {
+            for path in std::iter::once(&m.socket).chain(&m.netshim_path) {
+                let canon = fs::canonicalize(path).map_err(|e| {
+                    LaunchError::InvalidProfile(format!(
+                        "profile {name} model route {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                if let Some(p) = protected.iter().find(|p| overlapping(&canon, p)) {
+                    return Err(LaunchError::InvalidProfile(format!(
+                        "profile {name} model route {} overlaps protected host path {}",
+                        canon.display(),
+                        p.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl ProfileSpec {
+    fn limits(&self) -> ResourceLimits {
+        let defaults = ResourceLimits::default();
+        ResourceLimits {
+            memory_max_bytes: self.memory_max_bytes.or(defaults.memory_max_bytes),
+            pids_max: self.pids_max.or(defaults.pids_max),
+            ..defaults
+        }
+    }
+}
+
+fn create_workspace(root: &Path, label: &AgentLabel) -> std::io::Result<PathBuf> {
+    let dir = root.join(label.as_str());
+    DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
 impl SandboxSpawner for LauncherSpawner {
     fn spawn(&mut self, agent: AgentId, profile: &str) -> Result<OwnedFd, String> {
         let p = self
@@ -180,8 +283,14 @@ impl SandboxSpawner for LauncherSpawner {
             .get(profile)
             .ok_or_else(|| format!("unknown launch profile {profile:?}"))?;
         let label = AgentLabel::new(agent_label(agent)).map_err(|e| e.to_string())?;
-        let mut lp = LaunchProfile::new(label, &p.program).args(p.args.iter());
-        if let Some(ws) = &p.workspace {
+        let mut lp = LaunchProfile::new(label.clone(), &p.program).args(p.args.iter());
+        let workspace = p
+            .workspace
+            .as_deref()
+            .map(|root| create_workspace(root, &label))
+            .transpose()
+            .map_err(|e| format!("create workspace for {label}: {e}"))?;
+        if let Some(ws) = &workspace {
             lp = lp.workspace(ws);
         }
         for (h, s) in &p.ro_binds {
@@ -192,18 +301,19 @@ impl SandboxSpawner for LauncherSpawner {
                 lp = lp.env(k, v);
             }
         }
-        lp = lp.limits(ResourceLimits {
-            memory_max_bytes: p.memory_max_bytes,
-            pids_max: p.pids_max,
-            ..ResourceLimits::default()
-        });
+        lp = lp.limits(p.limits());
         if let Some(m) = &p.model_route {
             lp = lp.model_route(m.to_route()?);
         }
         if p.piped_stdio {
             lp = lp.stdio(StdioMode::Piped, StdioMode::Piped, StdioMode::Piped);
         }
-        let mut h = self.launcher.spawn(&lp).map_err(|e| e.to_string())?;
+        let mut h = self.launcher.spawn(&lp).map_err(|e| {
+            if let Some(ws) = &workspace {
+                let _ = fs::remove_dir(ws);
+            }
+            e.to_string()
+        })?;
         let fd = h
             .take_broker_channel()
             .ok_or("launcher returned no broker channel")?;
@@ -284,6 +394,107 @@ impl Drop for SpawnerThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn profile() -> ProfileSpec {
+        serde_json::from_str(r#"{"program":"/bin/true"}"#).unwrap()
+    }
+
+    #[test]
+    fn omitted_limits_inherit_launcher_defaults() {
+        let mut p = profile();
+        assert_eq!(p.limits(), ResourceLimits::default());
+        p.pids_max = Some(64);
+        assert_eq!(p.limits().pids_max, Some(64));
+        assert_eq!(
+            p.limits().memory_max_bytes,
+            ResourceLimits::default().memory_max_bytes
+        );
+    }
+
+    #[test]
+    fn each_workspace_is_created_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = AgentLabel::new("e1.s0").unwrap();
+        let b = AgentLabel::new("e1.s1").unwrap();
+        let first = create_workspace(tmp.path(), &a).unwrap();
+        fs::write(first.join("marker"), "first").unwrap();
+        let second = create_workspace(tmp.path(), &b).unwrap();
+        assert!(second.read_dir().unwrap().next().is_none());
+        assert_eq!(fs::metadata(second).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            create_workspace(tmp.path(), &a).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn profiles_reject_overlaps_with_protected_paths_and_other_workspaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let workspaces = root.join("workspaces");
+        let state = root.join("state");
+        let run = root.join("run");
+        for path in [&workspaces, &state, &run] {
+            DirBuilder::new().mode(0o700).create(path).unwrap();
+        }
+        let protected = [state.clone(), run.join("admin.sock")];
+        let state_child = state.join("child");
+        fs::create_dir(&state_child).unwrap();
+        let alias = root.join("alias");
+        symlink(&state_child, &alias).unwrap();
+
+        let mut worker = profile();
+        worker.workspace = Some(workspaces.clone());
+        let mut profiles = HashMap::from([("worker".into(), worker), ("other".into(), profile())]);
+        prepare_profiles(&mut profiles, &protected).unwrap();
+        for host in [&root, &run, &state, &alias, &workspaces] {
+            profiles.get_mut("other").unwrap().ro_binds = vec![(host.clone(), "/data".into())];
+            assert!(matches!(
+                prepare_profiles(&mut profiles, &protected),
+                Err(LaunchError::InvalidProfile(_))
+            ));
+        }
+        let other = profiles.get_mut("other").unwrap();
+        other.ro_binds.clear();
+        other.workspace = Some(alias);
+        assert!(matches!(
+            prepare_profiles(&mut profiles, &protected),
+            Err(LaunchError::InvalidProfile(_))
+        ));
+    }
+
+    #[test]
+    fn model_route_must_not_overlap_protected_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let run = root.join("run");
+        let free = root.join("free");
+        fs::create_dir(&run).unwrap();
+        fs::create_dir(&free).unwrap();
+        let admin = run.join("admin.sock");
+        let _a = std::os::unix::net::UnixListener::bind(&admin).unwrap();
+        let model = free.join("model.sock");
+        let _m = std::os::unix::net::UnixListener::bind(&model).unwrap();
+        let protected = [run.clone(), admin.clone()];
+        let mut p = profile();
+        p.model_route = Some(ModelRouteSpec {
+            socket: model,
+            loopback_port: None,
+            netshim_path: None,
+        });
+        let mut profiles = HashMap::from([("compat".to_string(), p)]);
+        prepare_profiles(&mut profiles, &protected).unwrap();
+        profiles.get_mut("compat").unwrap().model_route = Some(ModelRouteSpec {
+            socket: admin,
+            loopback_port: None,
+            netshim_path: None,
+        });
+        assert!(matches!(
+            prepare_profiles(&mut profiles, &protected),
+            Err(LaunchError::InvalidProfile(_))
+        ));
+    }
 
     #[test]
     fn model_route_spec() {

@@ -69,6 +69,16 @@ CASES = [
     ("kcmp(self)", 312, (PID, PID, 0, 0, 0), EPERM, True),
     ("process_madvise", 440, (-1, 0, 0, 0, 0), EPERM, True),
     ("syslog", 103, (3, 0, 0), EPERM, False),
+    # Newer syscalls (unfiltered on older kernels: ENOSYS; here EPERM).
+    ("open_tree_attr", 467, (-1, 0, 0, 0, 0), EPERM, True),
+    ("file_getattr", 468, (-1, 0, 0, 0, 0), EPERM, True),
+    ("file_setattr", 469, (-1, 0, 0, 0, 0), EPERM, True),
+    ("listns", 470, (0, 0, 0, 0), EPERM, True),
+    # modify_ldt(read, NULL, 0): unfiltered returns 0.
+    ("modify_ldt", 154, (0, 0, 0), EPERM, True),
+    # Future syscalls beyond the reviewed table: ENOSYS by default.
+    ("future syscall 471", 471, (), ENOSYS, False),
+    ("future syscall 1000", 1000, (), ENOSYS, False),
     ("clone3", 435, (0, 0), ENOSYS, True),
     ("x32 getpid", 0x40000000 | 39, (), ENOSYS, False),
 ]

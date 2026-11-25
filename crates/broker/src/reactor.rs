@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroU64;
 use std::os::fd::OwnedFd;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -46,8 +46,11 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::clock::{Clock, TickSource};
 use crate::conn::{self, ChannelHandle, error};
 use crate::convert::{self as cv, hex};
-use crate::entry::{Binding, BindingResult, EndpointSpec, Entry, FileIdentityRec, FileSlotRec};
+use crate::entry::{
+    Binding, BindingResult, EndpointSpec, Entry, FileIdentityRec, FileReplaceIntent, FileSlotRec,
+};
 use crate::executor::{DispatchJob, ExecResult, Executor, JobOperation, MAX_INLINE_CONTENT};
+use crate::ledger_quota::{LedgerQuotas, LedgerUsage};
 use crate::spawner::{AgentSpawnProfile, BaselineGrant, SandboxSpawner, SpawnerMsg, SpawnerThread};
 
 /// Points at which a test can kill the reactor (simulated crash).
@@ -77,6 +80,8 @@ pub type FaultHook = Arc<dyn Fn(FaultPoint) -> bool + Send + Sync>;
 pub struct BrokerConfig {
     /// Core resource bounds.
     pub limits: Limits,
+    /// Per-principal and per-root admission limits for agent-created ledger records.
+    pub ledger_quotas: LedgerQuotas,
     /// Lifetime of a root grant whose request says `Inherit`.
     pub default_grant_ttl_ms: u64,
     /// Upper bound on any requested root lifetime.
@@ -85,10 +90,12 @@ pub struct BrokerConfig {
     pub approval_timeout_ms: u64,
     /// Approval rate-limit window.
     pub approval_rate_window_ms: u64,
-    /// Approval requests per window.
+    /// Approval prompts per principal per window.
     pub approval_max_per_window: u32,
     /// Grant requests queued behind the active one.
     pub approval_queue: usize,
+    /// Active and queued approval requests per principal.
+    pub max_pending_approvals_per_agent: usize,
     /// Require FIDO2 user verification (PIN) on every mint.
     pub require_user_verification: bool,
     /// Agent channel frame bound (bytes).
@@ -125,6 +132,7 @@ impl std::fmt::Debug for BrokerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrokerConfig")
             .field("limits", &self.limits)
+            .field("ledger_quotas", &self.ledger_quotas)
             .field("endpoints", &self.endpoints.len())
             .finish_non_exhaustive()
     }
@@ -134,12 +142,14 @@ impl Default for BrokerConfig {
     fn default() -> Self {
         BrokerConfig {
             limits: Limits::default(),
+            ledger_quotas: LedgerQuotas::default(),
             default_grant_ttl_ms: 5 * 60 * 1000,
             max_grant_ttl_ms: 24 * 60 * 60 * 1000,
             approval_timeout_ms: 2 * 60 * 1000,
             approval_rate_window_ms: 60 * 1000,
             approval_max_per_window: 30,
             approval_queue: 16,
+            max_pending_approvals_per_agent: 2,
             require_user_verification: false,
             agent_max_frame: 128 * 1024,
             dispatch_workers: 4,
@@ -241,6 +251,11 @@ pub(crate) enum Inbox {
         reservation: ReservationId,
         result: ExecResult,
     },
+    FileReplacePrepared {
+        reservation: ReservationId,
+        intent: FileReplaceIntent,
+        ack: Sender<()>,
+    },
     Shutdown,
 }
 
@@ -309,6 +324,12 @@ struct PendingDispatch {
     root: u128,
 }
 
+struct ReplayedReplacement {
+    reservation: ReservationId,
+    intent: FileReplaceIntent,
+    resolved: bool,
+}
+
 #[derive(Debug)]
 enum Stop {
     Killed(FaultPoint),
@@ -323,6 +344,7 @@ type Flow = Result<(), Stop>;
 pub(crate) struct Reactor<S: Storage> {
     cfg: BrokerConfig,
     state: State,
+    ledger_usage: LedgerUsage,
     journal: Journal<S>,
     installation: u128,
     clock: Clock,
@@ -342,6 +364,8 @@ pub(crate) struct Reactor<S: Storage> {
     session: Option<ap::ApprovalSession>,
     active: Option<PendingGrant>,
     queue: VecDeque<PendingGrant>,
+    last_approval_agent: Option<AgentId>,
+    approval_begins: HashMap<AgentId, VecDeque<u64>>,
     next_ticket: u64,
     inbox_tx: SyncSender<Inbox>,
     jobs: Option<Sender<DispatchJob>>,
@@ -358,6 +382,21 @@ fn journal_err(e: JournalError) -> Stop {
     Stop::Journal(e.to_string())
 }
 
+fn matches_file_replace(
+    state: &State,
+    reservation: ReservationId,
+    intent: FileReplaceIntent,
+) -> bool {
+    intent.before != intent.after
+        && state.reservation(reservation).is_some_and(|r| {
+            r.operation()
+                == Operation::File {
+                    object: intent.object,
+                    right: FileRight::Replace,
+                }
+        })
+}
+
 impl<S: Storage> Reactor<S> {
     /// Recover from the journal, then begin a new epoch (ADR-0003).
     pub(crate) fn open(
@@ -372,6 +411,7 @@ impl<S: Storage> Reactor<S> {
         let mut dispatched = BTreeSet::new();
         let mut principals = BTreeSet::new();
         let mut files: HashMap<ObjectId, FileSlotRec> = HashMap::new();
+        let mut replacements = HashMap::<ObjectId, ReplayedReplacement>::new();
         let mut endpoint_recs: Vec<(EndpointId, EndpointSpec)> = Vec::new();
         let mut enrollment = None;
         let mut n_records = 0u64;
@@ -400,6 +440,47 @@ impl<S: Storage> Reactor<S> {
                     }
                     Ok(Entry::FileRegistered(f)) => {
                         files.insert(f.object, f);
+                        continue;
+                    }
+                    Ok(Entry::FileReplacePrepared {
+                        reservation,
+                        intent,
+                    }) => {
+                        if !files.contains_key(&intent.object)
+                            || !dispatched.contains(&reservation)
+                            || !matches_file_replace(&state, reservation, intent)
+                        {
+                            return Err(StartError::BadEntry(rec.seq));
+                        }
+                        replacements.insert(
+                            intent.object,
+                            ReplayedReplacement {
+                                reservation,
+                                intent,
+                                resolved: false,
+                            },
+                        );
+                        continue;
+                    }
+                    Ok(Entry::FileIdentityRecovered {
+                        reservation,
+                        object,
+                        identity,
+                    }) => {
+                        let (Some(replacement), Some(file)) =
+                            (replacements.get_mut(&object), files.get_mut(&object))
+                        else {
+                            return Err(StartError::BadEntry(rec.seq));
+                        };
+                        if replacement.reservation != reservation
+                            || replacement.resolved
+                            || ![replacement.intent.before, replacement.intent.after]
+                                .contains(&identity)
+                        {
+                            return Err(StartError::BadEntry(rec.seq));
+                        }
+                        replacement.resolved = true;
+                        file.identity = identity;
                         continue;
                     }
                     Ok(Entry::EndpointRegistered { id, spec }) => {
@@ -432,7 +513,23 @@ impl<S: Storage> Reactor<S> {
             if let Some((obj, id)) = fid
                 && let Some(f) = files.get_mut(&obj)
             {
-                f.identity = id;
+                match replacements.get_mut(&obj) {
+                    None => f.identity = id, // legacy journal entry
+                    Some(replacement)
+                        if matches!(cmd,
+                        AuthenticatedCommand::Operator(AdminCommand::RecordOutcome { reservation, outcome: Outcome::Completed })
+                            if reservation == replacement.reservation) =>
+                    {
+                        if replacement.resolved || replacement.intent.after != id {
+                            return Err(StartError::BadEntry(rec.seq));
+                        }
+                        f.identity = id;
+                        replacement.resolved = true;
+                    }
+                    // Result delivery can lag behind the next worker's prepare
+                    // on this slot. The newest exchange intent takes precedence.
+                    Some(_) => {}
+                }
             }
         }
         check_invariant(&state).map_err(|v| StartError::Replay(format!("{v:?}")))?;
@@ -487,6 +584,7 @@ impl<S: Storage> Reactor<S> {
             spawner: services.spawner.map(SpawnerThread::start),
             cfg,
             state,
+            ledger_usage: LedgerUsage::default(),
             journal,
             installation,
             bindings,
@@ -502,6 +600,8 @@ impl<S: Storage> Reactor<S> {
             session: None,
             active: None,
             queue: VecDeque::new(),
+            last_approval_agent: None,
+            approval_begins: HashMap::new(),
             next_ticket: 1,
             inbox_tx,
             jobs: None,
@@ -545,7 +645,8 @@ impl<S: Storage> Reactor<S> {
         }
         // Registries (re-registration checks every file identity).
         for (_, f) in files {
-            r.restore_file(f);
+            let pending = replacements.remove(&f.object).filter(|r| !r.resolved);
+            r.restore_file(f, pending)?;
         }
         let cfg_endpoints = r.cfg.endpoints.clone();
         for (id, spec, secret) in cfg_endpoints {
@@ -575,15 +676,46 @@ impl<S: Storage> Reactor<S> {
         Ok(r)
     }
 
-    fn restore_file(&mut self, f: FileSlotRec) {
-        match self.executor.register_file(
-            f.object,
-            &f.name,
-            f.max_read_bytes,
-            f.max_write_bytes,
-            Some(f.identity),
-        ) {
-            Ok(_) => {
+    fn restore_file(
+        &mut self,
+        mut f: FileSlotRec,
+        pending: Option<ReplayedReplacement>,
+    ) -> Result<(), StartError> {
+        let register = |identity| {
+            self.executor.register_file(
+                f.object,
+                &f.name,
+                f.max_read_bytes,
+                f.max_write_bytes,
+                Some(identity),
+            )
+        };
+        let registered = match &pending {
+            Some(r) => self
+                .executor
+                .restore_file_replacement(&f, r.reservation, r.intent),
+            None => register(f.identity),
+        };
+        match registered {
+            Ok(identity) => {
+                if let Some(r) = pending {
+                    if ![r.intent.before, r.intent.after].contains(&identity) {
+                        return Err(StartError::Replay(
+                            "executor returned an unexpected replacement identity".into(),
+                        ));
+                    }
+                    self.journal
+                        .append(
+                            &Entry::FileIdentityRecovered {
+                                reservation: r.reservation,
+                                object: f.object,
+                                identity,
+                            }
+                            .encode(),
+                        )
+                        .map_err(StartError::Journal)?;
+                }
+                f.identity = identity;
                 self.file_ok.insert(f.object);
             }
             Err(e) => self.audit_error(
@@ -592,6 +724,7 @@ impl<S: Storage> Reactor<S> {
             ),
         }
         self.files.insert(f.object, f);
+        Ok(())
     }
 
     fn install_enrollment(&mut self, e: ap::Enrollment) {
@@ -600,12 +733,11 @@ impl<S: Storage> Reactor<S> {
             authority_epoch: ap::AuthorityEpoch(self.state.epoch()),
             require_user_verification: self.cfg.require_user_verification,
         };
-        let sc = ap::SessionConfig {
-            approval_timeout: self.cfg.approval_timeout_ms,
-            rate_window: self.cfg.approval_rate_window_ms,
-            max_requests_per_window: self.cfg.approval_max_per_window,
-        };
-        self.session = Some(ap::ApprovalSession::new(e.clone(), policy, sc));
+        self.session = Some(ap::ApprovalSession::with_external_rate_limit(
+            e.clone(),
+            policy,
+            self.cfg.approval_timeout_ms,
+        ));
         self.enrollment = Some(e);
     }
 
@@ -617,10 +749,12 @@ impl<S: Storage> Reactor<S> {
         // Dispatch workers.
         let (jtx, jrx) = mpsc::channel::<DispatchJob>();
         let jrx = Arc::new(Mutex::new(jrx));
+        let file_replacements = Arc::new(RwLock::new(true));
         for i in 0..self.cfg.dispatch_workers.max(1) {
             let jrx = Arc::clone(&jrx);
             let exec = Arc::clone(&self.executor);
             let tx = self.inbox_tx.clone();
+            let file_replacements = Arc::clone(&file_replacements);
             let _ = thread::Builder::new()
                 .name(format!("tessera-dispatch-{i}"))
                 .spawn(move || {
@@ -630,8 +764,26 @@ impl<S: Storage> Reactor<S> {
                             g.recv()
                         };
                         let Ok(job) = job else { return };
-                        let result = exec.execute(&job);
                         let reservation = job.id();
+                        let result = if matches!(job.operation, JobOperation::FileReplace { .. }) {
+                            let running =
+                                file_replacements.read().unwrap_or_else(|p| p.into_inner());
+                            if !*running {
+                                return;
+                            }
+                            exec.execute_with_file_intent(&job, &mut |intent| {
+                                let (ack, wait) = mpsc::channel();
+                                tx.send(Inbox::FileReplacePrepared {
+                                    reservation,
+                                    intent,
+                                    ack,
+                                })
+                                .is_ok()
+                                    && wait.recv().is_ok()
+                            })
+                        } else {
+                            exec.execute(&job)
+                        };
                         drop(job);
                         if tx
                             .send(Inbox::DispatchDone {
@@ -668,6 +820,10 @@ impl<S: Storage> Reactor<S> {
         // Whatever the reason: release nothing more, close every channel.
         self.jobs = None;
         self.channels.clear();
+        // Drop queued acknowledgments and wait for any acknowledged exchange
+        // before another embedded broker can recover against the same root.
+        drop(inbox);
+        *file_replacements.write().unwrap_or_else(|p| p.into_inner()) = false;
         self.spawner = None;
         match reason {
             Stop::Shutdown => StopReason::Shutdown,
@@ -727,8 +883,51 @@ impl<S: Storage> Reactor<S> {
                 reservation,
                 result,
             } => self.on_dispatched(reservation, result),
+            Inbox::FileReplacePrepared {
+                reservation,
+                intent,
+                ack,
+            } => {
+                if self.record_file_replace(reservation, intent)? {
+                    let _ = ack.send(());
+                }
+                Ok(())
+            }
             Inbox::Shutdown => Err(Stop::Shutdown),
         }
+    }
+
+    fn record_file_replace(
+        &mut self,
+        reservation: ReservationId,
+        intent: FileReplaceIntent,
+    ) -> Result<bool, Stop> {
+        if !matches_file_replace(&self.state, reservation, intent)
+            || !self.dispatched.contains(&reservation)
+            || !self.pending_dispatch.contains_key(&reservation)
+            || !self.files.contains_key(&intent.object)
+        {
+            return Err(Stop::Inconsistent(
+                "replacement intent has no matching dispatch".into(),
+            ));
+        }
+        if !self
+            .state
+            .reservation(reservation)
+            .is_some_and(|r| r.status() == ReservationStatus::Reserved)
+        {
+            return Ok(false); // Emergency stop abandoned this job before the exchange.
+        }
+        self.journal
+            .append(
+                &Entry::FileReplacePrepared {
+                    reservation,
+                    intent,
+                }
+                .encode(),
+            )
+            .map_err(journal_err)?;
+        Ok(true)
     }
 
     // ------------------------------------------------------------------
@@ -754,6 +953,13 @@ impl<S: Storage> Reactor<S> {
         if let Err(d) = validate_command(&self.state, &command, now) {
             return Ok(Err(d));
         }
+        let charge = match self
+            .ledger_usage
+            .admit(self.cfg.ledger_quotas, &self.state, command)
+        {
+            Ok(charge) => charge,
+            Err(d) => return Ok(Err(d)),
+        };
         let entry = Entry::Command {
             tick: now,
             command,
@@ -763,6 +969,9 @@ impl<S: Storage> Reactor<S> {
         let receipt = self.journal.append(&entry.encode()).map_err(journal_err)?;
         match step(&mut self.state, command, now) {
             Ok(eff) => {
+                if let Some(charge) = charge {
+                    self.ledger_usage.charge(charge);
+                }
                 if let tessera_capability_core::Effect::PrincipalCreated { agent } = &eff {
                     self.principals.insert(*agent);
                 }
@@ -1341,16 +1550,24 @@ impl<S: Storage> Reactor<S> {
                 self.record(ev);
                 self.reply(agent, corr, resp);
             }
-            Err(d) => self.deny_agent(
-                agent,
-                corr,
-                kind,
-                Some(rid),
-                Some(digest),
-                Some(cap),
-                cv::denial_code(d),
-                &format!("{d:?}"),
-            ),
+            Err(d) => {
+                let code = cv::denial_code(d);
+                let detail = if code == ErrorCode::UnknownCapability {
+                    "UnknownCapability".into()
+                } else {
+                    format!("{d:?}")
+                };
+                self.deny_agent(
+                    agent,
+                    corr,
+                    kind,
+                    Some(rid),
+                    Some(digest),
+                    Some(cap),
+                    code,
+                    &detail,
+                );
+            }
         }
         Ok(())
     }
@@ -1367,11 +1584,6 @@ impl<S: Storage> Reactor<S> {
         // Look up the capability only to learn its resource; a copied id of
         // another principal is reported exactly like an unknown id.
         let Some(c) = self.state.capability(cap).filter(|c| c.owner() == agent) else {
-            let reason = if self.state.capability(cap).is_some() {
-                "NotOwner"
-            } else {
-                "UnknownCapability"
-            };
             self.deny_agent(
                 agent,
                 corr,
@@ -1380,7 +1592,7 @@ impl<S: Storage> Reactor<S> {
                 Some(digest),
                 Some(cap),
                 ErrorCode::UnknownCapability,
-                reason,
+                "UnknownCapability",
             );
             return Ok(());
         };
@@ -1719,6 +1931,22 @@ impl<S: Storage> Reactor<S> {
                 "too many denied requests remembered for this principal",
             );
         }
+        if self.queue.len() >= self.cfg.approval_queue {
+            return deny(self, ErrorCode::RateLimited, "approval queue full");
+        }
+        let pending_for_agent = self
+            .active
+            .iter()
+            .chain(&self.queue)
+            .filter(|p| p.agent == agent)
+            .count();
+        if pending_for_agent >= self.cfg.max_pending_approvals_per_agent {
+            return deny(
+                self,
+                ErrorCode::RateLimited,
+                "too many pending approvals for this principal",
+            );
+        }
         let (Some(enrollment), true) = (self.enrollment.clone(), self.session.is_some()) else {
             return deny(
                 self,
@@ -1780,9 +2008,6 @@ impl<S: Storage> Reactor<S> {
             Ok(r) => r,
             Err(e) => return deny(self, ErrorCode::Malformed, &e.to_string()),
         };
-        if self.queue.len() >= self.cfg.approval_queue {
-            return deny(self, ErrorCode::RateLimited, "approval queue full");
-        }
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         // The description is untrusted agent text: audited by length and
@@ -1835,18 +2060,44 @@ impl<S: Storage> Reactor<S> {
 
     fn activate_next(&mut self) {
         while self.active.is_none() {
-            let Some(pg) = self.queue.pop_front() else {
+            // Walk the principals in order, wrapping after the last prompt.
+            // Among requests for the same principal, serve the oldest first.
+            let next = self
+                .queue
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, p)| (Some(p.agent) <= self.last_approval_agent, p.agent))
+                .map(|(i, _)| i);
+            let Some(pg) = next.and_then(|i| self.queue.remove(i)) else {
                 return;
             };
             let now = ap::Tick(self.clock.now().to_raw());
+            if pg.request.fields().request_expires_at <= now {
+                self.fail_grant(
+                    pg,
+                    ErrorCode::ApprovalTimeout,
+                    "approval timed out in queue",
+                );
+                continue;
+            }
             let Some(session) = self.session.as_mut() else {
                 self.fail_grant(pg, ErrorCode::Unavailable, "no approval credential");
                 continue;
             };
+            let window_start = now.0.saturating_sub(self.cfg.approval_rate_window_ms);
+            let begins = self.approval_begins.entry(pg.agent).or_default();
+            while begins.front().is_some_and(|t| *t < window_start) {
+                begins.pop_front();
+            }
+            if begins.len() >= self.cfg.approval_max_per_window as usize {
+                self.fail_grant(pg, ErrorCode::RateLimited, "approval requests rate-limited");
+                continue;
+            }
             match session.begin(pg.request.clone(), now) {
-                Ok(_) => self.active = Some(pg),
-                Err(ap::SessionError::RateLimited) => {
-                    self.fail_grant(pg, ErrorCode::RateLimited, "approval requests rate-limited")
+                Ok(_) => {
+                    begins.push_back(now.0);
+                    self.last_approval_agent = Some(pg.agent);
+                    self.active = Some(pg);
                 }
                 Err(e) => self.fail_grant(pg, ErrorCode::ApprovalDenied, &e.to_string()),
             }
@@ -1885,15 +2136,19 @@ impl<S: Storage> Reactor<S> {
             self.fail_grant(pg, ErrorCode::ApprovalTimeout, "approval closed");
         }
         // Queued requests that expired while waiting.
-        let mut expired = Vec::new();
-        self.queue.retain(|p| {
-            let keep = p.request.fields().request_expires_at > now;
-            if !keep {
-                expired.push(p.ticket);
+        let queued = self.queue.len();
+        for _ in 0..queued {
+            let pg = self.queue.pop_front().expect("queued grant");
+            if pg.request.fields().request_expires_at <= now {
+                self.fail_grant(
+                    pg,
+                    ErrorCode::ApprovalTimeout,
+                    "approval timed out in queue",
+                );
+            } else {
+                self.queue.push_back(pg);
             }
-            keep
-        });
-        let _ = expired;
+        }
         self.activate_next();
     }
 
@@ -2398,6 +2653,7 @@ impl<S: Storage> Reactor<S> {
             self.reset_session();
         }
         self.queue.retain(|p| p.agent != agent);
+        self.approval_begins.remove(&agent);
         // Pending spawns of this principal: their children are in `children`
         // already and are terminated below; drop the waiters.
         self.spawning.retain(|(p, _), _| *p != agent);
@@ -2850,6 +3106,7 @@ impl<S: Storage> Reactor<S> {
         self.domain_size.clear();
         self.spawned.clear();
         self.denied.clear();
+        self.ledger_usage = LedgerUsage::default();
         if let Some(sp) = &self.spawner {
             for a in agents {
                 sp.send(SpawnerMsg::Stop(a));
@@ -2857,6 +3114,8 @@ impl<S: Storage> Reactor<S> {
         }
         self.active = None;
         self.queue.clear();
+        self.last_approval_agent = None;
+        self.approval_begins.clear();
         let epoch = self.state.epoch();
         self.bindings.retain(|(a, _), _| a.epoch() == epoch);
         self.reset_session();
@@ -3011,5 +3270,478 @@ fn agent_kind(c: &AgentCommand) -> &'static str {
         AgentCommand::Transfer { .. } => "transfer",
         AgentCommand::Revoke { .. } => "revoke",
         AgentCommand::Drop { .. } => "drop",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use tessera_journal::JournalOptions;
+    use tessera_journal::testing::{CrashMode, MemStorage};
+
+    const SLOT: &str = "notes";
+
+    fn open(root: &Path, storage: MemStorage) -> Reactor<MemStorage> {
+        let journal = Journal::open_storage(storage, JournalOptions::default()).unwrap();
+        Reactor::open(
+            journal,
+            BrokerConfig::default(),
+            Services {
+                executor: crate::AdapterExecutor::new(Some(root)).unwrap().shared(),
+                spawner: None,
+                audit: AuditLog::memory(),
+                clock: Arc::new(crate::ManualClock::new()),
+                fault: None,
+            },
+            mpsc::sync_channel(1).0,
+        )
+        .unwrap()
+    }
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        MemStorage,
+        Reactor<MemStorage>,
+        AgentId,
+        CapabilityId,
+        ObjectId,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root.path().join(SLOT), b"original").unwrap();
+        let storage = MemStorage::new();
+        let mut r = open(root.path(), storage.clone());
+        let Some(AdminResponse::Object(object)) = r
+            .on_admin(
+                AdminRequest::RegisterFile {
+                    name: SLOT.to_owned(),
+                    max_read_bytes: 64,
+                    max_write_bytes: 64,
+                },
+                &mpsc::channel().0,
+            )
+            .unwrap()
+        else {
+            panic!("register file")
+        };
+        let object = ObjectId::from_raw(object);
+        let agent = principal(&mut r);
+        let capability = baseline(
+            &mut r,
+            agent,
+            object,
+            Budget::Finite(4),
+            tessera_capability_core::Depth::Finite(0),
+        );
+        (root, storage, r, agent, capability, object)
+    }
+
+    fn principal(r: &mut Reactor<MemStorage>) -> AgentId {
+        let (tessera_capability_core::Effect::PrincipalCreated { agent }, _) = r
+            .commit(
+                AuthenticatedCommand::operator(AdminCommand::CreatePrincipal),
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("create principal")
+        };
+        agent
+    }
+
+    fn baseline(
+        r: &mut Reactor<MemStorage>,
+        agent: AgentId,
+        object: ObjectId,
+        budget: Budget,
+        depth: tessera_capability_core::Depth,
+    ) -> CapabilityId {
+        let (tessera_capability_core::Effect::RootCreated { capability, .. }, _) = r
+            .commit(
+                AuthenticatedCommand::operator(AdminCommand::InstallBaseline {
+                    recipient: agent,
+                    terms: tessera_capability_core::Terms {
+                        scope: Scope::File {
+                            object,
+                            rights: tessera_capability_core::FileRights::REPLACE,
+                        },
+                        budget,
+                        depth,
+                        expiry: Expiry::Never,
+                    },
+                }),
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("install baseline")
+        };
+        capability
+    }
+
+    fn replacement(
+        r: &mut Reactor<MemStorage>,
+        agent: AgentId,
+        cap: CapabilityId,
+        request: u128,
+        bytes: &[u8],
+    ) -> DispatchJob {
+        let (tx, rx) = mpsc::channel();
+        r.jobs = Some(tx);
+        r.on_consume(
+            agent,
+            1,
+            RequestId::from_raw(request),
+            [0; 32],
+            cap,
+            WireOperation::FileReplaceContent {
+                bytes: bytes.to_vec().try_into().unwrap(),
+            },
+        )
+        .unwrap();
+        rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn interrupted_replacement_restores_the_verified_occupant() {
+        for exchange in [false, true] {
+            let (root, storage, mut r, agent, cap, object) = fixture();
+            let path = root.path().join(SLOT);
+            let job = replacement(&mut r, agent, cap, 1, b"replacement");
+            let executor = Arc::clone(&r.executor);
+            let mut intent = None;
+            let result = executor.execute_with_file_intent(&job, &mut |prepared| {
+                assert_eq!(fs::read(&path).unwrap(), b"original");
+                let (ack, receipt) = mpsc::channel();
+                r.handle(Inbox::FileReplacePrepared {
+                    reservation: job.id(),
+                    intent: prepared,
+                    ack,
+                })
+                .unwrap();
+                receipt.try_recv().unwrap();
+                intent = Some(prepared);
+                exchange
+            });
+            assert_eq!(matches!(result, ExecResult::Completed { .. }), exchange);
+            let intent = intent.unwrap();
+            drop(r);
+
+            let storage = storage.crash(CrashMode::LoseUnsynced);
+            let r = open(root.path(), storage.clone());
+            let expected = if exchange {
+                intent.after
+            } else {
+                intent.before
+            };
+            assert!(r.file_ok.contains(&object));
+            assert_eq!(r.files[&object].identity, expected);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                if exchange {
+                    &b"replacement"[..]
+                } else {
+                    b"original"
+                }
+            );
+            assert_ne!(
+                r.state.reservation(job.id()).unwrap().status(),
+                ReservationStatus::Completed
+            );
+            drop(r);
+            let r = open(root.path(), storage);
+            assert!(r.file_ok.contains(&object));
+            assert_eq!(r.files[&object].identity, expected);
+        }
+    }
+
+    #[test]
+    fn late_outcome_cannot_override_a_newer_file_identity() {
+        let (root, storage, mut r, agent, cap, object) = fixture();
+        let executor = Arc::clone(&r.executor);
+        let first = replacement(&mut r, agent, cap, 1, b"first");
+        let first_result = executor.execute_with_file_intent(&first, &mut |intent| {
+            r.record_file_replace(first.id(), intent).unwrap()
+        });
+        let second = replacement(&mut r, agent, cap, 2, b"second");
+        let second_result = executor.execute_with_file_intent(&second, &mut |intent| {
+            r.record_file_replace(second.id(), intent).unwrap()
+        });
+        let ExecResult::Completed {
+            new_identity: Some((_, expected)),
+            ..
+        } = &second_result
+        else {
+            panic!("second replacement failed")
+        };
+        let expected = *expected;
+        r.on_dispatched(second.id(), second_result).unwrap();
+        r.on_dispatched(first.id(), first_result).unwrap();
+        drop(r);
+        let r = open(root.path(), storage);
+        assert!(r.file_ok.contains(&object));
+        assert_eq!(r.files[&object].identity, expected);
+        assert_eq!(fs::read(root.path().join(SLOT)).unwrap(), b"second");
+    }
+
+    #[test]
+    fn emergency_stop_after_prepare_preserves_the_exchanged_identity() {
+        let (root, storage, mut r, agent, cap, object) = fixture();
+        let job = replacement(&mut r, agent, cap, 1, b"replacement");
+        let executor = Arc::clone(&r.executor);
+        let result = executor.execute_with_file_intent(&job, &mut |intent| {
+            assert!(r.record_file_replace(job.id(), intent).unwrap());
+            r.emergency_stop().unwrap();
+            true
+        });
+        assert!(matches!(result, ExecResult::Completed { .. }));
+        r.on_dispatched(job.id(), result).unwrap();
+        assert_eq!(
+            r.state.reservation(job.id()).unwrap().status(),
+            ReservationStatus::Abandoned
+        );
+        drop(r);
+        let r = open(root.path(), storage);
+        assert!(r.file_ok.contains(&object));
+        assert_eq!(fs::read(root.path().join(SLOT)).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn replacement_stops_when_the_intent_cannot_be_synced() {
+        let (root, storage, mut r, agent, cap, object) = fixture();
+        let job = replacement(&mut r, agent, cap, 1, b"replacement");
+        let executor = Arc::clone(&r.executor);
+        storage.fail_syncs(true);
+        let result = executor.execute_with_file_intent(&job, &mut |intent| {
+            let (ack, receipt) = mpsc::channel();
+            assert!(matches!(
+                r.handle(Inbox::FileReplacePrepared {
+                    reservation: job.id(),
+                    intent,
+                    ack,
+                }),
+                Err(Stop::Journal(_))
+            ));
+            assert!(matches!(
+                receipt.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            false
+        });
+        assert!(matches!(result, ExecResult::Failed { .. }));
+        drop(r);
+        let r = open(root.path(), storage.crash(CrashMode::LoseUnsynced));
+        assert!(r.file_ok.contains(&object));
+        assert_eq!(fs::read(root.path().join(SLOT)).unwrap(), b"original");
+    }
+
+    #[test]
+    fn recovery_rejects_a_foreign_displaced_inode() {
+        let (root, storage, mut r, agent, cap, object) = fixture();
+        let _original = fs::File::open(root.path().join(SLOT)).unwrap();
+        let job = replacement(&mut r, agent, cap, 1, b"replacement");
+        let executor = Arc::clone(&r.executor);
+        let result = executor.execute_with_file_intent(&job, &mut |intent| {
+            r.record_file_replace(job.id(), intent).unwrap()
+        });
+        assert!(matches!(result, ExecResult::Completed { .. }));
+        let displaced = root.path().join(format!(
+            "{}{:032x}",
+            tessera_adapter_file::TEMP_PREFIX,
+            job.id().to_raw()
+        ));
+        fs::write(&displaced, b"foreign").unwrap();
+        drop(r);
+        let r = open(root.path(), storage);
+        assert!(!r.file_ok.contains(&object));
+        assert_eq!(fs::read(displaced).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn ledger_derivation_quota_follows_the_issuer_and_the_root() {
+        use tessera_capability_core::{Depth, Effect, FileRights, Resource, Terms};
+        let (root_dir, storage, mut r, a, _, object) = fixture();
+        r.cfg.ledger_quotas.derived_per_principal = 1;
+        r.cfg.ledger_quotas.derived_per_root = 1;
+        let other = principal(&mut r);
+        let root_a = baseline(&mut r, a, object, Budget::Finite(10), Depth::Finite(2));
+        let second_a = baseline(&mut r, a, object, Budget::Finite(10), Depth::Finite(2));
+        let root_other = baseline(&mut r, other, object, Budget::Finite(10), Depth::Finite(2));
+        let terms = Terms {
+            scope: Scope::File {
+                object,
+                rights: FileRights::REPLACE,
+            },
+            budget: Budget::Finite(3),
+            depth: Depth::Finite(1),
+            expiry: Expiry::Never,
+        };
+        let Ok((Effect::Derived { child, .. }, _)) = r
+            .commit(
+                AuthenticatedCommand::agent(
+                    a,
+                    AgentCommand::Delegate {
+                        capability: root_a,
+                        recipient: other,
+                        terms,
+                    },
+                ),
+                None,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("delegate under quota")
+        };
+
+        let seq = r.journal.next_seq();
+        let denied = Denial::CapacityExceeded(Resource::Capabilities);
+        for (caller, capability, depth) in [
+            (a, second_a, Depth::Finite(1)),
+            (other, child, Depth::Finite(0)),
+        ] {
+            let before = r.state.capability(capability).unwrap().budget();
+            let result = r
+                .commit(
+                    AuthenticatedCommand::agent(
+                        caller,
+                        AgentCommand::Split {
+                            capability,
+                            terms: Terms {
+                                depth,
+                                budget: Budget::Finite(1),
+                                ..terms
+                            },
+                        },
+                    ),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(result.unwrap_err(), denied);
+            assert_eq!(r.state.capability(capability).unwrap().budget(), before);
+        }
+        assert_eq!(r.journal.next_seq(), seq);
+        assert!(
+            r.commit(
+                AuthenticatedCommand::agent(
+                    other,
+                    AgentCommand::Split {
+                        capability: root_other,
+                        terms,
+                    }
+                ),
+                None,
+                None
+            )
+            .unwrap()
+            .is_ok()
+        );
+
+        drop(r);
+        let r = open(root_dir.path(), storage);
+        assert_eq!(r.state.capability(child).unwrap().owner(), other);
+        assert!(!r.state.is_active(other));
+    }
+
+    #[test]
+    fn ledger_reservation_quota_keeps_failed_attempts_and_resets_with_epoch() {
+        use tessera_capability_core::{Depth, Effect, Resource};
+        let (_root, _storage, mut r, a, _, object) = fixture();
+        let cap = baseline(&mut r, a, object, Budget::Finite(4), Depth::Finite(1));
+        let unrelated = baseline(&mut r, a, object, Budget::Finite(4), Depth::Finite(0));
+        let other = principal(&mut r);
+        r.cfg.ledger_quotas.reservations_per_principal = 1;
+        r.cfg.ledger_quotas.reservations_per_root = 1;
+        let cmd = |agent, capability, id| {
+            AuthenticatedCommand::agent(
+                agent,
+                AgentCommand::Consume {
+                    request_id: RequestId::from_raw(id),
+                    capability,
+                    operation: Operation::File {
+                        object,
+                        right: FileRight::Replace,
+                    },
+                },
+            )
+        };
+        let Ok((Effect::Reserved(reservation), _)) = r.commit(cmd(a, cap, 1), None, None).unwrap()
+        else {
+            panic!("reserve under quota")
+        };
+        r.commit(
+            AuthenticatedCommand::operator(AdminCommand::RecordOutcome {
+                reservation: reservation.id(),
+                outcome: Outcome::Failed,
+            }),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            r.commit(cmd(a, cap, 1), None, None).unwrap(),
+            Ok((Effect::AlreadyReserved { .. }, _))
+        ));
+        let seq = r.journal.next_seq();
+        assert_eq!(
+            r.commit(cmd(a, cap, 2), None, None).unwrap().unwrap_err(),
+            Denial::CapacityExceeded(Resource::Reservations)
+        );
+        assert_eq!(r.journal.next_seq(), seq);
+        assert_eq!(r.state.capability(cap).unwrap().budget(), Budget::Finite(3));
+
+        let denied = Denial::CapacityExceeded(Resource::Reservations);
+        assert_eq!(
+            r.commit(cmd(a, unrelated, 2), None, None)
+                .unwrap()
+                .unwrap_err(),
+            denied
+        );
+        r.commit(
+            AuthenticatedCommand::agent(
+                a,
+                AgentCommand::Transfer {
+                    capability: cap,
+                    recipient: other,
+                },
+            ),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            r.commit(cmd(other, cap, 1), None, None)
+                .unwrap()
+                .unwrap_err(),
+            denied
+        );
+
+        r.emergency_stop().unwrap();
+        assert_eq!(
+            r.state.reservation(reservation.id()).unwrap().status(),
+            ReservationStatus::Failed
+        );
+        let new_agent = principal(&mut r);
+        let new_cap = baseline(
+            &mut r,
+            new_agent,
+            object,
+            Budget::Finite(4),
+            Depth::Finite(0),
+        );
+        assert!(matches!(
+            r.commit(cmd(new_agent, new_cap, 1), None, None).unwrap(),
+            Ok((Effect::Reserved(_), _))
+        ));
     }
 }

@@ -12,7 +12,7 @@ use tessera_approval::Authenticator;
 use tessera_broker::{
     AdapterExecutor, AdminRequest, AdminResponse, AuditLog, Broker, BrokerConfig, DispatchJob,
     EndpointSpec, ExecResult, Executor, FaultHook, MonotonicClock, SandboxSpawner, Services,
-    entry::FileIdentityRec,
+    TickSource, entry::FileIdentityRec,
 };
 use tessera_capability_core::{AgentId, EndpointId, ObjectId};
 use tessera_journal::testing::MemStorage;
@@ -52,6 +52,25 @@ impl Executor for Counting {
     fn execute(&self, job: &DispatchJob) -> ExecResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.execute(job)
+    }
+
+    fn execute_with_file_intent(
+        &self,
+        job: &DispatchJob,
+        record: &mut dyn FnMut(tessera_broker::entry::FileReplaceIntent) -> bool,
+    ) -> ExecResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.execute_with_file_intent(job, record)
+    }
+
+    fn restore_file_replacement(
+        &self,
+        slot: &tessera_broker::entry::FileSlotRec,
+        reservation: tessera_capability_core::ReservationId,
+        intent: tessera_broker::entry::FileReplaceIntent,
+    ) -> Result<FileIdentityRec, String> {
+        self.inner
+            .restore_file_replacement(slot, reservation, intent)
     }
 }
 
@@ -108,6 +127,27 @@ impl Harness {
         spawner: Option<Box<dyn SandboxSpawner>>,
         audit: AuditLog,
     ) -> Broker {
+        self.start_with_services(
+            storage,
+            fault,
+            spawner,
+            audit,
+            Arc::new(MonotonicClock::default()),
+        )
+    }
+
+    pub fn start_with_clock(&self, clock: Arc<dyn TickSource>) -> Broker {
+        self.start_with_services(self.storage.clone(), None, None, AuditLog::memory(), clock)
+    }
+
+    fn start_with_services(
+        &self,
+        storage: MemStorage,
+        fault: Option<FaultHook>,
+        spawner: Option<Box<dyn SandboxSpawner>>,
+        audit: AuditLog,
+        clock: Arc<dyn TickSource>,
+    ) -> Broker {
         let journal = Journal::open_storage(storage, JournalOptions::default()).unwrap();
         let exec = Counting {
             inner: AdapterExecutor::new(Some(self.root.path())).unwrap(),
@@ -120,7 +160,7 @@ impl Harness {
                 executor: Arc::new(exec),
                 spawner,
                 audit,
-                clock: Arc::new(MonotonicClock::default()),
+                clock,
                 fault,
             },
         )

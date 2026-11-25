@@ -15,7 +15,8 @@ use std::time::Duration;
 use common::*;
 use tessera_broker::entry::Entry;
 use tessera_broker::{
-    AdminRequest, AdminResponse, AgentSpawnProfile, AuditLog, BaselineGrant, Broker, SandboxSpawner,
+    AdminRequest, AdminResponse, AgentSpawnProfile, AuditLog, BaselineGrant, Broker, ManualClock,
+    SandboxSpawner,
 };
 use tessera_capability_core::{AdminCommand, AgentCommand, AgentId, AuthenticatedCommand};
 use tessera_journal::{Journal, JournalOptions, RecordKind};
@@ -329,6 +330,103 @@ fn timed_out_grant_request_id_is_answered_consistently() {
     assert_eq!(code(&r), Some(ErrorCode::ApprovalTimeout));
     assert!(pending_list(&b).is_empty());
     // A fresh id is a fresh request.
+    a.send(grant_req(2, obj, 1, None));
+    wait_pending(&b);
+}
+
+#[test]
+fn queued_grant_timeout_replies_to_every_waiter_and_releases_slots() {
+    let mut h = Harness::new();
+    h.config.approval_timeout_ms = 100;
+    h.config.max_in_flight_per_agent = 2;
+    let clock = ManualClock::new();
+    let b = h.start_with_clock(Arc::new(clock.clone()));
+    h.enroll(&b);
+    let obj = register_file(&b, "notes.txt");
+    let mut a = Agent::attach(&b);
+    let mut queued = Agent::attach(&b);
+    a.send(grant_req(1, obj, 1, None));
+    wait_pending(&b);
+    let request = grant_req(1, obj, 1, None);
+    let correlations = [queued.send(request.clone()), queued.send(request.clone())];
+    for corr in correlations {
+        let m = queued.recv_any().unwrap();
+        assert_eq!(m.correlation_id, corr);
+        assert!(matches!(m.response, Response::GrantPending { .. }));
+    }
+    assert_eq!(pending_list(&b).iter().filter(|p| !p.active).count(), 1);
+    clock.advance(100);
+    for corr in correlations {
+        let m = queued.recv().unwrap();
+        assert_eq!(m.correlation_id, corr);
+        assert_eq!(code(&m.response), Some(ErrorCode::ApprovalTimeout));
+    }
+    assert_eq!(
+        code(&queued.call(request)),
+        Some(ErrorCode::ApprovalTimeout)
+    );
+    queued.send(grant_req(2, obj, 1, None));
+    assert!(matches!(
+        queued.recv_any().unwrap().response,
+        Response::GrantPending { .. }
+    ));
+}
+
+#[test]
+fn approval_queue_rotates_and_rate_limits_are_per_principal() {
+    let mut h = Harness::new();
+    h.config.approval_max_per_window = 1;
+    let clock = ManualClock::new();
+    let b = h.start_with_clock(Arc::new(clock.clone()));
+    h.enroll(&b);
+    let obj = register_file(&b, "notes.txt");
+    let mut a = Agent::attach(&b);
+    let mut other = Agent::attach(&b);
+    for id in [1, 2] {
+        a.send(grant_req(id, obj, 1, None));
+        assert!(matches!(
+            a.recv_any().unwrap().response,
+            Response::GrantPending { .. }
+        ));
+    }
+    assert_eq!(
+        code(&a.call(grant_req(3, obj, 1, None))),
+        Some(ErrorCode::RateLimited)
+    );
+    other.send(grant_req(1, obj, 1, None));
+    assert!(matches!(
+        other.recv_any().unwrap().response,
+        Response::GrantPending { .. }
+    ));
+
+    clock.advance(1_000);
+    let active = &pending_list(&b)[0];
+    assert_eq!(active.agent, a.id);
+    assert!(active.rendered.contains("in ~4m 59s"));
+    assert_eq!(
+        b.admin(AdminRequest::Deny {
+            ticket: active.ticket
+        }),
+        AdminResponse::Ok
+    );
+    assert_eq!(
+        code(&a.recv().unwrap().response),
+        Some(ErrorCode::ApprovalDenied)
+    );
+    assert_eq!(pending_list(&b)[0].agent, other.id);
+
+    // Cancelling another principal's active approval resets the authenticator
+    // session but does not refund the first principal's prompt allowance.
+    assert_eq!(
+        b.admin(AdminRequest::TerminatePrincipal { agent: other.id }),
+        AdminResponse::Ok
+    );
+    assert_eq!(
+        code(&a.recv().unwrap().response),
+        Some(ErrorCode::RateLimited)
+    );
+    assert!(pending_list(&b).is_empty());
+    clock.advance(h.config.approval_rate_window_ms);
     a.send(grant_req(2, obj, 1, None));
     wait_pending(&b);
 }

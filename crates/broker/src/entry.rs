@@ -94,6 +94,17 @@ pub struct FileIdentityRec {
     pub fs_type: i64,
 }
 
+/// Identities of a prepared replacement, recorded before the exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileReplaceIntent {
+    /// Logical slot.
+    pub object: ObjectId,
+    /// Slot identity before the exchange.
+    pub before: FileIdentityRec,
+    /// Identity of the synced replacement file.
+    pub after: FileIdentityRec,
+}
+
 /// Administrator-registered file slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSlotRec {
@@ -189,6 +200,22 @@ pub enum Entry {
     Enrolled {
         /// `Enrollment::encode` bytes.
         enrollment: Vec<u8>,
+    },
+    /// The worker prepared a replacement and is waiting to exchange it.
+    FileReplacePrepared {
+        /// Dispatched reservation.
+        reservation: ReservationId,
+        /// The only two identities recovery may accept for the slot.
+        intent: FileReplaceIntent,
+    },
+    /// Recovery verified which identity occupies a prepared slot.
+    FileIdentityRecovered {
+        /// Reservation whose intent was reconciled.
+        reservation: ReservationId,
+        /// Logical slot.
+        object: ObjectId,
+        /// Verified current identity.
+        identity: FileIdentityRec,
     },
 }
 

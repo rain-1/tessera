@@ -112,7 +112,7 @@ operator runs `tessera-admin` as the broker user.**
 
 ```sh
 sudo useradd --system --create-home --home-dir /var/lib/tessera tessera
-sudo install -d -o tessera -g tessera -m 0700 /var/lib/tessera /run/tessera /srv/tessera/files
+sudo install -d -o tessera -g tessera -m 0700 /var/lib/tessera /run/tessera /srv/tessera/files /srv/tessera/workspaces/agent
 ```
 
 Files the broker serves must be owned by the broker user and sit directly
@@ -121,7 +121,7 @@ in `file_root`. Slot names are single names, not paths.
 ## 4. Configuration (`tesserad --config FILE`)
 
 The configuration is a JSON file (`crates/broker/src/config.rs`). Unknown
-keys are **silently ignored**, so check spelling.
+keys are errors.
 
 ```json
 {
@@ -174,15 +174,34 @@ keys are **silently ignored**, so check spelling.
 | `file_root` | trusted directory for file slots. Omit it to disable the file adapter |
 | `require_user_verification` | require FIDO2 UV (PIN/biometric) on every mint, not only UP |
 | `endpoints[]` | HTTPS endpoints with broker-held secrets. `secret_header.value_file` is read at startup (trailing CR/LF stripped). Secrets are never journaled or audited. `ca_pem_file` adds private CAs; otherwise webpki roots are used. Optional `spec` keys: `allow_private` (permit loopback/private addresses), `pinned_addrs` (skip DNS) |
-| `profiles` | trusted launch profiles. Agents cannot choose programs; the operator picks a profile with `create-principal`. `workspace` is bound read-write at `/workspace` and `ro_binds` are `[host, sandbox]` pairs |
+| `profiles` | trusted launch profiles. The operator picks a profile with `create-principal`. `workspace` is the parent directory for private workspaces, and `ro_binds` are `[host, sandbox]` pairs |
 | `launcher.landlock` | `required` (default), `best_effort` or `disabled` |
 | `launcher.cgroup_opt_out_reason` | non-null = run without cgroup confinement (see §1) |
 
-Bind **directories** in `ro_binds`, not single files. A rule on a regular
-file cannot carry Landlock's directory rights, so the ruleset is reported
-as "partial". Under `landlock: "required"` the init shim then refuses the
-launch with `Landlock required but ruleset is partial`. Put the agent's
-files in a directory and bind that.
+Create each configured workspace parent before starting the daemon. It must
+be broker-owned and prohibit group and world writes. Tessera creates a fresh
+`<workspace>/e<epoch>.s<serial>` directory for each principal and mounts it
+read-write at `/workspace`. It retains these directories after termination.
+Place shared startup files in a separate read-only bind. Bind sources must
+be outside workspace trees. Sandbox mounts cannot overlap `state_dir`,
+`file_root` or `admin_socket`.
+
+Omitting `memory_max_bytes` or `pids_max`, or setting either to `null`, uses
+the launcher default of 2 GiB or 512 processes, respectively.
+
+The optional `limits.ledger_quotas` object sets how many records agent
+commands can allocate in an epoch. Each key is optional.
+
+| Key | Default | Records charged |
+|---|---:|---|
+| `derived_per_principal` | 256 | Children created by one issuer through split or delegation |
+| `derived_per_root` | 1,024 | Children created anywhere beneath one root grant |
+| `reservations_per_principal` | 4,096 | New operation reservations created by one caller |
+| `reservations_per_root` | 16,384 | New reservations against grants beneath one root, including the root itself |
+
+Setting a quota to zero disables that allocation. Exhaustion returns
+`LimitExceeded`. The global core limits continue to count historical
+records retained across restarts.
 
 If `profiles` is empty, no launcher is started, and only in-process
 principals (tests and embeddings) can exist. If `profiles` is not empty,

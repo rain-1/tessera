@@ -147,6 +147,9 @@ A restart (crash, `kill`, `systemctl restart`, or emergency stop) is
     happened (R-8). Check it out of band.
   `tessera-admin reservations --uncertain` lists them. `status` counts
   them in `uncertain_reservations`.
+* File slots with an interrupted replacement are restored only if the
+  occupant matches a journaled identity and passes the adapter's checks.
+  Restoring a slot does not change the old reservation's uncertain status.
 * Request-id bindings from earlier epochs are dropped. Agents in a new
   epoch are new principals.
 

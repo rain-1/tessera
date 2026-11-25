@@ -102,3 +102,35 @@ connect.
   (§12.3). `compromised_harness_stays_contained` exercises this.
 - The proxy is a new trusted component and needs independent review
   (ADR-0021).
+
+## Related launcher hardening (security review 2026-11-25)
+These changes landed with this work package because they touch the same
+launcher code.
+
+- **Protected host paths (finding #6).** `LauncherConfig::protected_host_paths`
+  (from main) refuses a workspace or bind that is, contains or lies inside
+  a protected path. The launcher now applies the same check to the
+  `ModelRoute` socket and netshim, so a profile cannot pass the broker
+  admin socket off as a model socket. The broker's `prepare_profiles`
+  checks `model_route` at startup.
+- **What `tesserad` protects.** `tesserad` now protects:
+  - `state_dir` and `file_root`;
+  - the admin socket **and its directory**;
+  - every endpoint `secret_header.value_file` and `ca_pem_file`;
+  - the operator list `launcher.protected_paths`, for example the model
+    proxy's credential file and audit log.
+
+  A missing path, or a profile that overlaps one, stops `tesserad` at
+  startup (`launcher refused to start`). Tests:
+  `crates/launcher/tests/protected.rs`, broker `spawner` tests.
+- **Seccomp.**
+  - `modify_ldt` (x86_64), `open_tree_attr` (467), `file_getattr` (468),
+    `file_setattr` (469) and `listns` (470) are denied with `EPERM`.
+  - A fourth filter returns `ENOSYS` for every native syscall number above
+    `MAX_KNOWN_SYSCALL = 470`. Syscalls added by future kernels are
+    therefore denied until reviewed, and libc sees "not implemented" and
+    falls back.
+
+  Tests: `seccomp::tests::future_syscalls_get_enosys`, and the
+  `syscalls.py` adversarial probe, which covers the new numbers plus 471
+  and 1000.

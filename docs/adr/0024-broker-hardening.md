@@ -25,7 +25,9 @@ negotiation. The codec is unchanged: strict, canonical, bounded.
   id. Not part of the signed `GrantRequest`. Rendered by
   `tessera_approval::render_request` in a block labelled UNTRUSTED with
   control/bidi/invisible characters escaped and truncated; `tessera-admin
-  approve` shows it the same way. Audited as length and SHA-256 only.
+  approve` uses the broker's rendering after matching its canonical request
+  to the authenticator challenge. Relative durations use the broker clock.
+  Every description line carries a prefix. Audited as length and SHA-256 only.
 - `Request::ListCapabilities { after: Option<CapId> }` → `Response::
   Capabilities { caps: BoundedVec<WireCapabilityView, 64>, more }`: the
   caller's own capabilities (any status), ascending id. Read-only, no request
@@ -80,6 +82,31 @@ outcome is journaled). Over either: `RateLimited` under the request's
 correlation id, not forwarded, not bound. One principal cannot fill the
 shared writer inbox.
 
+The broker permits two distinct pending approvals per principal by default,
+counting the active one. The shared waiting queue is bounded at 16. Prompts
+rotate among queued principals and preserve request order within each
+principal. Each principal may start 30 prompts in a 60-second window by
+default. The broker owns that history so replacing the authenticator session
+preserves the allowance of existing principals. When a queued request
+expires, the broker sends a final `ApprovalTimeout` to every attached
+correlation and records the denial against the request ID.
+
+The broker also limits ledger records created by agent commands. It charges
+each split or delegation to the issuer and the originating root, and each
+new reservation to the caller and the originating root. The default limits
+are 256 derived records and 4,096 reservations per principal, and 1,024
+derived records and 16,384 reservations per root. A limit returns
+`LimitExceeded` before journaling or changing authority. Drops,
+revocation, transfers and failed dispatches leave existing charges in place.
+Duplicate requests reuse their earlier result. These counters apply within
+the current epoch, and the broker replays old journal records independently
+of the current quota settings. Global ledger capacity still includes
+historical records across restarts.
+
+Agent-facing capability errors use the same code and detail for missing
+capabilities and ones the caller cannot access. Agent revoke checks ancestor
+authorization before reporting an already-revoked target.
+
 ### Audit log
 JSON lines, each with `prev` = hex SHA-256 of the previous line's bytes
 (genesis: 64 zeros). `AuditSync`: `every-event` (default), `every:N`,
@@ -104,6 +131,12 @@ and waits for it to exit, so `stop()` returns only after every process of the
 sandbox is gone (previously `--die-with-parent` made this asynchronous).
 
 ### Launcher details
+- The broker creates a fresh directory for each principal beneath the
+  configured workspace root. Read-only profile binds cannot overlap any
+  configured workspace root. The daemon also excludes its state directory,
+  protected file root and administrative socket from sandbox mounts, using
+  resolved host paths. Omitted per-profile memory and PID limits use the
+  launcher defaults.
 - Linux AIO (`io_setup`, `io_destroy`, `io_submit`, `io_cancel`,
   `io_getevents`, `io_pgetevents`) is denied by seccomp, like io_uring.
 - Landlock rules for single-file read-only binds use file-level rights only;

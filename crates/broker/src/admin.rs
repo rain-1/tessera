@@ -405,13 +405,28 @@ fn check_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn socket_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Prepare the private socket directory and resolve the socket's host path.
+pub fn prepare_socket_path(path: &Path) -> io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "admin socket requires a file name",
+        )
+    })?;
+    let dir = socket_dir(path);
+    check_dir(dir)?;
+    Ok(dir.canonicalize()?.join(name))
+}
+
 /// Bind the admin socket and serve it on background threads.
 pub(crate) fn serve(path: &Path, submit: AdminSubmit) -> io::Result<PathBuf> {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    check_dir(dir)?;
+    check_dir(socket_dir(path))?;
     if let Ok(md) = std::fs::symlink_metadata(path) {
         use std::os::unix::fs::FileTypeExt;
         if md.file_type().is_socket() {

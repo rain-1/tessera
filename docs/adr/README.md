@@ -16,7 +16,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0002](0002-persistence-wal.md) | Append-only hash-chained WAL + fsync | §11, open Q persistence | Accepted (design) |
 | [0003](0003-restart-epoch-fail-closed.md) | Restart: epoch bump, fail closed | §16 Restart, §11 | Accepted (design), model-checked |
 | [0004](0004-peer-authentication.md) | Socketpair per sandbox + SO_PEERCRED | open Q peer auth | Accepted (design) |
-| [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design); amended by 0024 (AIO denied, synchronous stop, startup sweep) |
+| [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design); amended by 0024 (AIO denied, synchronous stop, startup sweep) and 0030 (newer syscalls denied, ENOSYS above the reviewed table, model route) |
 | [0006](0006-fido2-verification.md) | RustCrypto verification, libfido2 transport | §8, changes WP4 wording | Accepted (design) |
 | [0007](0007-https-client.md) | HTTPS client: no redirects/retries, own DNS | §9.4 | Accepted (design) |
 | [0008](0008-verification-strategy.md) | Verus target; tests/proptest/model meanwhile | §16 Verification | Accepted; amended 2026-11-25: Verus pinned, mirrored core verified (`proofs/`) |

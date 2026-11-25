@@ -42,8 +42,9 @@
 //! Replacement changes the inode bound to the slot. The slot (root directory +
 //! name) is the stable object; after a successful replacement the registry's
 //! identity for the slot is updated to the new inode, and the new identity is
-//! reported in the [`FileEffect`] so the broker can journal it (and later
-//! re-register with [`FileAdapter::register_with_identity`] after restart).
+//! reported in the [`FileEffect`]. The broker records both identities before
+//! the exchange through [`FileAdapter::dispatch_with_replace_intent`]. It can
+//! use [`FileAdapter::recover_replacement`] if the outcome is unavailable.
 //! Descriptors to the previous inode held by other processes keep observing
 //! the previous content; the previous inode is unlinked.
 //!
@@ -369,6 +370,8 @@ pub enum FileError {
     },
     /// The file changed while being read; no snapshot is returned.
     ConcurrentModification,
+    /// The caller refused to authorize the prepared replacement.
+    ReplacementNotRecorded,
     /// Integrity violation (also recorded via [`FileAdapter::reports`]).
     Integrity(IntegrityViolation),
     /// Unexpected system call failure.
@@ -716,6 +719,40 @@ impl FileAdapter {
         self.register_inner(object, name, policy, Some(expected))
     }
 
+    /// Restore a slot with an interrupted replacement. If the new inode is
+    /// in the slot and the displaced name still exists, it must hold the
+    /// expected old inode. Foreign objects are left in place for the operator.
+    pub fn recover_replacement(
+        &self,
+        object: ObjectId,
+        name: &str,
+        policy: SlotPolicy,
+        reservation: ReservationId,
+        before: FileIdentity,
+        after: FileIdentity,
+    ) -> Result<FileIdentity, SetupError> {
+        match self.register_with_identity(object, name, policy, before) {
+            Err(SetupError::Integrity(IntegrityViolation::IdentityMismatch {
+                observed, ..
+            })) if observed == after => {}
+            result => return result,
+        }
+        let tmp_name = format!("{TEMP_PREFIX}{:032x}", reservation.0);
+        match statat(&self.root, tmp_name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {
+                open_verified(&self.root, &tmp_name, self.owner, Some(&before))?;
+            }
+            Err(Errno::NOENT) => {} // The exchange verified and removed the displaced entry.
+            Err(errno) => {
+                return Err(SetupError::Io {
+                    stage: "stat-displaced",
+                    errno,
+                });
+            }
+        }
+        self.register_with_identity(object, name, policy, after)
+    }
+
     fn register_inner(
         &self,
         object: ObjectId,
@@ -788,6 +825,17 @@ impl FileAdapter {
 
     /// Execute at most one dispatch for `reservation`. See crate docs.
     pub fn dispatch(&self, reservation: &Reservation) -> Result<FileOutcome, FileError> {
+        self.dispatch_with_replace_intent(reservation, |_, _| true)
+    }
+
+    /// As `dispatch`, but calls `record` with the old and new identities after
+    /// syncing the prepared file and before exchanging it. The slot stays
+    /// locked across the callback. A false result leaves the slot intact.
+    pub fn dispatch_with_replace_intent(
+        &self,
+        reservation: &Reservation,
+        record: impl FnOnce(FileIdentity, FileIdentity) -> bool,
+    ) -> Result<FileOutcome, FileError> {
         // Claim first: any outcome, including denial, consumes the id.
         if !lock(&self.dispatched).insert(reservation.id) {
             return Err(FileError::AlreadyDispatched(reservation.id));
@@ -802,7 +850,7 @@ impl FileAdapter {
                     self.read_snapshot(reservation, &slot, &identity, *max_bytes)
                 }
                 FileOperation::ReplaceContent { bytes } => {
-                    self.replace(reservation, &slot, &mut identity, bytes)
+                    self.replace(reservation, &slot, &mut identity, bytes, record)
                 }
             }
         });
@@ -884,6 +932,7 @@ impl FileAdapter {
         slot: &Slot,
         identity: &mut FileIdentity,
         bytes: &[u8],
+        record: impl FnOnce(FileIdentity, FileIdentity) -> bool,
     ) -> Result<FileOutcome, FileError> {
         let limit = slot.policy.max_write_bytes;
         let len = bytes.len() as u64;
@@ -930,7 +979,10 @@ impl FileAdapter {
         let tfs = fstatfs(&file).map_err(|e| cleanup("fstatfs-temp", e))?;
         #[allow(clippy::unnecessary_cast)]
         let new_identity = identity_of(&tst, tfs.f_type as i64);
-        drop(file);
+        if !record(expected, new_identity) {
+            let _ = unlinkat(&self.root, tmp_name.as_str(), AtFlags::empty());
+            return Err(FileError::ReplacementNotRecorded);
+        }
 
         // Atomic exchange: the slot now holds the new file; tmp_name holds the
         // displaced object, which we verify is the registered one.
