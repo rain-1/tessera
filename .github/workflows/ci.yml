@@ -147,7 +147,7 @@ jobs:
       - name: cargo-audit
         run: |
           cargo install cargo-audit --locked
-          cargo audit --ignore RUSTSEC-2026-0387 # same justification as deny.toml
+          cargo audit
       - name: SBOM is up to date with Cargo.lock
         run: |
           cargo install cargo-cyclonedx --locked

@@ -3,7 +3,7 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-11-25T10:46:44.000000000Z",
+    "timestamp": "2026-11-25T11:14:44.000000000Z",
     "tools": [
       {
         "vendor": "CycloneDX",
@@ -190,37 +190,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/cfg-if"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#const-oid@0.9.6",
-      "author": "RustCrypto Developers",
-      "name": "const-oid",
-      "version": "0.9.6",
-      "description": "Const-friendly implementation of the ISO/IEC Object Identifier (OID) standard as defined in ITU X.660, with support for BER/DER encoding/decoding as well as heapless no_std (i.e. embedded) support ",
-      "scope": "required",
-      "hashes": [
-        {
-          "alg": "SHA-256",
-          "content": "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
-        }
-      ],
-      "licenses": [
-        {
-          "expression": "Apache-2.0 OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/const-oid@0.9.6",
-      "externalReferences": [
-        {
-          "type": "documentation",
-          "url": "https://docs.rs/const-oid"
-        },
-        {
-          "type": "vcs",
-          "url": "https://github.com/RustCrypto/formats/tree/master/const-oid"
         }
       ]
     },
@@ -1745,9 +1714,6 @@
       "ref": "registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.5"
     },
     {
-      "ref": "registry+https://github.com/rust-lang/crates.io-index#const-oid@0.9.6"
-    },
-    {
       "ref": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.2.17"
     },
     {
@@ -1761,9 +1727,7 @@
       "ref": "registry+https://github.com/rust-lang/crates.io-index#digest@0.10.7",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.10.4",
-        "registry+https://github.com/rust-lang/crates.io-index#const-oid@0.9.6",
-        "registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.1.6",
-        "registry+https://github.com/rust-lang/crates.io-index#subtle@2.6.1"
+        "registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.1.6"
       ]
     },
     {
@@ -1782,8 +1746,7 @@
       "ref": "registry+https://github.com/rust-lang/crates.io-index#generic-array@0.14.9",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#typenum@1.20.1",
-        "registry+https://github.com/rust-lang/crates.io-index#version_check@0.9.5",
-        "registry+https://github.com/rust-lang/crates.io-index#zeroize@1.9.2"
+        "registry+https://github.com/rust-lang/crates.io-index#version_check@0.9.5"
       ]
     },
     {

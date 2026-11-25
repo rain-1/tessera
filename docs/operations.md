@@ -209,9 +209,7 @@ From [threat-model.md §8](threat-model.md). These are **not** mitigated:
 Gaps specific to this implementation:
 
 * The **software authenticator** (`--key`) proves nothing about physical
-  presence, and its ES256 signing uses `crypto-bigint 0.5`, which has a
-  timing advisory (RUSTSEC-2026-0387; see `deny.toml`). Use it for
-  development only.
+  presence. Use it for development only.
 * The `fido2-cli` hardware path has not been tested with a real token.
 * The audit log is not tamper-evident (no hash chain, no fsync).
 * Unknown configuration keys are silently ignored.

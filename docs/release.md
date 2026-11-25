@@ -70,8 +70,9 @@ linker) has not been tested.
 | Duplicates (warn) | `sha2` 0.10 + 0.11 (journal uses 0.11, everything else 0.10), so `digest`, `block-buffer`, `crypto-common`, `const-oid`, `cpufeatures` are duplicated too, as is `syn` 2 + 3 |
 | Wildcards (warn) | workspace crates have path dependencies without `publish = false`. Set `publish = false` in each crate manifest, then make this `deny` |
 
-RUSTSEC-2026-0387 is ignored in `deny.toml` and in CI's `cargo audit` for
-the following reason. A production broker only **verifies** ES256
+**Resolved:** `p256` was upgraded to 0.14, which removes `crypto-bigint`
+0.5 from the tree; the ignore entries were deleted. Original rationale, kept
+for the record: A production broker only **verifies** ES256
 signatures, and those inputs are public. Secret-key arithmetic runs only in
 the development software authenticator (`crates/broker/src/softkey.rs`),
 which must not be used in production. **Action:** upgrade to the `p256` /

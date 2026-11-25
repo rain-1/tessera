@@ -136,8 +136,7 @@ Known limitations (more in [operations.md §8](docs/operations.md#8-known-residu
 and [threat-model.md §8](docs/threat-model.md)):
 
 * The software authenticator proves no physical presence and is for
-  development only. It also depends on `crypto-bigint 0.5`, which has an
-  open timing advisory (RUSTSEC-2026-0387).
+  development only.
 * Revocation is prospective. Effects reserved before a revoke can still
   happen, and data that was read cannot be un-read.
 * Remote effects are at-most-once, not exactly-once. An effect interrupted

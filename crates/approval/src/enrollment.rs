@@ -116,7 +116,7 @@ impl CosePublicKey {
     /// Raw key bytes as stored (ES256: x||y; EdDSA: 32-byte point).
     pub fn raw_bytes(&self) -> Vec<u8> {
         match self {
-            CosePublicKey::Es256(k) => k.to_encoded_point(false).as_bytes()[1..].to_vec(),
+            CosePublicKey::Es256(k) => k.to_sec1_point(false).as_bytes()[1..].to_vec(),
             CosePublicKey::EdDsa(k) => k.as_bytes().to_vec(),
         }
     }
@@ -141,7 +141,7 @@ impl CosePublicKey {
         let mut out = Vec::new();
         match self {
             CosePublicKey::Es256(k) => {
-                let pt = k.to_encoded_point(false);
+                let pt = k.to_sec1_point(false);
                 // {1: 2, 3: -7, -1: 1, -2: x, -3: y}
                 out.extend_from_slice(&[
                     0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20,
