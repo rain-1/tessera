@@ -105,12 +105,16 @@ impl Budget {
         Ok(permit)
     }
 
-    /// Charge `n` response bytes. Returns false (and charges nothing) if
-    /// that would exceed the lifetime response budget.
+    /// Charge `n` response bytes. Returns false if that would exceed the
+    /// lifetime response budget; the budget is then marked exhausted (the
+    /// caller aborts the stream) so later requests are refused.
     pub fn charge_response(&self, n: u64) -> bool {
         let mut s = self.lock();
         let next = s.response_bytes.saturating_add(n);
-        if self.cfg.max_response_bytes.is_some_and(|max| next > max) {
+        if let Some(max) = self.cfg.max_response_bytes
+            && next > max
+        {
+            s.response_bytes = max;
             return false;
         }
         s.response_bytes = next;

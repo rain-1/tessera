@@ -258,12 +258,22 @@ impl ModelProxy {
             Ok(resp) => resp,
             Err(Failure::Denied(d)) => {
                 let r = self.local_response(d.status(), "tessera_proxy_denied", &d.reason());
-                self.finish(&mut rec, start, d.status(), format!("denied:{}", d.reason()));
+                self.finish(
+                    &mut rec,
+                    start,
+                    d.status(),
+                    format!("denied:{}", d.reason()),
+                );
                 r
             }
             Err(Failure::Upstream(e)) => {
                 let r = self.local_response(e.status(), "api_error", &e.reason());
-                self.finish(&mut rec, start, e.status(), format!("upstream:{}", e.reason()));
+                self.finish(
+                    &mut rec,
+                    start,
+                    e.status(),
+                    format!("upstream:{}", e.reason()),
+                );
                 r
             }
         }
@@ -358,13 +368,14 @@ impl ModelProxy {
         let deadline = tokio::time::Instant::from_std(start) + inner.upstream.max_duration;
         let mut conn = inner.upstream.connect().await?;
         rec.upstream_peer = Some(conn.peer.to_string());
-        let header_deadline = deadline.min(tokio::time::Instant::now() + inner.upstream.header_timeout);
-        let resp = match tokio::time::timeout_at(header_deadline, conn.sender.send_request(up)).await
-        {
-            Err(_) => return Err(UpstreamError::Timeout.into()),
-            Ok(Err(_)) => return Err(UpstreamError::Protocol.into()),
-            Ok(Ok(r)) => r,
-        };
+        let header_deadline =
+            deadline.min(tokio::time::Instant::now() + inner.upstream.header_timeout);
+        let resp =
+            match tokio::time::timeout_at(header_deadline, conn.sender.send_request(up)).await {
+                Err(_) => return Err(UpstreamError::Timeout.into()),
+                Ok(Err(_)) => return Err(UpstreamError::Protocol.into()),
+                Ok(Ok(r)) => r,
+            };
         let status = resp.status();
         let declared = resp
             .headers()

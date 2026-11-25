@@ -308,7 +308,12 @@ mod tests {
         assert!(route_allows(&routes, &Method::GET, "/v1/models", false));
         assert!(route_allows(&routes, &Method::GET, "/v1/models/x", false));
         assert!(!route_allows(&routes, &Method::GET, "/v1/modelsx", false));
-        assert!(!route_allows(&routes, &Method::DELETE, "/v1/models/x", false));
+        assert!(!route_allows(
+            &routes,
+            &Method::DELETE,
+            "/v1/models/x",
+            false
+        ));
         let mut no_q = route("POST", "/v1/messages", false);
         no_q.allow_query = false;
         assert!(!route_allows(&[no_q], &Method::POST, "/v1/messages", true));
@@ -364,7 +369,8 @@ mod tests {
         assert!(out.contains_key("anthropic-version"));
         assert!(out.contains_key("content-type"));
 
-        let only = HeaderPolicy::new("x-api-key", &[], Some(&["content-type".into()]), &[]).unwrap();
+        let only =
+            HeaderPolicy::new("x-api-key", &[], Some(&["content-type".into()]), &[]).unwrap();
         let out = only.filter_request(&h);
         assert_eq!(out.len(), 1);
 

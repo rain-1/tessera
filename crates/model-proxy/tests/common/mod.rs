@@ -153,13 +153,15 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .await?;
             let ev1 = b"event: message_start\ndata: {\"n\":1}\n\n";
-            s.write_all(format!("{:x}\r\n", ev1.len()).as_bytes()).await?;
+            s.write_all(format!("{:x}\r\n", ev1.len()).as_bytes())
+                .await?;
             s.write_all(ev1).await?;
             s.write_all(b"\r\n").await?;
             s.flush().await?;
             gate.notified().await;
             let ev2 = b"event: message_stop\ndata: {\"n\":2}\n\n";
-            s.write_all(format!("{:x}\r\n", ev2.len()).as_bytes()).await?;
+            s.write_all(format!("{:x}\r\n", ev2.len()).as_bytes())
+                .await?;
             s.write_all(ev2).await?;
             s.write_all(b"\r\n0\r\n\r\n").await?;
         }
@@ -311,7 +313,10 @@ pub async fn raw(socket: &Path, req: &[u8]) -> String {
 }
 
 pub fn status_of(resp: &str) -> u16 {
-    resp.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    resp.split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 pub fn post(path: &str, extra_headers: &str, body: &str) -> Vec<u8> {
