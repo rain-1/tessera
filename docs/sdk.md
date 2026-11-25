@@ -38,11 +38,16 @@ let client = Client::from_env()?;            // claims TESSERA_BROKER_FD, once p
 The workspace denies `unsafe_code`. Turning the number in `TESSERA_BROKER_FD`
 into an `OwnedFd` needs `OwnedFd::from_raw_fd`, which is `unsafe`. That one call
 lives in `crates/sdk/src/env_fd.rs` under `#[allow(unsafe_code)]`, with a
-SAFETY comment. We checked the safe alternatives:
+SAFETY comment. It is the **only** `unsafe` in the repository
+(`crates/sdk/tests/unsafe_inventory.rs` enforces this) and is listed as
+trusted assumption A14 in `docs/proof-register.md`. We re-checked the safe
+alternatives during hardening; none works inside a sandbox:
 
 * `pidfd_getfd` is denied by the launcher's seccomp filter (ADR-0004).
 * `/proc/self/fd/N` cannot be opened for sockets.
 * "Safe" crates for inherited descriptors contain the same `unsafe` call.
+* Passing the channel on stdin (whose `BorrowedFd` std hands out safely)
+  would take stdio away from the workload.
 
 These checks keep the call sound:
 
@@ -56,7 +61,8 @@ These checks keep the call sound:
 
 | Method | Wire request | Returns |
 |---|---|---|
-| `request_grant(terms, untrusted_description)` | `RequestGrant` | `CapId` (after operator approval) |
+| `request_grant(terms, untrusted_description)` | `RequestGrant` (→ `GrantPending`, then final) | `CapId` (after operator approval) |
+| `request_grant_with_progress(id, terms, desc, on_pending)` | same | same; calls `on_pending(time left)` when queued |
 | `consume(cap, WireOperation)` | `Consume` | `Consumed::{Executed, Prior}` |
 | `read_file(cap, max_bytes)` | `Consume(FileReadSnapshot)` | `FileSnapshot` |
 | `replace_file(cap, bytes)` | `Consume(FileReplaceContent)` | bytes written |
@@ -66,8 +72,9 @@ These checks keep the call sound:
 | `transfer(cap, recipient)` | `Transfer` | `()` |
 | `drop(cap)` | `Drop` | `()` |
 | `inspect(cap)` | `Inspect` | `CapabilityView` |
-| `spawn(profile)` | `Spawn` | new `AgentId` |
-| `revoke(cap)` | `Revoke` (revokers only) | `()` |
+| `list_capabilities()` | `ListCapabilities` (paged, 64 per page) | every `CapabilityView` you own |
+| `spawn(profile)` | `Spawn` (operator-configured agent profiles, quotas) | new `AgentId` |
+| `revoke(cap)` | `Revoke` (a cap you own, or a descendant of one) | `()` |
 | `call_raw(Request, timeout)` | any | raw `Response` |
 
 Each mutating method has a `*_with_id(request_id, …)` twin. `Terms` bundles
@@ -84,10 +91,12 @@ Expiry is always *relative* (`WireExpiry::WithinMillis`). The broker's
 monotonic clock is the only time source, and it clamps the expiry to the
 parent's expiry.
 
-`untrusted_description` is free text for the operator. Protocol v1 has **no
-field for it, so it is not sent at present**. The operator sees only the
-broker's normalized rendering of the request (§8.1). The parameter is reserved
-so that callers need not change when a later protocol version carries it.
+`untrusted_description` (at most 512 bytes) is free text for the operator,
+carried since protocol v2. The approval UI prints it in a separate block
+labelled UNTRUSTED, with control, bidi and invisible characters escaped and
+long text truncated, below the broker's normalized rendering (§8.1). It is
+not part of what the operator's key signs, and the audit log records only its
+length and SHA-256.
 
 ### Errors
 
@@ -96,7 +105,8 @@ so that callers need not change when a later protocol version carries it.
 | Variant | Meaning |
 |---|---|
 | `Broker(BrokerError { code, detail, request_id })` | Typed denial; `code` is the protocol `ErrorCode` |
-| `Timeout { request_id }` | No answer before the deadline. **Outcome uncertain.** |
+| `Timeout { request_id }` | No answer before the deadline. **Outcome uncertain.** For `request_grant`: not even the `GrantPending` acknowledgement arrived (broker not answering). |
+| `ApprovalPending { request_id }` | `request_grant` was acknowledged (`GrantPending`) but the operator had not decided by `approval_timeout`. The broker is alive and the request is still queued; repeat with the same id to keep waiting. Outcome uncertain. |
 | `PriorReservation { … }` | A convenience consume method found an earlier reservation for this id. No new effect happened. |
 | `Closed`, `Io`, `Poisoned` | Channel failure. `Poisoned` happens only on stream transports, after a partial write or a bad frame header. |
 | `FrameTooLarge { outbound, len, max }` | Message too large. If `outbound`, nothing was sent. If inbound, a seqpacket channel stays usable. |
@@ -111,8 +121,21 @@ helpers to branch on. Denials are deliberately coarse. "Does not exist" and
 
 | Setting | Default |
 |---|---|
-| `ClientConfig::call_timeout` | 30 s |
-| `ClientConfig::approval_timeout` | 15 min, used for `request_grant`, which waits for a human |
+| `ClientConfig::call_timeout` | 30 s; also the limit for the first answer (`GrantPending`) to `request_grant` |
+| `ClientConfig::approval_timeout` | 15 min, total wait of `request_grant` for the human's decision |
+
+The broker answers `RequestGrant` first with `GrantPending { expires_in_millis }`
+(queued for the operator), then with the final `GrantIssued` or error on the
+same correlation id. So a short `call_timeout` detects a hung broker while
+`approval_timeout` bounds the wait for a human. Repeating a pending
+`RequestGrant` with the same id is a status query: another `GrantPending`,
+the same approval, one prompt, one mint.
+
+The broker also limits each principal: a token bucket (default 100 requests/s,
+burst 200) and at most 64 requests in flight (a pending grant request counts
+until it is decided). Over either limit the answer is `RateLimited`; nothing
+was done and nothing was bound to the id, so retrying with the same id later
+is safe.
 
 Calls on one `Client` are serialized. One request is in flight at a time, so
 an approval wait blocks other calls on the same client.
@@ -160,7 +183,7 @@ The CLI prints the request id for every mutating command and accepts
 ## 4. The `tessera` CLI
 
 ```text
-tessera [--json] [--timeout DUR] [--approval-timeout DUR] <command> …
+tessera [--json] [--timeout DUR] [--approval-timeout DUR] [--socket PATH] <command> …
   request   SCOPE TERMS [--description TEXT]
   read      --cap CAP [--max-bytes N] [--out FILE]
   replace   --cap CAP (--from FILE | --stdin)
@@ -169,12 +192,16 @@ tessera [--json] [--timeout DUR] [--approval-timeout DUR] <command> …
   attenuate --cap CAP SCOPE TERMS
   transfer  --cap CAP --to AGENT
   drop | inspect | revoke  --cap CAP
+  list      (every capability you own, e.g. ones delegated to you)
   spawn     --profile N
 SCOPE: --file OBJ [--rights read,replace] | --https EP [--methods get,post] [--max-body N]
 TERMS: --budget N|unlimited [--depth N|unlimited] [--expiry inherit|90s|5m|2h|1500ms]
 ```
 
-* `request` prints `waiting for operator approval…` to stderr, then blocks.
+* `request` prints the request id, then `queued: waiting for operator
+  approval … expires in Ns` when the broker acknowledges, then blocks.
+* `--socket PATH` connects to a stream socket instead of `TESSERA_BROKER_FD`
+  (tests and tools).
 * `read` and `http` write the raw body to stdout, or to `--out`. With `--json`
   the body is included as `body_utf8`, or as `body_hex` when it is not valid
   UTF-8.
@@ -253,48 +280,31 @@ and whatever starts the workers passes the id as `--cap`.
 
 ## 7. Protocol gaps found while writing the SDK
 
-The broker and the protocol must handle these. The SDK documents its
-assumptions.
+Status after protocol v2 and broker hardening (ADR-0024). Items 1–5 are
+resolved; 6 and 7 were resolved by ADR-0022.
 
-1. **No description field in `RequestGrant`.** The spec (§8.1) allows an
-   explicitly untrusted agent description, but the protocol v1 `RequestGrant`
-   has no field for it. The SDK accepts it and drops it.
-2. **Idempotent replay for non-consume requests is not specified on the
-   wire.** `PriorReservation` covers `Consume` only. On a repeated id the SDK
-   expects the broker to return the *original* success response:
-   * the same `child_cap_id` for `Delegate`;
-   * the same `cap_id` for `RequestGrant`;
-   * the same `agent` for `Spawn`;
-   * `Dropped`/`Revoked`/`Transferred`/`Attenuated` again.
-
-   The broker must never mint a second child, launch a second sandbox or open
-   a second approval prompt. A repeated `RequestGrant` id that is still
-   *pending* approval should attach to the same pending request.
-3. **No "pending" response.** A grant awaiting approval can only be waited
-   for. Nothing distinguishes "queued for the operator" from "broker hung".
-   A `Pending { request_id }` response, or a status query by request id,
-   would let clients use short timeouts.
-4. **Recipients cannot discover received capabilities.** After `Delegate` or
-   `Transfer`, only the sender learns the cap id. There is no `ListOwned` or
-   received-capability notification. `Spawn` cannot pass parameters (such as
-   a handoff cap id) to the child. Today, cap ids must be handed over out of
-   band.
-5. **No self-identity query.** An agent learns its own `AgentId` only from the
-   `owner` field of an `Inspect`. This is harmless, since an id is not a
-   credential, but a parent must learn each child's id from `Spawn` before it
-   can delegate to the child.
-6. **Datagram size versus socket buffers.** On `SOCK_SEQPACKET`, a message must
-   fit the socket send buffer. The default `wmem` is about 208 KiB, while
-   `MAX_CONTENT_BYTES` is 8 MiB and `HARD_MAX_FRAME` is 16 MiB.
-   * The SDK raises `SO_SNDBUF` as far as it is allowed, and reports
-     `EMSGSIZE` as `InvalidArgument` (nothing sent).
-   * The broker should set `SO_SNDBUF`/`SO_RCVBUF` on both ends of each pair
-     when it creates them (it can use `SO_SNDBUFFORCE`), or the protocol
-     should lower the content limit. Otherwise large `read_file` results
-     cannot be delivered.
-   * The broker should also publish its per-connection `FrameLimits`.
-7. **Correlation ids.** The SDK keeps one request in flight per channel and
-   expects the broker to echo `correlation_id` exactly. It also expects the
-   echoed `request_id` to match. The broker should answer a request it could
-   not decode with `Error { request_id: None }` under the received correlation
-   id if it can parse it, or else close the channel.
+1. **Description field.** *Resolved:* `RequestGrant.untrusted_description`
+   (≤ 512 bytes), shown escaped under an UNTRUSTED label, not signed, audited
+   by length and digest only.
+2. **Idempotent replay for non-consume requests.** *Resolved:* a repeated id
+   returns the original success (`GrantIssued` with the same cap, `Delegated`
+   with the same child, `Spawned` with the same agent, `Dropped`, `Revoked`,
+   `Transferred`, `Attenuated`). A repeat while a grant is pending attaches to
+   it; a repeat while a spawn is launching attaches to the launch. Final
+   denials of grant requests (denied, timed out, invalid) and failed spawns
+   are remembered for the epoch, so a repeat gets the same denial and never a
+   second prompt or launch. Transient refusals (`RateLimited`, `Unavailable`)
+   are not remembered.
+3. **"Pending" response.** *Resolved:* interim `GrantPending { request_id,
+   expires_in_millis }`; see Timeouts.
+4. **Recipients cannot discover received capabilities.** *Resolved:*
+   `ListCapabilities { after }` lists the caller's own capabilities (64 per
+   page, ascending id; `list_capabilities()` pages through them). `Spawn`
+   still passes no parameters to the child; the child lists what it was
+   delegated.
+5. **No self-identity query.** *Unchanged by design:* an id is not a
+   credential; the owner field of `Inspect`/`ListCapabilities` shows it, and
+   a parent learns each child's id from `Spawn`.
+6. **Datagram size versus socket buffers.** Resolved by ADR-0022 (1 MiB
+   buffers, 96 KiB inline content).
+7. **Correlation ids.** Resolved by ADR-0022.

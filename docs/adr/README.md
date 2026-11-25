@@ -16,7 +16,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0002](0002-persistence-wal.md) | Append-only hash-chained WAL + fsync | §11, open Q persistence | Accepted (design) |
 | [0003](0003-restart-epoch-fail-closed.md) | Restart: epoch bump, fail closed | §16 Restart, §11 | Accepted (design), model-checked |
 | [0004](0004-peer-authentication.md) | Socketpair per sandbox + SO_PEERCRED | open Q peer auth | Accepted (design) |
-| [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design) |
+| [0005](0005-launcher.md) | bwrap + seccomp + optional Landlock + cgroup v2 | open Q launcher | Accepted (design); amended by 0024 (AIO denied, synchronous stop, startup sweep) |
 | [0006](0006-fido2-verification.md) | RustCrypto verification, libfido2 transport | §8, changes WP4 wording | Accepted (design) |
 | [0007](0007-https-client.md) | HTTPS client: no redirects/retries, own DNS | §9.4 | Accepted (design) |
 | [0008](0008-verification-strategy.md) | Verus target; tests/proptest/model meanwhile | §16 Verification | Accepted; amended 2026-11-25: Verus pinned, mirrored core verified (`proofs/`) |
@@ -33,8 +33,9 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0019](0019-file-object-identity.md) | Logical file slots | open Q file slot identity | Proposed |
 | [0020](0020-model-api-credentials.md) | Model API proxy and credentials | open Q model API | Proposed |
 | [0021](0021-independent-review.md) | Independent review | open Q review resources | Open |
-| [0022](0022-broker.md) | Broker: single writer, journal entries, dispatch marker, request-id binding, channel identity, admin endpoint | §5.2, §9, §11, WP3 | Accepted, implemented (tested) |
+| [0022](0022-broker.md) | Broker: single writer, journal entries, dispatch marker, request-id binding, channel identity, admin endpoint | §5.2, §9, §11, WP3 | Accepted, implemented (tested); gaps closed by 0024 |
 | [0023](0023-bpf-lsm-direct-grants.md) | BPF LSM direct grants: not in MVP; read-only subtree class, libbpf-rs, lease-gated generation protocol | §10.2, §10.3, WP7 | Accepted (no direct grants in MVP); P6 design Proposed, modelled, not kernel-tested |
+| [0024](0024-broker-hardening.md) | Broker hardening: protocol v2 (description, `GrantPending`, `ListCapabilities`), agent spawn in orchestration domains, denial bindings, admission control, hash-chained audit, startup cgroup sweep | §8.1, §9.1, §9.2, §11 | Accepted, implemented (tested) |
 
 ## Specification inconsistencies and gaps found in WP0
 
