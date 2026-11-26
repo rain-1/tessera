@@ -61,13 +61,33 @@ impl Budget {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Admit one request carrying `body_len` bytes: checks concurrency, the
-    /// token bucket and the lifetime totals, and charges them atomically.
-    /// The returned permit must be held until the response is finished.
+    /// Admit one request carrying `body_len` bytes: [`Self::acquire`] then
+    /// [`Self::charge`]. The returned permit must be held until the response
+    /// is finished.
     pub fn admit(&self, body_len: u64) -> Result<OwnedSemaphorePermit, Denial> {
-        let permit = Arc::clone(&self.in_flight)
+        let permit = self.acquire()?;
+        self.charge(body_len)?;
+        Ok(permit)
+    }
+
+    /// Take one in-flight slot. The server does this **before** reading
+    /// the request body, so `max_concurrent` bounds buffered bodies
+    /// (review 2026-11-26, F-1). The permit is released on drop.
+    pub fn acquire(&self) -> Result<OwnedSemaphorePermit, Denial> {
+        Arc::clone(&self.in_flight)
             .try_acquire_owned()
-            .map_err(|_| Denial::TooManyInFlight)?;
+            .map_err(|_| Denial::TooManyInFlight)
+    }
+
+    /// Requests currently holding an in-flight slot.
+    pub fn in_flight(&self) -> usize {
+        (self.cfg.max_concurrent as usize).saturating_sub(self.in_flight.available_permits())
+    }
+
+    /// Check the token bucket and the lifetime totals for one request of
+    /// `body_len` bytes and charge them atomically. Call with an in-flight
+    /// slot held.
+    pub fn charge(&self, body_len: u64) -> Result<(), Denial> {
         let mut s = self.lock();
         if self
             .cfg
@@ -102,7 +122,7 @@ impl Budget {
         s.tokens -= 1.0;
         s.requests += 1;
         s.request_bytes = s.request_bytes.saturating_add(body_len);
-        Ok(permit)
+        Ok(())
     }
 
     /// Charge `n` response bytes. Returns false if that would exceed the
@@ -165,8 +185,11 @@ mod tests {
             ..BudgetConfig::default()
         });
         let p = b.admit(0).unwrap();
+        assert_eq!(b.in_flight(), 1);
         assert_eq!(b.admit(0).unwrap_err(), Denial::TooManyInFlight);
+        assert_eq!(b.acquire().unwrap_err(), Denial::TooManyInFlight);
         drop(p);
+        assert_eq!(b.in_flight(), 0);
         assert!(b.admit(0).is_ok());
     }
 }
