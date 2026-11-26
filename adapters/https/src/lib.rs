@@ -478,8 +478,9 @@ fn header_set(
 }
 
 /// Validate an origin-form path (no query) used as a prefix, or the path part
-/// of a request.
-fn clean_path(path: &str) -> bool {
+/// of a request. Also used by `tessera-model-proxy`, so both components apply
+/// the same rules.
+pub fn clean_path(path: &str) -> bool {
     if !path.starts_with('/') || path.starts_with("//") {
         return false;
     }

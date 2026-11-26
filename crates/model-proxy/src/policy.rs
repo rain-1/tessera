@@ -40,7 +40,26 @@ pub const ALWAYS_STRIP_REQUEST: &[&str] = &[
     "x-real-ip",
     "accept-encoding",
     "http2-settings",
+    // Requests with a non-identity encoding are refused (F-5); `identity`
+    // is dropped.
+    "content-encoding",
 ];
+
+/// Request headers forwarded when `forward_request_headers` is not
+/// configured. Everything else (for example `openai-organization`,
+/// `openai-project`, which select the billed account) is dropped.
+/// `anthropic-beta` values are further filtered by `anthropic_beta_allow`,
+/// which is empty by default.
+pub const DEFAULT_FORWARD_REQUEST: &[&str] = &[
+    "content-type",
+    "accept",
+    "user-agent",
+    "anthropic-version",
+    "anthropic-beta",
+];
+
+/// Header whose comma-separated values are filtered by `anthropic_beta_allow`.
+pub const ANTHROPIC_BETA: &str = "anthropic-beta";
 
 /// Response headers that are never returned: credential-shaped headers,
 /// cookies, hop-by-hop and framing headers (the proxy re-frames the body,
@@ -72,6 +91,8 @@ pub struct Route {
     pub(crate) path: String,
     pub(crate) prefix: bool,
     pub(crate) allow_query: bool,
+    pub(crate) json_body: bool,
+    pub(crate) token_cap: bool,
 }
 
 /// Why a request was refused before contacting the upstream.
@@ -94,16 +115,26 @@ pub enum Denial {
     TooManyInFlight,
     /// A lifetime budget is exhausted.
     BudgetExhausted(&'static str),
+    /// The request body is compressed or otherwise encoded.
+    ContentEncoding,
+    /// The request body is not a JSON object (body policy).
+    BodyNotJson,
+    /// The JSON body policy refused the request.
+    BodyPolicy(&'static str),
 }
 
 impl Denial {
     /// HTTP status returned to the sandbox.
     pub fn status(&self) -> u16 {
         match self {
-            Self::BadTarget | Self::BodyReadFailed => 400,
+            Self::BadTarget | Self::BodyReadFailed | Self::BodyNotJson => 400,
             // Lifetime budgets do not refill: 403 so harnesses stop retrying.
-            Self::RouteNotAllowed | Self::UpgradeNotAllowed | Self::BudgetExhausted(_) => 403,
+            Self::RouteNotAllowed
+            | Self::UpgradeNotAllowed
+            | Self::BudgetExhausted(_)
+            | Self::BodyPolicy(_) => 403,
             Self::BodyTooLarge => 413,
+            Self::ContentEncoding => 415,
             Self::RateLimited | Self::TooManyInFlight => 429,
         }
     }
@@ -119,30 +150,22 @@ impl Denial {
             Self::RateLimited => "rate_limited".into(),
             Self::TooManyInFlight => "too_many_in_flight".into(),
             Self::BudgetExhausted(what) => format!("budget_exhausted:{what}"),
+            Self::ContentEncoding => "content_encoding_not_allowed".into(),
+            Self::BodyNotJson => "body_not_json_object".into(),
+            Self::BodyPolicy(what) => format!("body_policy:{what}"),
         }
     }
 }
 
-/// Validate an origin-form path (no query). Rejects dot segments, empty
-/// segments other than a trailing slash, and percent-encoded dot, slash,
-/// backslash or NUL (which an upstream might normalise differently).
+/// Validate an origin-form path (no query) with the HTTPS adapter's rules
+/// ([`tessera_adapter_https::clean_path`]): no dot segments, no empty
+/// segments other than a trailing slash, no `;` path parameters, no
+/// percent-encoded dot, slash, backslash or NUL, no malformed escapes, and
+/// no segment that is still escaped or is a dot segment after one round of
+/// decoding (`%252e%252e`, `%25%32%65`). An upstream might normalise any of
+/// these differently from the route match.
 pub fn clean_path(path: &str) -> bool {
-    if !path.starts_with('/') || path.starts_with("//") {
-        return false;
-    }
-    let lower = path.to_ascii_lowercase();
-    if ["%2e", "%2f", "%5c", "%00"]
-        .iter()
-        .any(|p| lower.contains(p))
-    {
-        return false;
-    }
-    let segments: Vec<&str> = path.split('/').skip(1).collect();
-    let last = segments.len().saturating_sub(1);
-    !segments
-        .iter()
-        .enumerate()
-        .any(|(i, seg)| *seg == "." || *seg == ".." || (seg.is_empty() && i != last))
+    tessera_adapter_https::clean_path(path)
 }
 
 /// Split and validate the request target. Returns `(path, query)`.
@@ -170,7 +193,17 @@ pub fn origin_form(uri: &Uri) -> Result<(String, Option<String>), Denial> {
 
 /// Whether some route admits `method` + `path` (+ query presence).
 pub fn route_allows(routes: &[Route], method: &Method, path: &str, has_query: bool) -> bool {
-    routes.iter().any(|r| {
+    find_route(routes, method, path, has_query).is_some()
+}
+
+/// The first route admitting `method` + `path` (+ query presence).
+pub fn find_route<'a>(
+    routes: &'a [Route],
+    method: &Method,
+    path: &str,
+    has_query: bool,
+) -> Option<&'a Route> {
+    routes.iter().find(|r| {
         if r.method != *method || (has_query && !r.allow_query) {
             return false;
         }
@@ -188,7 +221,8 @@ pub fn route_allows(routes: &[Route], method: &Method, path: &str, has_query: bo
 #[derive(Clone, Debug)]
 pub struct HeaderPolicy {
     strip_request: HashSet<HeaderName>,
-    forward_only: Option<HashSet<HeaderName>>,
+    forward_only: HashSet<HeaderName>,
+    beta_allow: HashSet<String>,
     strip_response: HashSet<HeaderName>,
 }
 
@@ -202,11 +236,15 @@ fn names(list: &[&str], extra: &[String]) -> Result<HashSet<HeaderName>, String>
 
 impl HeaderPolicy {
     /// Compile. `credential_header` is always stripped in both directions.
+    /// `forward_only` is the request header allowlist; `None` selects
+    /// [`DEFAULT_FORWARD_REQUEST`]. `beta_allow` lists the `anthropic-beta`
+    /// values that may be forwarded.
     pub fn new(
         credential_header: &str,
         strip_request: &[String],
         forward_only: Option<&[String]>,
         strip_response: &[String],
+        beta_allow: &[String],
     ) -> Result<Self, String> {
         let cred = [credential_header.to_owned()];
         let mut req = names(ALWAYS_STRIP_REQUEST, strip_request)?;
@@ -214,12 +252,13 @@ impl HeaderPolicy {
         let mut resp = names(ALWAYS_STRIP_RESPONSE, strip_response)?;
         resp.extend(names(&[], &cred)?);
         let forward_only = match forward_only {
-            Some(list) => Some(names(&[], list)?),
-            None => None,
+            Some(list) => names(&[], list)?,
+            None => names(DEFAULT_FORWARD_REQUEST, &[])?,
         };
         Ok(Self {
             strip_request: req,
             forward_only,
+            beta_allow: beta_allow.iter().cloned().collect(),
             strip_response: resp,
         })
     }
@@ -240,15 +279,33 @@ impl HeaderPolicy {
         let hop = Self::connection_named(headers);
         let mut out = HeaderMap::new();
         for (name, value) in headers {
-            if self.strip_request.contains(name) || hop.contains(name) {
-                continue;
-            }
-            if let Some(allow) = &self.forward_only
-                && !allow.contains(name)
+            if self.strip_request.contains(name)
+                || hop.contains(name)
+                || !self.forward_only.contains(name)
+                || name == ANTHROPIC_BETA
             {
                 continue;
             }
             out.append(name.clone(), value.clone());
+        }
+        // `anthropic-beta`: keep only allowlisted values, merged into one
+        // header; drop it when none remain.
+        let beta = HeaderName::from_static(ANTHROPIC_BETA);
+        if self.forward_only.contains(&beta) && !hop.contains(&beta) {
+            let mut kept: Vec<&str> = Vec::new();
+            for v in headers.get_all(ANTHROPIC_BETA) {
+                let Ok(v) = v.to_str() else { continue };
+                for item in v.split(',').map(str::trim) {
+                    if self.beta_allow.contains(item) && !kept.contains(&item) {
+                        kept.push(item);
+                    }
+                }
+            }
+            if !kept.is_empty()
+                && let Ok(v) = kept.join(",").parse()
+            {
+                out.insert(ANTHROPIC_BETA, v);
+            }
         }
         out
     }
@@ -281,6 +338,8 @@ mod tests {
             path: p.into(),
             prefix,
             allow_query: true,
+            json_body: true,
+            token_cap: true,
         }
     }
 
@@ -336,6 +395,13 @@ mod tests {
             "//evil.example/v1",
             "/v1/%2e%2e/admin",
             "/v1/x%2Fy",
+            // Review 2026-11-26 F-4.
+            "/v1/models/..;/messages",
+            "/v1/x;a=b",
+            "/v1/%252e%252e/files",
+            "/v1/%25%32%65%25%32%65",
+            "/v1/%zz",
+            "/v1/%2",
         ];
         for t in bad {
             let parsed: Result<Uri, _> = t.parse();
@@ -347,7 +413,7 @@ mod tests {
 
     #[test]
     fn header_filtering() {
-        let p = HeaderPolicy::new("x-api-key", &["x-extra".into()], None, &[]).unwrap();
+        let p = HeaderPolicy::new("x-api-key", &["x-extra".into()], None, &[], &[]).unwrap();
         let mut h = HeaderMap::new();
         for (k, v) in [
             ("authorization", "Bearer sandbox"),
@@ -370,9 +436,35 @@ mod tests {
         assert!(out.contains_key("content-type"));
 
         let only =
-            HeaderPolicy::new("x-api-key", &[], Some(&["content-type".into()]), &[]).unwrap();
+            HeaderPolicy::new("x-api-key", &[], Some(&["content-type".into()]), &[], &[]).unwrap();
         let out = only.filter_request(&h);
         assert_eq!(out.len(), 1);
+
+        // Default allowlist drops account selection headers and unlisted
+        // `anthropic-beta` values; the explicit allowlist cannot re-enable
+        // a stripped header.
+        let mut sel = HeaderMap::new();
+        for (k, v) in [
+            ("openai-organization", "org-x"),
+            ("openai-project", "proj-x"),
+            ("anthropic-beta", "a, b"),
+            ("anthropic-beta", "c"),
+            ("content-encoding", "gzip"),
+        ] {
+            sel.append(HeaderName::from_static(k), v.parse().unwrap());
+        }
+        assert!(p.filter_request(&sel).is_empty());
+        let beta = HeaderPolicy::new(
+            "x-api-key",
+            &[],
+            Some(&["anthropic-beta".into(), "x-api-key".into()]),
+            &[],
+            &["c".into(), "a".into()],
+        )
+        .unwrap();
+        let out = beta.filter_request(&sel);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out["anthropic-beta"], "a,c");
 
         let mut r = HeaderMap::new();
         r.append("x-echo", "key=sk-SECRET-1".parse().unwrap());

@@ -59,20 +59,54 @@ Compatibility mode (spec §3.1, §10.1, WP6; ADR-0020, ADR-0030) runs an
   redirects, retries or proxy discovery.
 - It accepts only origin-form requests whose method and path match a
   configured route: `exact`, which is the default, or `prefix`. It refuses
-  absolute-form, CONNECT, upgrades, dot segments and encoded separators.
-- It strips `authorization`, `x-api-key`, `api-key`, `x-goog-api-key`,
-  `proxy-*`, `cookie`, hop-by-hop, forwarding and `accept-encoding`
-  headers. It injects `x-api-key: KEY` (`"inject": "x-api-key"`) or
+  absolute-form, CONNECT, upgrades, dot segments, encoded separators,
+  `;` path parameters, malformed escapes and double encoding
+  (`%252e%252e`). The path rules are the HTTPS adapter's
+  (`tessera_adapter_https::clean_path`).
+- **Request headers are allowlisted.** Only `forward_request_headers` are
+  forwarded. The default list is `content-type`, `accept`, `user-agent`,
+  `anthropic-version` and `anthropic-beta`. Everything else is dropped,
+  including `openai-organization` and `openai-project`, which select the
+  billed account. `anthropic-beta` values are filtered again by
+  `anthropic_beta_allow`. That list is empty by default, so the header is
+  dropped, because betas can enable server-side tools. Credential,
+  hop-by-hop, forwarding and `accept-encoding` headers are always
+  stripped, even if allowlisted. A request with a `content-encoding`
+  other than `identity` is refused with 415: the byte budget would count
+  compressed bytes, and the body policy could not read the body. The
+  proxy injects `x-api-key: KEY` (`"inject": "x-api-key"`) or
   `authorization: Bearer KEY` (`"inject": "bearer"`).
-- It streams responses, including SSE.
-- Limits: request body, response body, header bytes and count, timeouts,
-  and per-sandbox requests/minute, burst, concurrency, and lifetime
-  requests, request bytes and response bytes.
-- Audit: one JSON line per request to `audit_log` or stderr. Each line
-  records the sandbox label, method, path without query, query length,
+- Optional **JSON body policy** (`body_policy`). It is on in the shipped
+  examples. See below.
+- It streams responses, including SSE. If the sandbox stops reading, the
+  stream is cut at the idle timeout or the `max_duration` deadline,
+  whichever comes first. The upstream connection and the in-flight slot
+  are released, and the sandbox connection is closed. A stream that ends
+  early never ends with a clean chunked terminator.
+- Limits: request body (default 4 MiB), response body, header bytes and
+  count, timeouts, and per-sandbox requests/minute, burst, concurrency,
+  and lifetime requests, request bytes and response bytes. A request
+  takes one of the sandbox's `max_concurrent` in-flight slots **before**
+  its body is read. Buffered request bodies are therefore bounded by
+  `max_concurrent × max_request_body` per sandbox. Further requests get
+  429 without their body being read. `request_header_timeout_ms` (default
+  30 s) bounds a request head, including keep-alive idle time.
+  `request_read_timeout_ms` (default 60 s) bounds the body.
+- Audit: JSON lines to `audit_log` or stderr. Each line records the
+  sandbox label, a request `id`, method, path without query, query length,
   status, outcome, byte counts, SHA-256 digests, upstream peer, number of
   redactions and duration. Bodies, header values and the key are never
   logged.
+  - An admitted request gets a `forwarded` line **before** anything is
+    sent upstream. A completion line with the same `id` follows: `ok`,
+    `upstream:<reason>` or `aborted:<reason>`.
+  - Refused connections and requests denied locally are rate limited per
+    sandbox (`audit_denials_per_second`, default 5; `audit_denials_burst`,
+    default 20). Lines over the limit are counted. Every
+    `audit_summary_interval_ms` (default 10 s), the proxy writes one
+    `suppressed:<outcome>` line per outcome with the count in
+    `suppressed`. A sandbox therefore cannot fill the host disk through
+    the audit log.
 - Each socket is mode 0600 and peer-checked with `SO_PEERCRED`. By
   default only the proxy's uid may connect. Keep the socket in a 0700
   directory.
@@ -83,12 +117,63 @@ statuses:
 
 | Status | Cause |
 |---|---|
-| 400 | Bad target |
-| 403 | Route or upgrade not allowed, or a lifetime budget is exhausted |
+| 400 | Bad target; body unreadable, too slow, or not a JSON object (body policy) |
+| 403 | Route or upgrade not allowed, body policy refusal (`body_policy:<reason>`), or a lifetime budget is exhausted |
 | 413 | Request body too large |
+| 415 | Request `content-encoding` other than `identity` |
 | 429 | Rate or concurrency limit |
 | 431 | Request headers too large |
-| 502 / 504 | Upstream failure, or upstream timeout |
+| 502 / 504 | Upstream failure, or upstream timeout. The reason is generic: `destination_forbidden` never carries the resolved address, which only the host audit log records |
+
+### Body policy: defence in depth that depends on provider API shapes
+
+Restricting routes does not stop *provider-side tools*. With them, an
+agent can make the **provider** connect to arbitrary hosts on its behalf:
+
+- Anthropic `mcp_servers` (MCP connector);
+- Anthropic `web_fetch` / `web_search` / `code_execution` tools;
+- OpenAI Responses `mcp` tools (`server_url`) and `web_search`.
+
+That is an egress path that bypasses the empty network namespace.
+
+When `body_policy` is configured, the proxy parses every non-empty
+request body on routes with `json_body` (the default). The body is
+bounded by `max_request_body` and parsed once. The policy refuses, before
+anything is sent upstream:
+
+- a body that is not a single JSON object, or that has a duplicate object
+  key (400). Another parser might keep the other value;
+- a top-level key in `deny_keys` (default `["mcp_servers"]`);
+- any `tools[]` entry whose `type` is present and not in
+  `allowed_tool_types` (default `["custom", "function"]`). A tool without
+  `type` is a client-side tool and is allowed. `tools` must be an array
+  of objects;
+- if `max_tokens` is set, a request on a `token_cap` route (the default)
+  that carries none of `max_tokens_fields` (default `max_tokens`,
+  `max_output_tokens`, `max_completion_tokens`), or one that is not an
+  integer at most the cap. Set `"token_cap": false` on routes that
+  generate nothing, such as `/v1/messages/count_tokens`;
+- if `models` is set, a `model` that is missing or not in the list.
+
+Shipped examples:
+
+- `anthropic-proxy.json` denies `mcp_servers` and `container`, allows
+  only `custom` tools and caps `max_tokens` at 64000. Claude Code's own
+  tools are client-side. Its `WebSearch` tool uses the server-side
+  `web_search` tool and therefore fails, which is intended.
+- `openai-proxy.json` denies `prompt` (a stored prompt can carry tools)
+  and `web_search_options`, and allows `function`, `custom` and
+  `local_shell`. It sets no token cap, because Codex does not send
+  `max_output_tokens`.
+
+**Limits of this check.** It knows only the field names and shapes that
+providers document today. It is not a parser of the provider's API. A
+new provider feature that reaches the network through a different field,
+or a provider that accepts a different spelling, is not caught until the
+configuration is updated. Treat it as defence in depth on top of the
+route allowlist. It does not replace choosing a provider account or
+organisation whose server-side tools and connectors are disabled. Keep
+`anthropic_beta_allow` short for the same reason.
 
 ## Harness recipes
 
@@ -107,7 +192,12 @@ a local fake upstream; see "Evidence" below. Set:
 
 Routes needed: `POST /v1/messages` (with a `?beta=true` query) and
 `POST /v1/messages/count_tokens`. `GET /v1/models` is optional. See
-`examples/compat/anthropic-proxy.json`.
+`examples/compat/anthropic-proxy.json`. Its `forward_request_headers`
+and `anthropic_beta_allow` list what Claude Code is expected to send.
+Betas outside the list are removed silently. If a harness version needs
+another beta, check that it does not enable a server-side tool before
+adding it. The example's 8 MiB `max_request_body` allows long contexts
+with images while keeping `max_concurrent × max_request_body` at 32 MiB.
 
 Run it with `examples/compat/run-claude.sh WORKSPACE -p "..."`. The script
 starts the proxy, then calls `tessera-launch-run --model-socket ...`.
@@ -186,6 +276,7 @@ has `model_route: { socket, loopback_port?, netshim_path? }`.
 | Rate limit, request and byte budgets | `rate_limit_and_budgets` |
 | Socket 0600; TLS-on-plain-socket detected | `socket_mode_and_tls_on_plain_socket` |
 | Shim forwards bytes both ways with half-close | `tests/shim.rs`, `shim_forwards_to_proxy_end_to_end` |
+| Review 2026-11-26: body read only after the in-flight slot is taken (16 stalled 30 MiB uploads: 31 MiB RSS, was 483 MiB); header and body deadlines; rate-limited and summarised audit of refusals; stalled reader released at the deadline and audited (`forwarded` + completion); `;` and double encoding refused; header allowlist, `anthropic-beta` value allowlist, request `content-encoding` refused; body policy (server-side tools, `mcp_servers`, duplicate keys, `max_tokens`, model); no resolved address in errors; examples enable the policy | `tests/review_2026_11_26.rs`; `docs/security-review-2026-11-26-model-proxy.md` |
 | Real sandbox: stub harness → shim → proxy → fake TLS upstream with the injected key; direct connect (host upstream port, 1.1.1.1, IPv6), other loopback ports (bind and connect), UDP and DNS all fail; no credential-shaped token in env, `/proc/*/environ`, `/proc/*/cmdline`, files or responses | `tests/compat_sandbox.rs` `compat_sandbox_reaches_model_only_through_proxy` |
 | §12.3: the harness rewrites its own permission settings and tries `unshare`, `sudo`, `su`, `nsenter`, a host binary path, unlinking the socket, overwriting the netshim, binding the shim port and direct egress; outer confinement holds | `compromised_harness_stays_contained` |
 | Fail closed: loopback port without Required Landlock; non-socket or world-accessible socket | `loopback_port_requires_required_landlock`, `model_socket_must_be_private_socket`; `init.rs` `tcp_port_exception_parsing_and_fail_closed` |
@@ -200,5 +291,17 @@ has `model_route: { socket, loopback_port?, netshim_path? }`.
   was disclosed (R-2).
 - Provider-side state, such as files or batches APIs, is a relay channel
   between sandboxes on the same account if such routes are enabled. The
-  example configs do not enable them.
-- The proxy itself has not been independently reviewed (ADR-0021).
+  example configs do not enable them. `previous_response_id` and
+  conversation state on OpenAI's Responses API are not filtered.
+- **Provider-side tools are an egress path** (threat model R-15). The body
+  policy refuses the known shapes (`mcp_servers`, server-side
+  `tools[].type`). It depends on provider API shapes and does not see
+  features added later. Turn off server-side tools and connectors on the
+  provider account as well.
+- Token caps are per request. `n` or several choices, retries and
+  reasoning tokens are bounded only by the request rate and the byte
+  budgets.
+- Connections refused at the 64-connection cap cost the host one
+  `accept` each. The audit log is protected; the CPU is not.
+- The proxy was reviewed on 2026-11-26; see
+  `docs/security-review-2026-11-26-model-proxy.md`.

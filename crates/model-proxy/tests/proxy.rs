@@ -62,9 +62,14 @@ async fn allowed_route_forwarded_with_injected_key_and_client_auth_stripped() {
     assert!(lower.contains("request-id: req_1"));
     assert!(resp.contains("[REDACTED-BY-TESSERA]"));
 
-    let audit = h.wait_audit(1).await;
-    assert_eq!(audit.len(), 1);
-    let a = &audit[0];
+    // A `forwarded` record before contacting the upstream, then the
+    // completion record (review 2026-11-26, F-3).
+    let audit = h.wait_audit(2).await;
+    assert_eq!(audit.len(), 2);
+    assert_eq!(audit[0].outcome, "forwarded");
+    assert_eq!(audit[0].id, audit[1].id);
+    assert_eq!(audit[0].request_sha256, audit[1].request_sha256);
+    let a = &audit[1];
     assert_eq!(
         (a.sandbox.as_str(), a.method.as_str(), a.path.as_str()),
         ("agent-1", "POST", "/v1/messages")

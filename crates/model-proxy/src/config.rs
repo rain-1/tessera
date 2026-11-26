@@ -89,6 +89,15 @@ pub struct RouteConfig {
     /// Whether a query string may be present (default true).
     #[serde(default = "yes")]
     pub allow_query: bool,
+    /// When a [`BodyPolicyConfig`] is configured, a non-empty request body
+    /// on this route must be a JSON object that passes it (default true).
+    #[serde(default = "yes")]
+    pub json_body: bool,
+    /// Whether the body policy's `max_tokens` cap applies on this route
+    /// (default true). Set false for routes that generate no output, such
+    /// as `/v1/messages/count_tokens`.
+    #[serde(default = "yes")]
+    pub token_cap: bool,
 }
 
 /// Route path matching mode.
@@ -106,7 +115,10 @@ pub enum MatchKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
-    /// Largest request body accepted from the sandbox.
+    /// Largest request body accepted from the sandbox (default 4 MiB). A
+    /// body is read only after the request holds one of the sandbox's
+    /// `max_concurrent` in-flight slots, so at most
+    /// `max_concurrent * max_request_body` bytes are buffered per sandbox.
     #[serde(default = "default_max_request_body")]
     pub max_request_body: u64,
     /// Largest response body streamed back for one request.
@@ -118,9 +130,26 @@ pub struct LimitsConfig {
     /// Most request headers accepted.
     #[serde(default = "default_max_headers")]
     pub max_headers: usize,
-    /// Deadline for reading the request head and body from the sandbox.
+    /// Deadline for the first byte of a connection and for the whole
+    /// request body (measured from the end of the head).
     #[serde(default = "default_request_read_ms")]
     pub request_read_timeout_ms: u64,
+    /// Deadline for a complete request head, including the idle time
+    /// before it on a keep-alive connection (default 30 s).
+    #[serde(default = "default_request_header_ms")]
+    pub request_header_timeout_ms: u64,
+    /// Sustained rate of audit lines for refused connections and requests
+    /// denied before reaching the upstream, per sandbox (default 5/s).
+    /// Lines over the limit are counted and written as `suppressed:<outcome>`
+    /// summaries.
+    #[serde(default = "default_audit_denials_rate")]
+    pub audit_denials_per_second: u32,
+    /// Burst for `audit_denials_per_second` (default 20).
+    #[serde(default = "default_audit_denials_burst")]
+    pub audit_denials_burst: u32,
+    /// How often suppressed-line summaries are written (default 10 s).
+    #[serde(default = "default_audit_summary_ms")]
+    pub audit_summary_interval_ms: u64,
 }
 
 impl Default for LimitsConfig {
@@ -131,6 +160,10 @@ impl Default for LimitsConfig {
             max_header_bytes: default_max_header_bytes(),
             max_headers: default_max_headers(),
             request_read_timeout_ms: default_request_read_ms(),
+            request_header_timeout_ms: default_request_header_ms(),
+            audit_denials_per_second: default_audit_denials_rate(),
+            audit_denials_burst: default_audit_denials_burst(),
+            audit_summary_interval_ms: default_audit_summary_ms(),
         }
     }
 }
@@ -173,6 +206,38 @@ impl Default for BudgetConfig {
     }
 }
 
+/// Optional JSON request-body policy (defence in depth, see
+/// `docs/compat.md`). It depends on the provider's API shapes: it inspects
+/// field names the provider documents today and cannot know about fields a
+/// provider adds later.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BodyPolicyConfig {
+    /// Top-level keys that are refused outright (default `["mcp_servers"]`,
+    /// Anthropic's MCP connector, which makes the provider connect to an
+    /// arbitrary URL).
+    #[serde(default = "default_deny_keys")]
+    pub deny_keys: Vec<String>,
+    /// Allowed values of `tools[].type`. A tool object without `type` is a
+    /// client-side tool and always allowed. Default `["custom", "function"]`:
+    /// server-side tools such as `web_search_*`, `web_fetch_*`,
+    /// `code_execution_*` and OpenAI `mcp` / `web_search` are refused.
+    #[serde(default = "default_tool_types")]
+    pub allowed_tool_types: Vec<String>,
+    /// Per-request output token cap. When set, a request on a route with
+    /// `token_cap` must carry at least one of `max_tokens_fields`, each an
+    /// integer `<=` this value.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    /// Field names that carry the output token limit (default
+    /// `max_tokens`, `max_output_tokens`, `max_completion_tokens`).
+    #[serde(default = "default_max_tokens_fields")]
+    pub max_tokens_fields: Vec<String>,
+    /// When set, a request body must carry a string `model` from this list.
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+}
+
 /// One sandbox's listening socket.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,9 +273,20 @@ pub struct ProxyConfig {
     /// list of credential, hop-by-hop and forwarding headers).
     #[serde(default)]
     pub strip_request_headers: Vec<String>,
-    /// If set, only these request headers are forwarded (after stripping).
+    /// Request headers forwarded upstream (after stripping); everything
+    /// else is dropped. Default: [`crate::policy::DEFAULT_FORWARD_REQUEST`]
+    /// (`content-type`, `accept`, `user-agent`, `anthropic-version`,
+    /// `anthropic-beta`).
     #[serde(default)]
     pub forward_request_headers: Option<Vec<String>>,
+    /// Allowed `anthropic-beta` values; other values are removed from the
+    /// header (default: none, so the header is dropped). Betas can enable
+    /// server-side tools.
+    #[serde(default)]
+    pub anthropic_beta_allow: Vec<String>,
+    /// Optional JSON request-body policy (off when absent).
+    #[serde(default)]
+    pub body_policy: Option<BodyPolicyConfig>,
     /// Extra response header names to strip.
     #[serde(default)]
     pub strip_response_headers: Vec<String>,
@@ -240,7 +316,7 @@ fn default_max_duration_ms() -> u64 {
     30 * 60_000
 }
 fn default_max_request_body() -> u64 {
-    32 << 20
+    4 << 20
 }
 fn default_max_response_body() -> u64 {
     64 << 20
@@ -253,6 +329,31 @@ fn default_max_headers() -> usize {
 }
 fn default_request_read_ms() -> u64 {
     60_000
+}
+fn default_request_header_ms() -> u64 {
+    30_000
+}
+fn default_audit_denials_rate() -> u32 {
+    5
+}
+fn default_audit_denials_burst() -> u32 {
+    20
+}
+fn default_audit_summary_ms() -> u64 {
+    10_000
+}
+fn default_deny_keys() -> Vec<String> {
+    vec!["mcp_servers".into()]
+}
+fn default_tool_types() -> Vec<String> {
+    vec!["custom".into(), "function".into()]
+}
+fn default_max_tokens_fields() -> Vec<String> {
+    vec![
+        "max_tokens".into(),
+        "max_output_tokens".into(),
+        "max_completion_tokens".into(),
+    ]
 }
 fn default_rpm() -> u32 {
     120
@@ -313,6 +414,8 @@ impl ProxyConfig {
                 path: r.path.clone(),
                 prefix: r.match_kind == MatchKind::Prefix,
                 allow_query: r.allow_query,
+                json_body: r.json_body,
+                token_cap: r.token_cap,
             });
         }
         Ok(out)
@@ -349,8 +452,31 @@ impl ProxyConfig {
                 return err("max_concurrent must be positive");
             }
         }
-        if self.limits.max_header_bytes < 1024 || self.limits.max_headers == 0 {
+        let l = &self.limits;
+        if l.max_header_bytes < 1024 || l.max_headers == 0 {
             return err("header limits too small");
+        }
+        if l.max_request_body == 0
+            || l.request_read_timeout_ms == 0
+            || l.request_header_timeout_ms == 0
+            || l.audit_denials_per_second == 0
+            || l.audit_denials_burst == 0
+            || l.audit_summary_interval_ms == 0
+        {
+            return err("limits must be positive");
+        }
+        if let Some(b) = &self.body_policy {
+            if b.max_tokens == Some(0) || b.max_tokens_fields.is_empty() {
+                return err("body_policy: max_tokens and max_tokens_fields must be non-empty");
+            }
+            if b.models.as_ref().is_some_and(Vec::is_empty) {
+                return err("body_policy: models must not be empty when set");
+            }
+        }
+        for v in &self.anthropic_beta_allow {
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_graphic() && b != b',') {
+                return err(format!("bad anthropic_beta_allow value {v:?}"));
+            }
         }
         let u = &self.upstream;
         if u.connect_timeout_ms == 0
@@ -389,6 +515,25 @@ mod tests {
         assert_eq!(c.routes[0].match_kind, MatchKind::Exact);
         assert!(c.routes[0].allow_query);
         assert_eq!(c.sandboxes[0].budget.requests_per_minute, 120);
+        // Review 2026-11-26 F-1: bounded request body by default.
+        assert_eq!(c.limits.max_request_body, 4 << 20);
+        assert_eq!(c.limits.request_header_timeout_ms, 30_000);
+        assert!(c.body_policy.is_none());
+        assert!(c.anthropic_beta_allow.is_empty());
+        assert!(c.routes[0].json_body && c.routes[0].token_cap);
+    }
+
+    #[test]
+    fn body_policy_defaults() {
+        let c = ProxyConfig::from_json(
+            &MIN.replace("\"sandboxes\"", "\"body_policy\": {}, \"sandboxes\""),
+        )
+        .unwrap();
+        c.validate().unwrap();
+        let b = c.body_policy.unwrap();
+        assert_eq!(b.deny_keys, ["mcp_servers"]);
+        assert_eq!(b.allowed_tool_types, ["custom", "function"]);
+        assert!(b.max_tokens.is_none() && b.models.is_none());
     }
 
     #[test]
