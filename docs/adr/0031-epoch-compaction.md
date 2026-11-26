@@ -1,8 +1,10 @@
 # ADR-0031: Ledger compaction at the epoch boundary
 
 - Status: Accepted. Implemented in `crates/capability-core`
-  (`AdminCommand::CompactEpoch`) and `crates/broker` (`Reactor::open`);
-  tested, not proved (outside the Verus mirror, see below).
+  (`AdminCommand::CompactEpoch`) and `crates/broker` (`Reactor::open`).
+  Machine-checked on the Verus mirror since 2026-11-26 (see Verification).
+  The production code is tied to the mirror by the differential test
+  (proof register A13).
 - Spec: §4.4, §6.1, §11. Closes security review 2026-11-25 finding 3 together
   with the per-principal and per-root admission limits of ADR-0024. Amends
   proof-register semantic decisions 9 and 13 ("records are never
@@ -103,7 +105,45 @@ later ADR.
 - Crash tests (`crates/broker/tests/crash.rs`) run unchanged against the
   archived views.
 
+## Verification
+
+The Verus mirror (`proofs/src/ledger.rs`) keeps every record in its
+dense-vector slot. A record that compaction removes becomes a tombstone
+(`pruned`), which every lookup treats exactly like a missing key, so ids
+stay indices and are never reused. `compact` mirrors `plan_compact_epoch`
+and its commit. Verus proves (see `proofs/README.md`, "Compaction"):
+
+- `inv` is preserved by COMPACT. This includes T1 per-pool conservation
+  and the retired-pool sums. `lemma_retired_balanced` proves
+  `retired.initial = retired.consumed + retired.discarded`, with stranded
+  balances counted in D. `lemma_global_conservation` proves the global
+  identity above.
+- COMPACT prunes exactly the principals and roots of earlier epochs and
+  every capability, pool and reservation of those roots. It keeps every
+  spent nonce, the epoch and every id counter.
+- Liveness is unchanged for every id at every time: no live capability is
+  pruned, and none is resurrected. Pruned records never change again
+  (`frozen`).
+- No present record refers to a pruned one (`lemma_no_dangling_*`). The
+  pruned roots are exactly the ids below `retired_roots_below`. Every
+  spent nonce names the root that redeemed it, and that root is present
+  iff its id is at or above the floor. Spent nonces stay pairwise
+  distinct, so a pruned approval cannot be redeemed again.
+
+The differential test (`proofs/tests/differential.rs`) generates
+`CompactEpoch` at random points and right after `BumpEpoch`. It compares
+the mirror with the production core after every step, including the
+tombstones (which must be absent in the core), `retired`,
+`retired_roots_below` and the request-id index. A soak of 20,000 cases
+per configuration passed on 2026-11-26. The production `state.rs`/
+`step.rs` themselves are not verified; that link is assumption A13.
+
 ## Consequences
+> Amended 2026-11-26: the first point below is superseded by the
+> Verification section above. The mirror now represents pruned ids as
+> tombstones, and `CompactEpoch` is mirrored, proved and differentially
+> tested.
+
 - The Verus mirror (`proofs/`) represents identifiers as dense vector
   indices and cannot express pruned (sparse) ids. `CompactEpoch` is
   therefore outside the mirrored command set: the differential test never
