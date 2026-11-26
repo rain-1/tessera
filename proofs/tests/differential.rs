@@ -8,9 +8,14 @@
 //!   `CapacityExceeded` resource) or the same `Effect`;
 //! * identical observable state: epoch, sequence, clock, every principal,
 //!   every capability record (all fields), every root record, every pool's
-//!   `initial`/`consumed`/`discarded`, every reservation record, the spent
-//!   nonce set, and `live` (with the same `NotLive` reason) for every
-//!   capability.
+//!   `initial`/`consumed`/`discarded`, every reservation record and its
+//!   request-id index entry, the spent nonce set, `live` (with the same
+//!   `NotLive` reason) for every capability, the record counts, and the
+//!   compaction state (`retired_roots_below`, `retired`). A record the
+//!   model has tombstoned (`pruned`) must be absent from the core.
+//!
+//! Sequences include `CompactEpoch` (ADR-0031) at random points and right
+//! after `BumpEpoch`, as the broker issues it at every start.
 //!
 //! This is what keeps the proved model from drifting away from the code
 //! that actually runs: any behavioural change to `crates/capability-core`
@@ -158,11 +163,7 @@ fn command(c: core::AuthenticatedCommand) -> m::AuthenticatedCommand {
             }
             A::AdvanceClock => m::AdminCommand::AdvanceClock,
             A::BumpEpoch => m::AdminCommand::BumpEpoch,
-            // ADR-0031: compaction renumbers nothing but leaves sparse ids,
-            // which the mirror's index-as-id representation cannot express.
-            // The generator used here (`arb_sym`) never emits it; it is
-            // covered by the production model test instead.
-            A::CompactEpoch => unreachable!("CompactEpoch is outside the mirrored command set"),
+            A::CompactEpoch => m::AdminCommand::CompactEpoch,
             A::Mint { approval } => {
                 let r = approval.request();
                 m::AdminCommand::Mint {
@@ -337,7 +338,25 @@ fn effect(e: &core::Effect) -> m::Effect {
             terminated_principals: *terminated_principals,
             abandoned_reservations: *abandoned_reservations,
         },
-        E::EpochCompacted { .. } => unreachable!("CompactEpoch is never generated here"),
+        E::EpochCompacted {
+            principals,
+            capabilities,
+            roots,
+            pools,
+            reservations,
+            initial,
+            consumed,
+            discarded,
+        } => m::Effect::EpochCompacted {
+            principals: *principals,
+            capabilities: *capabilities,
+            roots: *roots,
+            pools: *pools,
+            reservations: *reservations,
+            initial: *initial,
+            consumed: *consumed,
+            discarded: *discarded,
+        },
         E::RootCreated {
             root,
             capability,
@@ -414,33 +433,77 @@ fn status(s: core::Status) -> m::Status {
 // State comparison
 // ---------------------------------------------------------------------------
 
+fn core_nonce(n: m::Nonce) -> core::Nonce {
+    let mut b = [0u8; 32];
+    b[..16].copy_from_slice(&n.hi.to_be_bytes());
+    b[16..].copy_from_slice(&n.lo.to_be_bytes());
+    core::Nonce::from_bytes(b)
+}
+
 fn compare(s: &core::State, ms_: &m::State, now: u64) -> Result<(), TestCaseError> {
     prop_assert_eq!(limits(s.limits()), ms_.limits);
     prop_assert_eq!(s.epoch(), ms_.epoch);
     prop_assert_eq!(s.sequence(), ms_.sequence);
     prop_assert_eq!(s.clock().to_raw(), ms_.clock.0);
 
-    // Principals: dense by serial, keyed by (epoch, serial) in the core.
+    // Compaction state (ADR-0031).
+    prop_assert_eq!(s.retired_roots_below(), ms_.retired_roots_below);
+    let r = s.retired();
+    prop_assert_eq!(
+        (r.pools, r.initial, r.consumed, r.discarded),
+        (
+            ms_.retired.pools,
+            ms_.retired.initial,
+            ms_.retired.consumed,
+            ms_.retired.discarded
+        )
+    );
+
+    // Principals: dense by serial, keyed by (epoch, serial) in the core;
+    // a pruned one is absent.
     for (serial, p) in ms_.principals.iter().enumerate() {
         let a = core::AgentId::new(p.epoch, serial as u64);
         let st = s.principal(a);
-        prop_assert_eq!(
-            st.map(|x| matches!(x, core::PrincipalStatus::Active)),
-            Some(matches!(p.status, m::PrincipalStatus::Active)),
-            "principal {:?}",
-            a
-        );
+        if p.pruned {
+            prop_assert!(st.is_none(), "pruned principal {:?} present in core", a);
+        } else {
+            prop_assert_eq!(
+                st.map(|x| matches!(x, core::PrincipalStatus::Active)),
+                Some(matches!(p.status, m::PrincipalStatus::Active)),
+                "principal {:?}",
+                a
+            );
+        }
     }
+    prop_assert_eq!(
+        ms_.n_principals,
+        ms_.principals.iter().filter(|p| !p.pruned).count()
+    );
     // No principal exists in the core beyond the model's serial range.
     let n = ms_.principals.len() as u64;
     for e in 0..=s.epoch() {
         prop_assert!(s.principal(core::AgentId::new(e, n)).is_none());
     }
 
-    // Capabilities: every field.
-    prop_assert_eq!(s.capabilities().count(), ms_.capabilities.len());
+    // Capabilities: every field of every present record; pruned ones absent.
+    let present = ms_.capabilities.iter().filter(|c| !c.pruned).count();
+    prop_assert_eq!(s.capabilities().count(), present);
+    prop_assert_eq!(ms_.n_capabilities, present);
+    let t = core::Tick::from_raw(now);
     for (i, mc) in ms_.capabilities.iter().enumerate() {
         let id = core::CapabilityId::from_raw(i as u128);
+        // Liveness, with the exact reason (`Unknown` for a pruned id).
+        let core_live = s.live(id, t).map(|_| ()).map_err(not_live);
+        let model_live = ms_.live(i as u128, mq::Tick(now)).map(|_| ());
+        prop_assert_eq!(core_live, model_live, "live({}) at {}", i, now);
+        if mc.pruned {
+            prop_assert!(
+                s.capability(id).is_none(),
+                "pruned capability {} present in core",
+                i
+            );
+            continue;
+        }
         let c = s.capability(id).expect("capability present in core");
         prop_assert_eq!(c.root().to_raw(), mc.root);
         prop_assert_eq!(c.parent().map(|p| p.to_raw()), mc.parent);
@@ -453,19 +516,25 @@ fn compare(s: &core::State, ms_: &m::State, now: u64) -> Result<(), TestCaseErro
         prop_assert_eq!(c.pool().map(|p| p.to_raw()), mc.pool);
         prop_assert_eq!(c.generation(), mc.generation);
         prop_assert_eq!(status(c.status()), mc.status);
-        // Liveness, with the exact reason.
-        let t = core::Tick::from_raw(now);
-        let core_live = s.live(id, t).map(|_| ()).map_err(not_live);
-        let model_live = ms_.live(i as u128, mq::Tick(now)).map(|_| ());
-        prop_assert_eq!(core_live, model_live, "live({}) at {}", i, now);
     }
+    // Ids are never reused: nothing at or beyond the model's counter.
+    prop_assert!(s
+        .capability(core::CapabilityId::from_raw(ms_.capabilities.len() as u128))
+        .is_none());
 
     // Roots.
-    prop_assert_eq!(s.roots().count(), ms_.roots.len());
+    let present = ms_.roots.iter().filter(|r| !r.pruned).count();
+    prop_assert_eq!(s.roots().count(), present);
+    prop_assert_eq!(ms_.n_roots, present);
     for (i, mr) in ms_.roots.iter().enumerate() {
-        let r = s
-            .root(core::RootId::from_raw(i as u128))
-            .expect("root present in core");
+        let id = core::RootId::from_raw(i as u128);
+        if mr.pruned {
+            prop_assert!(s.root(id).is_none(), "pruned root {} present in core", i);
+            prop_assert!((i as u128) < s.retired_roots_below());
+            continue;
+        }
+        prop_assert!((i as u128) >= s.retired_roots_below());
+        let r = s.root(id).expect("root present in core");
         prop_assert_eq!(r.capability().to_raw(), mr.capability);
         prop_assert_eq!(root_kind(r.kind()), mr.kind);
         prop_assert_eq!(agent(r.recipient()), mr.recipient);
@@ -474,11 +543,17 @@ fn compare(s: &core::State, ms_: &m::State, now: u64) -> Result<(), TestCaseErro
         prop_assert_eq!(r.issued_at().to_raw(), mr.issued_at.0);
     }
 
-    // Pools (via the core's public accounting view).
+    // Pools (via the core's public accounting view): exactly the model's
+    // present pools.
     let accts = s.accounts_at(core::Tick::from_raw(now)).expect("accounts");
-    prop_assert_eq!(accts.len(), ms_.pools.len());
+    prop_assert_eq!(accts.len(), ms_.pools.iter().filter(|p| !p.pruned).count());
     for a in &accts {
         let mp = &ms_.pools[a.pool.to_raw() as usize];
+        prop_assert!(
+            !mp.pruned,
+            "pruned pool {} present in core",
+            a.pool.to_raw()
+        );
         prop_assert_eq!(a.root.to_raw(), mp.root);
         prop_assert_eq!(a.anchor.to_raw(), mp.anchor);
         prop_assert_eq!(a.initial, mp.initial);
@@ -486,29 +561,70 @@ fn compare(s: &core::State, ms_: &m::State, now: u64) -> Result<(), TestCaseErro
         prop_assert_eq!(a.discarded_explicit, mp.discarded);
     }
 
-    // Spent nonces: the model's entries are exactly the core's set (the
-    // core's map is in bijection with approved roots, see check_invariant).
+    // Spent nonces: every model entry is spent in the core; entries of
+    // present roots match the root's nonce, entries of pruned roots lie
+    // below the floor. Present approved roots are exactly the entries
+    // whose root is present.
     let approved = s
         .roots()
         .filter(|r| matches!(r.kind(), core::RootKind::Approved { .. }))
         .count();
-    prop_assert_eq!(approved, ms_.spent_nonces.len());
+    prop_assert_eq!(
+        approved,
+        ms_.spent_nonces
+            .iter()
+            .filter(|sn| !ms_.roots[sn.root as usize].pruned)
+            .count()
+    );
     for sn in &ms_.spent_nonces {
-        let r = s.root(core::RootId::from_raw(sn.root)).expect("nonce root");
-        match r.kind() {
-            core::RootKind::Approved { nonce: n } => {
-                prop_assert_eq!(nonce(n), sn.nonce);
-                prop_assert!(s.is_nonce_spent(&n));
+        prop_assert!(s.is_nonce_spent(&core_nonce(sn.nonce)));
+        match s.root(core::RootId::from_raw(sn.root)) {
+            Some(r) => match r.kind() {
+                core::RootKind::Approved { nonce: n } => prop_assert_eq!(nonce(n), sn.nonce),
+                core::RootKind::Baseline => prop_assert!(false, "nonce for baseline root"),
+            },
+            None => {
+                prop_assert!(ms_.roots[sn.root as usize].pruned);
+                prop_assert!(sn.root < s.retired_roots_below());
             }
-            core::RootKind::Baseline => prop_assert!(false, "nonce for baseline root"),
         }
     }
+    // The generator's whole nonce space ([k; 32]): spent in the core iff
+    // spent in the model (no extra core entries).
+    for k in 0..=255u8 {
+        let n = core::Nonce::from_bytes([k; 32]);
+        prop_assert_eq!(
+            s.is_nonce_spent(&n),
+            ms_.is_nonce_spent(nonce(n)),
+            "nonce [{}; 32]",
+            k
+        );
+    }
 
-    // Reservations.
+    // Reservations and the request-id index.
+    let present = ms_.reservations.iter().filter(|r| !r.pruned).count();
+    prop_assert_eq!(s.reservations().count(), present);
+    prop_assert_eq!(ms_.n_reservations, present);
     for (i, mr) in ms_.reservations.iter().enumerate() {
-        let r = s
-            .reservation(core::ReservationId::from_raw(i as u64))
-            .expect("reservation present in core");
+        let id = core::ReservationId::from_raw(i as u64);
+        // The index lookup agrees for every (owner, request id) ever used.
+        let owner = core::AgentId::new(mr.owner.epoch, mr.owner.serial);
+        let via = s
+            .reservation_for_request(owner, core::RequestId::from_raw(mr.request_id))
+            .map(|x| x.id().to_raw());
+        prop_assert_eq!(
+            via,
+            ms_.find_request(mr.owner, mr.request_id).map(|k| k as u64)
+        );
+        if mr.pruned {
+            prop_assert!(
+                s.reservation(id).is_none(),
+                "pruned reservation {} present in core",
+                i
+            );
+            continue;
+        }
+        let r = s.reservation(id).expect("reservation present in core");
         prop_assert_eq!(agent(r.owner()), mr.owner);
         prop_assert_eq!(r.request_id().to_raw(), mr.request_id);
         prop_assert_eq!(r.capability().to_raw(), mr.capability);
@@ -517,10 +633,6 @@ fn compare(s: &core::State, ms_: &m::State, now: u64) -> Result<(), TestCaseErro
         prop_assert_eq!(operation(r.operation()), mr.operation);
         prop_assert_eq!(res_status(r.status()), mr.status);
         prop_assert_eq!(r.reserved_at().to_raw(), mr.reserved_at.0);
-        // Request-id index agrees.
-        let via = s
-            .reservation_for_request(r.owner(), r.request_id())
-            .map(|x| x.id().to_raw());
         prop_assert_eq!(via, Some(i as u64));
     }
     prop_assert!(s
@@ -554,6 +666,45 @@ fn run(l: core::Limits, cmds: Vec<(Sym, u8, bool)>) -> Result<(), TestCaseError>
     Ok(())
 }
 
+/// One generated step: a symbol, or the broker's start-up pair
+/// `BumpEpoch` immediately followed by `CompactEpoch` (ADR-0031).
+#[derive(Clone, Debug)]
+enum Step {
+    One(Sym),
+    BumpThenCompact(u64),
+}
+
+fn arb_step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        12 => arb_sym_with_compaction().prop_map(Step::One),
+        1 => (0..60u64).prop_map(Step::BumpThenCompact),
+    ]
+}
+
+fn expand(steps: Vec<(Step, u8, bool)>) -> Vec<(Sym, u8, bool)> {
+    let mut out = Vec::new();
+    for (st, dt, regress) in steps {
+        match st {
+            Step::One(sym) => out.push((sym, dt, regress)),
+            Step::BumpThenCompact(t) => {
+                out.push((Sym::Bump(t), dt, false));
+                out.push((Sym::Compact, 0, false));
+            }
+        }
+    }
+    out
+}
+
+fn tight() -> core::Limits {
+    core::Limits {
+        max_capabilities: 8,
+        max_principals: 4,
+        max_roots: 3,
+        max_reservations: 6,
+        max_lineage_length: 2,
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
@@ -571,14 +722,23 @@ proptest! {
     fn verified_model_agrees_with_core_tight_limits(
         cmds in prop::collection::vec((arb_sym(), 0..3u8, prop::bool::weighted(0.05)), 1..80)
     ) {
-        let l = core::Limits {
-            max_capabilities: 8,
-            max_principals: 4,
-            max_roots: 3,
-            max_reservations: 6,
-            max_lineage_length: 2,
-        };
-        run(l, cmds)?;
+        run(tight(), cmds)?;
+    }
+
+    /// ADR-0031: `CompactEpoch` at random points and right after
+    /// `BumpEpoch`; tight limits make capacity freed by compaction matter.
+    #[test]
+    fn verified_model_agrees_with_core_with_compaction(
+        steps in prop::collection::vec((arb_step(), 0..3u8, prop::bool::weighted(0.05)), 1..120)
+    ) {
+        run(core::Limits::default(), expand(steps))?;
+    }
+
+    #[test]
+    fn verified_model_agrees_with_core_with_compaction_tight_limits(
+        steps in prop::collection::vec((arb_step(), 0..3u8, prop::bool::weighted(0.05)), 1..120)
+    ) {
+        run(tight(), expand(steps))?;
     }
 
     /// Pure functions on arbitrary inputs (not only generator-reachable ones).
@@ -931,4 +1091,71 @@ fn attenuated_ancestor_expiry_agrees() {
         9,
     );
     assert!(s.is_live(c1, core::Tick::from_raw(9)));
+}
+
+/// Guards against a vacuous compaction test: the generator must reach
+/// compactions that actually prune capabilities, pools and reservations
+/// (with stranded balances), operations on the survivors afterwards, and
+/// the denials seen after a compaction (unknown id, re-used nonce).
+#[test]
+fn compaction_generator_coverage() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = prop::collection::vec((arb_step(), 0..3u8, Just(false)), 80..120);
+    let (mut pruning, mut caps, mut pools, mut res, mut stranded) = (0, 0, 0, 0, 0);
+    let (mut after_ok, mut unknown_after, mut nonce_reused_after) = (0, 0, 0);
+    for _ in 0..200 {
+        let cmds = expand(strat.new_tree(&mut runner).unwrap().current());
+        let mut s = core::State::new(core::Limits::default());
+        let mut model = m::State::new(limits(core::Limits::default()));
+        let mut last = core::AuthenticatedCommand::operator(core::AdminCommand::AdvanceClock);
+        let mut compacted = false;
+        for (sym, dt, _) in cmds {
+            let now = match sym {
+                Sym::Bump(t) => t,
+                _ => s.clock().to_raw() + dt as u64,
+            };
+            let cmd = match sym {
+                Sym::RepeatLast => last,
+                _ => Ctx { s: &s, now }.resolve(&sym),
+            };
+            last = cmd;
+            let r = core::step(&mut s, cmd, core::Tick::from_raw(now));
+            let _ = model.step(command(cmd), mq::Tick(now));
+            match &r {
+                Ok(core::Effect::EpochCompacted {
+                    capabilities,
+                    pools: p,
+                    reservations,
+                    initial,
+                    consumed,
+                    discarded,
+                    ..
+                }) if *capabilities > 0 => {
+                    pruning += 1;
+                    compacted = true;
+                    caps += *capabilities;
+                    pools += *p;
+                    res += *reservations;
+                    // Some pruned pool still held units in its records.
+                    if *discarded > 0 && initial > consumed {
+                        stranded += 1;
+                    }
+                }
+                Ok(core::Effect::Reserved(_) | core::Effect::Derived { .. }) if compacted => {
+                    after_ok += 1
+                }
+                Err(core::Denial::UnknownCapability) if compacted => unknown_after += 1,
+                Err(core::Denial::NonceReused) if compacted => nonce_reused_after += 1,
+                _ => {}
+            }
+        }
+    }
+    eprintln!(
+        "pruning compactions {pruning}, pruned caps {caps}, pools {pools}, reservations {res}, \
+         with stranded {stranded}; after: ok {after_ok}, unknown {unknown_after}, nonce reused {nonce_reused_after}"
+    );
+    assert!(pruning >= 50 && caps >= 100 && pools >= 50 && res >= 20 && stranded >= 10);
+    assert!(after_ok >= 50 && unknown_after >= 10 && nonce_reused_after >= 5);
 }

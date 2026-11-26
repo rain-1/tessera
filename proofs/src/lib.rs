@@ -5,8 +5,9 @@
 //! * `scope` mirrors `scope.rs` (FileRights, MethodSet, Scope, Operation,
 //!   `permits`, `is_subset`).
 //! * `ledger` mirrors `state.rs` + `step.rs` (the whole `step` transition
-//!   function, `live`, the pool accounting) over a dense-vector
-//!   representation of the core's `BTreeMap`s.
+//!   function including `CompactEpoch`, `live`, the pool accounting) over
+//!   a dense-vector representation of the core's `BTreeMap`s, with
+//!   tombstones for records removed by compaction.
 //!
 //! The same file is (a) verified by `proofs/run_verus.sh` and (b) compiled
 //! by plain `cargo` with ghost code erased, so that
