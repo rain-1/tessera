@@ -30,6 +30,7 @@
 //!   "launcher": { "init_path": "/usr/libexec/tessera/tessera-sandbox-init",
 //!                 "protected_paths": ["/etc/tessera/anthropic-api-key"],
 //!                 "cgroup_group": "tesserad",
+//!                 "model_socket_dir": "/run/user/1000/tessera",
 //!                 "cgroup_opt_out_reason": null, "landlock": "required" }
 //! }
 //! ```
@@ -105,6 +106,12 @@ pub struct LauncherSection {
     /// always protected.
     #[serde(default)]
     pub protected_paths: Vec<PathBuf>,
+    /// Private directory (owned by the broker's uid, mode 0700, not
+    /// `$XDG_RUNTIME_DIR` or `$HOME` itself) holding the model proxy
+    /// sockets. Every profile `model_route.socket` must lie inside it;
+    /// required when any profile has a model route.
+    #[serde(default)]
+    pub model_socket_dir: Option<PathBuf>,
 }
 
 /// Optional broker limits (defaults from `BrokerConfig`).
@@ -178,8 +185,16 @@ impl DaemonConfig {
         serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Check that every agent spawn profile names a configured profile.
+    /// Check that every agent spawn profile names a configured profile and
+    /// that model routes have a model socket directory.
     pub fn check(&self) -> Result<(), String> {
+        if self.launcher.model_socket_dir.is_none()
+            && let Some((name, _)) = self.profiles.iter().find(|(_, p)| p.model_route.is_some())
+        {
+            return Err(format!(
+                "profile {name:?} has a model_route but launcher.model_socket_dir is not set"
+            ));
+        }
         for (id, p) in &self.agent_spawn_profiles {
             if !self.profiles.contains_key(&p.profile) {
                 return Err(format!(

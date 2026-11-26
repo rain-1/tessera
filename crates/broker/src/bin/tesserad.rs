@@ -123,6 +123,7 @@ fn run() -> Result<(), String> {
         if let Some(p) = &cfg.launcher.init_path {
             lc.init_path = p.clone();
         }
+        lc.model_socket_dir = cfg.launcher.model_socket_dir.clone();
         lc.cgroup_group_name = cfg
             .launcher
             .cgroup_group

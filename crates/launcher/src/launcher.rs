@@ -78,6 +78,12 @@ const PROTECTED_HOST_PATHS: &[&str] = &[
 ];
 /// Host trees under which nothing may be exposed.
 const FORBIDDEN_HOST_TREES: &[&str] = &["/run", "/var/run", "/proc", "/sys", "/dev"];
+/// Words that mark credential-agent sockets and keyrings when they appear
+/// in a path component (split at every non-alphanumeric character, compared
+/// case-insensitively), e.g. `gnupg/S.gpg-agent`, `S.gpg-agent.ssh`,
+/// `openssh_agent`, `.ssh`, `keyring`. Never in a model socket path or the
+/// model socket directory (defence in depth behind `model_socket_dir`).
+const CREDENTIAL_AGENT_WORDS: &[&str] = &["gnupg", "gpg", "keyring", "keyrings", "ssh", "openssh"];
 
 /// Arguments laying out the read-only runtime (`/usr` plus top-level
 /// symlinks or directories such as `/lib64`).
@@ -213,6 +219,62 @@ fn check_host_exposure(what: &str, canon: &Path) -> Result<(), LaunchError> {
     Ok(())
 }
 
+fn credential_agent_component(p: &Path) -> Option<String> {
+    p.components().find_map(|c| match c {
+        Component::Normal(n) => {
+            let n = n.to_string_lossy().to_lowercase();
+            n.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| CREDENTIAL_AGENT_WORDS.contains(&w))
+                .then_some(n)
+        }
+        _ => None,
+    })
+}
+
+fn env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .and_then(|p| fs::canonicalize(p).ok())
+}
+
+/// Validate [`LauncherConfig::model_socket_dir`] and return it canonical.
+fn check_model_socket_dir(dir: &Path) -> Result<PathBuf, LaunchError> {
+    use std::os::unix::fs::MetadataExt;
+    let invalid = |m: String| Err(LaunchError::InvalidProfile(format!("model_socket_dir {m}")));
+    let canon = fs::canonicalize(dir).map_err(|e| {
+        LaunchError::InvalidProfile(format!("model_socket_dir {}: {e}", dir.display()))
+    })?;
+    let md = fs::metadata(&canon)?;
+    let uid = rustix::process::getuid().as_raw();
+    if !md.is_dir() || md.uid() != uid || md.mode() & 0o777 != 0o700 {
+        return invalid(format!(
+            "{} must be a directory owned by uid {uid} with mode 0700",
+            canon.display()
+        ));
+    }
+    for (var, p) in [
+        ("XDG_RUNTIME_DIR", env_dir("XDG_RUNTIME_DIR")),
+        ("HOME", home_dir()),
+    ] {
+        if let Some(p) = p
+            && p.starts_with(&canon)
+        {
+            return invalid(format!(
+                "{} is ${var} or contains it; use a dedicated directory",
+                canon.display()
+            ));
+        }
+    }
+    if let Some(c) = credential_agent_component(&canon) {
+        return invalid(format!(
+            "{} has a credential-agent path component {c:?}",
+            canon.display()
+        ));
+    }
+    Ok(canon)
+}
+
 fn check_protected_paths(source: &Path, protected: &[PathBuf]) -> Result<(), LaunchError> {
     for path in protected {
         if source.starts_with(path) || path.starts_with(source) {
@@ -299,6 +361,10 @@ impl Launcher {
             return Err(LaunchError::MissingMandatoryControl(missing));
         }
         Self::check_runtime_exposure(&config.protected_host_paths)?;
+        let mut config = config;
+        if let Some(dir) = &config.model_socket_dir {
+            config.model_socket_dir = Some(check_model_socket_dir(dir)?);
+        }
         Ok(Self { config, report })
     }
 
@@ -382,12 +448,43 @@ impl Launcher {
         Ok(env.into_iter().collect())
     }
 
+    /// Validate a compatibility-mode model route as [`Launcher::spawn`]
+    /// would, without launching anything (e.g. at daemon start).
+    pub fn validate_model_route(&self, r: &ModelRoute) -> Result<(), LaunchError> {
+        self.check_model_route(r).map(|_| ())
+    }
+
     /// Validate a compatibility-mode model route (fail closed).
     fn check_model_route(&self, r: &ModelRoute) -> Result<CheckedModelRoute, LaunchError> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let invalid = |m: String| LaunchError::InvalidProfile(m);
+        let Some(dir) = &self.config.model_socket_dir else {
+            return Err(invalid(
+                "model routes require LauncherConfig.model_socket_dir".into(),
+            ));
+        };
+        // SSH_AUTH_SOCK is compared before and after resolving symlinks.
+        let ssh_agent = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+        if ssh_agent.as_ref().is_some_and(|p| *p == r.host_socket) {
+            return Err(invalid("model socket is the SSH agent socket".into()));
+        }
         let socket = fs::canonicalize(&r.host_socket)
             .map_err(|e| invalid(format!("model socket {}: {e}", r.host_socket.display())))?;
+        // Only sockets in the operator's dedicated directory: never a host
+        // agent socket such as the GnuPG or SSH agent in $XDG_RUNTIME_DIR.
+        if !socket.starts_with(dir) || socket == *dir {
+            return Err(invalid(format!(
+                "model socket {} is outside model_socket_dir {}",
+                socket.display(),
+                dir.display()
+            )));
+        }
+        if let Some(c) = credential_agent_component(&socket) {
+            return Err(invalid(format!(
+                "model socket {} has a credential-agent path component {c:?}",
+                socket.display()
+            )));
+        }
         let md = fs::symlink_metadata(&socket)?;
         let uid = rustix::process::getuid().as_raw();
         // Only a private socket owned by the launcher's user (the model
@@ -401,7 +498,7 @@ impl Launcher {
         }
         // Never the broker's admin socket or anything else protected.
         check_protected_paths(&socket, &self.config.protected_host_paths)?;
-        if std::env::var_os("SSH_AUTH_SOCK")
+        if ssh_agent
             .and_then(|p| fs::canonicalize(p).ok())
             .is_some_and(|p| p == socket)
         {

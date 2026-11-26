@@ -213,8 +213,19 @@ impl LauncherSpawner {
         mut profiles: HashMap<String, ProfileSpec>,
     ) -> Result<Self, LaunchError> {
         prepare_profiles(&mut profiles, &config.protected_host_paths)?;
+        let launcher = Launcher::new(config)?;
+        // Fail at start, not at the first spawn: every model route must
+        // pass the launcher's checks (socket inside model_socket_dir, ...).
+        for (name, p) in &profiles {
+            if let Some(m) = &p.model_route {
+                let route = m.to_route().map_err(LaunchError::InvalidProfile)?;
+                launcher.validate_model_route(&route).map_err(|e| {
+                    LaunchError::InvalidProfile(format!("profile {name} model route: {e}"))
+                })?;
+            }
+        }
         Ok(LauncherSpawner {
-            launcher: Launcher::new(config)?,
+            launcher,
             profiles,
             running: HashMap::new(),
             on_spawn: None,
@@ -289,8 +300,10 @@ fn prepare_profiles(
             }
             *host = canon;
         }
-        // Compat-mode model route: the socket and netshim must not be (or
-        // lie inside) a protected path such as the admin socket.
+        // Compat-mode model route: the socket and netshim must not be,
+        // contain or lie inside a protected path such as the admin socket,
+        // nor a workspace root (whose per-principal directories are
+        // agent-writable), as for bind sources.
         if let Some(m) = &profile.model_route {
             for path in std::iter::once(&m.socket).chain(&m.netshim_path) {
                 let canon = fs::canonicalize(path).map_err(|e| {
@@ -299,9 +312,13 @@ fn prepare_profiles(
                         path.display()
                     ))
                 })?;
-                if let Some(p) = protected.iter().find(|p| overlapping(&canon, p)) {
+                if let Some(p) = protected
+                    .iter()
+                    .chain(&workspace_roots)
+                    .find(|p| overlapping(&canon, p))
+                {
                     return Err(LaunchError::InvalidProfile(format!(
-                        "profile {name} model route {} overlaps protected host path {}",
+                        "profile {name} model route {} overlaps protected host path or workspace root {}",
                         canon.display(),
                         p.display()
                     )));
@@ -586,6 +603,59 @@ mod tests {
             prepare_profiles(&mut profiles, &protected),
             Err(LaunchError::InvalidProfile(_))
         ));
+    }
+
+    /// Re-review N3: a model socket or netshim inside a workspace root
+    /// (whose per-principal directories agents write) is refused, as a
+    /// bind source there already was.
+    #[test]
+    fn model_route_must_not_overlap_workspace_roots() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let workspaces = root.join("workspaces");
+        let free = root.join("free");
+        fs::create_dir(&workspaces).unwrap();
+        fs::create_dir(&free).unwrap();
+        fs::set_permissions(&workspaces, fs::Permissions::from_mode(0o700)).unwrap();
+        let planted = workspaces.join("e1.s1");
+        fs::create_dir(&planted).unwrap();
+        let bad_sock = planted.join("model.sock");
+        let _b = std::os::unix::net::UnixListener::bind(&bad_sock).unwrap();
+        let bad_shim = planted.join("netshim");
+        fs::write(&bad_shim, "#!/bin/sh\n").unwrap();
+        let good_sock = free.join("model.sock");
+        let _g = std::os::unix::net::UnixListener::bind(&good_sock).unwrap();
+        let good_shim = free.join("netshim");
+        fs::write(&good_shim, "#!/bin/sh\n").unwrap();
+        let alias = root.join("alias.sock");
+        symlink(&bad_sock, &alias).unwrap();
+
+        let route = |socket: &Path, shim: &Path| ModelRouteSpec {
+            socket: socket.to_path_buf(),
+            loopback_port: Some(18080),
+            netshim_path: Some(shim.to_path_buf()),
+        };
+        let mut worker = profile();
+        worker.workspace = Some(workspaces.clone());
+        let mut compat = profile();
+        compat.model_route = Some(route(&good_sock, &good_shim));
+        let mut profiles = HashMap::from([("worker".into(), worker), ("compat".into(), compat)]);
+        prepare_profiles(&mut profiles, &[]).unwrap();
+        for (socket, shim, what) in [
+            (&bad_sock, &good_shim, "socket in a workspace"),
+            (&alias, &good_shim, "symlink to a socket in a workspace"),
+            (&good_sock, &bad_shim, "netshim in a workspace"),
+        ] {
+            profiles.get_mut("compat").unwrap().model_route = Some(route(socket, shim));
+            assert!(
+                matches!(
+                    prepare_profiles(&mut profiles, &[]),
+                    Err(LaunchError::InvalidProfile(_))
+                ),
+                "{what} accepted"
+            );
+        }
     }
 
     #[test]
