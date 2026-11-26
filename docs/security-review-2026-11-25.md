@@ -62,3 +62,21 @@ the PoC printed `ACCEPTED` for all three agent sockets).
 | N2 | Low | launcher.rs `check_model_route` | The model route socket check accepted `/run/user/$UID/gnupg/S.gpg-agent`, `S.gpg-agent.ssh` and `/run/user/$UID/openssh_agent` (private sockets owned by the user). | **FIXED** | `LauncherConfig.model_socket_dir`: owned by our uid, mode 0700, not `$XDG_RUNTIME_DIR` or `$HOME` or an ancestor of either, otherwise the launcher refuses to start. Without it every model route is refused; a socket must resolve to a path inside it. Defence in depth: any path component containing the words `gnupg`, `gpg`, `keyring(s)`, `ssh` or `openssh`, and `$SSH_AUTH_SOCK` (before and after resolving), are refused. `tesserad`: `launcher.model_socket_dir`, required when a profile has a model route; all routes are validated at start. `tessera-launch-run --model-socket-dir`. Examples and `docs/compat.md` updated. | 812b1e2, de37668 | `crates/launcher/tests/model_socket.rs` (`host_agent_sockets_are_refused`, `model_routes_need_a_model_socket_dir`, `model_socket_dir_must_be_private_and_dedicated`), `protected.rs`, `config::tests::model_routes_need_a_model_socket_dir`, `model-proxy` `compat_sandbox.rs` |
 | N3 | Low | broker spawner.rs `prepare_profiles` | Model route socket and netshim paths were checked against protected paths but not against workspace roots (bind sources were). | **FIXED** | Socket and netshim are checked against protected paths and workspace roots (ancestor and descendant, after canonicalisation). | 812b1e2 | `spawner::tests::model_route_must_not_overlap_workspace_roots` |
 | Info | — | broker reactor.rs `emergency_stop` | Emergency stop bumped the epoch but did not compact, so the ended epoch kept its record capacity until the next restart. | **FIXED** | `CompactEpoch` is journaled and then applied after the bump, as at startup. It is deferred until no job of the ended epoch is still on a worker, because such a job may still journal a file-replacement intent or an outcome for its reservation. | 8f1be5a | `rereview_regressions::emergency_stop_compacts_the_ended_epoch` (capacity filled, stop, fresh principal served, journal has `CompactEpoch` after each bump, replay reproduces it), `emergency_stop_compaction_waits_for_jobs_on_a_worker`; `reactor::tests::emergency_stop_after_prepare_preserves_the_exchanged_identity` |
+
+## Provenance of commit fb583ba (audited 2026-11-26)
+
+`fb583ba` ("Harden broker isolation, approvals, and recovery") landed directly
+on `main` without the orchestrator's co-author trailer. An audit traced it to
+an owner-directed OpenAI Codex CLI session (`01a21319-c403-7a43-b516-3a991f7007e3`,
+codex-tui 0.172.0). Codex's sandbox could not write `.git`, so the owner ran
+Codex's suggested commit-and-push from their own terminal.
+
+**Verdict: benign.** The audit found no backdoors, weakened checks, network or
+exfiltration code, dependency or CI changes, or loosened tests. Its
+per-principal approval rate limit was weaker in one respect and was superseded
+by per-domain limits in `8f1be5a`. Everything else survives on `main` in the
+same or a further-hardened form.
+
+**Process note:** agent-suggested `git add -A && commit && push` should not go
+straight to `main`. Use a branch with review, signed commits, and branch
+protection on the remote.
