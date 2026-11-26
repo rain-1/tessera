@@ -57,3 +57,15 @@ toolchain is not available yet, but the core is being written now.
   The production crate is not yet directly verified. Next step: port
   `step.rs` into `verus!` in place, using vstd's `BTreeMap` specs, and
   reuse the mirror's invariant and lemmas.
+
+## Amendment (2026-11-26): compaction proved; production leaf modules verified
+
+`CompactEpoch` is now in the mirror and its invariant preservation is proved.
+The production crate's leaf modules (`budget.rs`, `scope.rs`, `ids.rs`) are
+verified directly. Their annotations are compiled only when Verus sets
+`verus_keep_ghost`, so a normal build is unchanged. `proofs/run_verus.sh`
+reports 173 verified on the mirror and 63 on the production leaves, with 0
+errors, and runs the production stage with `--no-cheating`. The production
+ledger (`state.rs`, `step.rs`) still relies on the differential test
+(assumption A13). The production spec files add assumption A15
+(see `docs/proof-register.md`).

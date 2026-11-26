@@ -1,7 +1,9 @@
 # Traceability matrix (spec §15)
 
 Status as of 2026-11-25 (WP0, broker rows updated in WP3 and in broker
-hardening (ADR-0024), core proof rows updated in WP-verus). The production code is not proved. A
+hardening (ADR-0024), core proof rows updated in WP-verus and WP-verus2). The production leaf modules
+(`budget.rs`, `scope.rs`, `ids.rs`) are verified directly by Verus; the production
+ledger (`state.rs`, `step.rs`) is not proved. A
 function-by-function mirror of the authority core is machine-checked with
 Verus 0.2026.11.02.8bf68ee (`proofs/`). "tested" means CI tests exist in the named crate. Status
 values:
@@ -39,7 +41,7 @@ independent review is resourced (ADR-0021). Proof-register entries live in
 | R8 | Decisions auditable incl. root grant and delegation path | `crates/journal` (`record`, `chain`), `crates/broker` (`audit`, admin `Lineage`/`Tree`/`Audit`, `tessera-admin lineage`) | ADR-0002 (journal hash chain); ADR-0024 (audit hash chain, fsync policy, external checkpoint) | journal chain-verification tests; broker e2e/swarm tests check root id on every effect and no content in audit; `audit::tests::*` (tamper, deletion, consistent rewrite vs checkpoint, torn tail), `broker_audit_log_is_chained_verifiable_and_content_free`; `tessera-admin audit verify` | tested (broker); lineage display manual |
 | R9 | Restart/crash restores no consumed grant, permits no replay | `crates/journal` (`recover`), `crates/broker` (`reactor::open`, epoch bump, `Dispatched` marker) | T10. Model: `NoResurrection`, `RestartInvalidatesGrants`, `NoReplayAfterCrash` (variants `no-epoch-bump`, `replay-after-crash`, `volatile-nonces` caught) | `crates/broker/tests/crash.rs` (kill before/after consume commit, after marker, after dispatch, after outcome, around mint; fsync failure; torn tail), `file_backed_journal_restart_resurrects_nothing`; startup `CompactEpoch` keeps nonces and frees capacity (ADR-0031: `review_regressions::finding3_record_exhaustion_does_not_survive_restart`, core `compaction_*`, model `core_refines_reference_model_with_compaction*`); startup sweep of earlier-epoch sandbox cgroups, fail closed (`crates/launcher/tests/sweep.rs`, ADR-0024) | model-checked (protocol); tested (fault injection, in-memory storage; sweep on real cgroups) |
 | R10 | Unsupported enforcement fails closed | `crates/launcher` (`probe`) | ADR-0005, ADR-0018 | `missing_seccomp_refuses`, `landlock_required_missing_refuses` (PE-23) | planned |
-| R11 | Small deterministic core with executable proofs | `crates/capability-core` | `proofs/` (Verus 0.2026.11.02.8bf68ee, ADR-0008 amendment) | proptest vs reference model; differential test vs the verified mirror | machine-checked (Verus, mirrored model); production crate not directly verified |
+| R11 | Small deterministic core with executable proofs | `crates/capability-core` | `proofs/` (Verus 0.2026.11.02.8bf68ee, ADR-0008 amendment) | proptest vs reference model; differential test vs the verified mirror | machine-checked (Verus: mirrored model incl. `CompactEpoch`; production `budget`/`scope`/`ids` verified directly); production ledger tested against the mirror |
 | R12 | Existing harnesses run unmodified where possible | `crates/launcher` (`ModelRoute` compat profile), `crates/model-proxy`, `crates/broker` (`model_route`), `crates/cli` (`run`), `crates/sdk` | ADR-0030 | `crates/model-proxy/tests/compat_sandbox.rs`; `examples/compat/run-claude.sh` (unmodified Claude Code against a local fake upstream, `docs/compat.md`) | compat mode implemented (P5); Codex path covered by the shim test only |
 
 ## Theorems
