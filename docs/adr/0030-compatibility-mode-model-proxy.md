@@ -3,8 +3,9 @@
 - Status: Accepted. Implemented in `crates/model-proxy`
   (`tessera-model-proxy`, `tessera-netshim`), `crates/launcher`
   (`ModelRoute`, `--allow-tcp-port`) and `crates/broker` (`model_route`).
-  Tested (unit, local TLS upstream, real sandboxes); not proved; the proxy
-  has not been independently reviewed.
+  Tested (unit, local TLS upstream, real sandboxes); not proved. Amended
+  after the proxy security review of 2026-11-26 (see "Amendment" below and
+  `docs/security-review-2026-11-26-model-proxy.md`).
 - Spec: §3.1, §10.1 (model API connectivity), §12.3, WP6. Implements and
   refines ADR-0020. Threat model R-2, PE-08, PE-09, B-10.
 
@@ -100,8 +101,61 @@ connect.
   nothing.
 - Harness-internal permission modes stay outside the trusted path
   (§12.3). `compromised_harness_stays_contained` exercises this.
-- The proxy is a new trusted component and needs independent review
-  (ADR-0021).
+- The proxy is a new trusted component. It was reviewed on 2026-11-26;
+  the amendment below records the resulting changes.
+
+## Amendment: model proxy security review (2026-11-26)
+The review found that the decision above bounded *where* requests go but
+not enough of *how much* a sandbox can make the proxy do, or *what* the
+provider does with a request. Decision 1 is amended as follows. Findings,
+tests and status are in `docs/security-review-2026-11-26-model-proxy.md`.
+
+- **Admission before buffering (F-1).** A request takes one of the
+  sandbox's `max_concurrent` in-flight slots before its body is read.
+  Rate and lifetime totals are charged after the read. The default
+  `max_request_body` is 4 MiB. `request_header_timeout_ms` (default 30 s,
+  including keep-alive idle time) bounds the request head, and
+  `request_read_timeout_ms` bounds the body. Buffered request memory per
+  sandbox is at most `max_concurrent × max_request_body`.
+- **Audit volume (F-2).** "One JSON line per request" now applies only to
+  admitted requests, which the request budget bounds. Refused connections
+  and locally denied requests go through a per-sandbox token bucket
+  (`audit_denials_per_second`, `audit_denials_burst`). Lines over the
+  limit are counted and summarised every `audit_summary_interval_ms` as
+  `suppressed:<outcome>` with a count.
+- **Two records per forwarded request (F-3).** A `forwarded` record (with
+  `id`, sizes and the request digest) is written before the upstream is
+  contacted, and a completion record with the same `id` follows. A crash,
+  hang or kill after forwarding cannot leave an unaudited request. The
+  response pump bounds its sends to the sandbox by the idle timeout and
+  the `max_duration` deadline. It stops when the sandbox closes, closes a
+  sandbox connection that stopped reading, and releases the permit and
+  the upstream connection on every path. A stream that stops early ends
+  with an error, never with a clean chunked terminator.
+- **Path rules shared with the HTTPS adapter (F-4).** Paths are checked
+  with `tessera_adapter_https::clean_path`. It refuses `;`, malformed
+  escapes, double encoding and segments that decode to dot segments.
+- **Request headers are an allowlist (F-5).** It replaces "forward all
+  but a denylist". The default is `content-type`, `accept`, `user-agent`,
+  `anthropic-version` and `anthropic-beta`. `anthropic-beta` values pass
+  only if listed in `anthropic_beta_allow`, which is empty by default.
+  Request `content-encoding` other than `identity` is refused (415).
+- **Optional JSON body policy (S-1, S-2).** It refuses `mcp_servers` (and
+  other configured top-level keys), any `tools[].type` outside an
+  allowlist (default `custom`, `function`), duplicate JSON keys and
+  non-object bodies. Optionally, it caps `max_tokens` per request and
+  restricts `model`. It is on in the shipped examples. It is **defence in
+  depth that depends on provider API shapes**. Provider-side tools as an
+  egress path are recorded as threat-model residual risk R-15.
+- **Error detail (S-3).** Errors returned to the sandbox carry generic
+  reasons. `destination_forbidden` no longer includes the resolved
+  address, which is kept in the host audit log.
+
+Consequences of the amendment: harnesses that relied on unlisted headers,
+betas or server-side tools lose those features (for example, Claude
+Code's `WebSearch`). The audit format gained `id` and `suppressed`, and
+consumers must pair `forwarded` with its completion record. Default
+deployments buffer less and refuse earlier.
 
 ## Related launcher hardening (security review 2026-11-25)
 These changes landed with this work package because they touch the same

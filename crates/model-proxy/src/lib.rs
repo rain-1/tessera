@@ -14,19 +14,26 @@
 //! * only allowlisted method + path routes are forwarded; absolute-form,
 //!   CONNECT and upgrade requests are refused; redirects are returned, never
 //!   followed;
-//! * client-supplied credentials (`authorization`, `x-api-key`, cookies,
-//!   ...) are stripped and the host-held credential is injected
+//! * request headers are an allowlist (`anthropic-beta` values too);
+//!   client-supplied credentials (`authorization`, `x-api-key`, cookies,
+//!   ...) are always stripped and the host-held credential is injected
 //!   (`x-api-key` or `authorization: Bearer`); it never enters the sandbox;
+//! * an optional JSON body policy ([`body`]) refuses provider-side tools
+//!   that would make the provider reach other hosts (`mcp_servers`,
+//!   server-side `tools[].type`) and can cap `max_tokens` and the model;
 //! * response headers carrying the credential are dropped and the body is
 //!   scanned (with `accept-encoding: identity` forced upstream) so that a
 //!   verbatim echo of the credential is replaced by
 //!   [`secret::REDACTED`]; transformed echoes are a documented residual risk;
 //! * responses, including server-sent events, are streamed;
 //! * request size, response size, request rate, concurrency and lifetime
-//!   byte/request budgets are bounded per sandbox;
-//! * one JSON audit line per request (method, path, sizes, digests, status,
-//!   sandbox label) — never bodies, header values, query strings or the
-//!   credential.
+//!   byte/request budgets are bounded per sandbox; the concurrency slot is
+//!   taken before a request body is read;
+//! * JSON audit lines (method, path, sizes, digests, status, sandbox label):
+//!   a `forwarded` record before contacting the upstream and a completion
+//!   record after it; locally refused connections and requests are rate
+//!   limited and summarised. Never bodies, header values, query strings or
+//!   the credential.
 //!
 //! # This is an unlimited-use baseline channel
 //!
