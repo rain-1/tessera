@@ -14,12 +14,16 @@
 # Usage: scripts/demo.sh            (builds debug binaries first)
 #   TESSERA_BIN=/path/to/bin-dir    use prebuilt binaries
 #   KEEP=1                          keep the temporary directory
+#   FIDO2_DEVICE=/dev/hidrawN       use a real FIDO2 token (libfido2 tools
+#                                   fido2-cred/fido2-assert must be installed);
+#                                   you will be asked to touch it twice
 # Exit status: 0 success, 3 sandbox controls missing on this host, 1 failure.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 bin="${TESSERA_BIN:-}"
 if [ -z "$bin" ]; then
-    (cd "$root" && cargo build -q -p tessera-broker -p tessera-cli -p tessera-launcher --bins)
+    feat=""; [ -n "${FIDO2_DEVICE:-}" ] && feat="--features tessera-broker/fido2-cli"
+    (cd "$root" && cargo build -q -p tessera-broker -p tessera-cli -p tessera-launcher --bins $feat)
     bin="$root/target/debug"
 fi
 for b in tesserad tessera-admin tessera tessera-sandbox-init; do
@@ -107,7 +111,9 @@ start_daemon
 admin status
 
 step "enroll an operator credential (software key: DEVELOPMENT ONLY)"
-admin enroll --key "$work/operator.key"
+if [ -n "${FIDO2_DEVICE:-}" ]; then auth=(--fido2 "$FIDO2_DEVICE"); echo "touch the token to enroll" >&2
+else auth=(--key "$work/operator.key"); fi
+admin enroll "${auth[@]}"
 
 step "register the file slot notes.txt"
 obj=$(admin register-file notes.txt --max-read 4096 --max-write 0 | sed -n 's/^id //p')
@@ -129,7 +135,8 @@ for _ in $(seq 200); do
 done
 [ -n "$ticket" ] || { echo "no approval request arrived" >&2; cat "$work/tesserad.log" >&2; exit 1; }
 admin pending
-admin approve "$ticket" --key "$work/operator.key" --yes
+[ -n "${FIDO2_DEVICE:-}" ] && echo "touch the token to approve" >&2
+admin approve "$ticket" "${auth[@]}" --yes
 
 for _ in $(seq 200); do [ -e "$ws/done" ] && break; sleep 0.1; done
 [ -e "$ws/done" ] || { echo "agent did not finish" >&2; exit 1; }
