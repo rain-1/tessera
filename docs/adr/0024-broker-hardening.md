@@ -82,6 +82,10 @@ outcome is journaled). Over either: `RateLimited` under the request's
 correlation id, not forwarded, not bound. One principal cannot fill the
 shared writer inbox.
 
+> Amended by [ADR-0033](0033-orchestration-domain-quotas.md): the pending
+> cap, the rotation and the rate window below now apply per orchestration
+> domain, with a fair share of the approval slots.
+
 The broker permits two distinct pending approvals per principal by default,
 counting the active one. The shared waiting queue is bounded at 16. Prompts
 rotate among queued principals and preserve request order within each

@@ -178,7 +178,7 @@ fn revoke_vs_consume_race_matches_a_serial_order() {
         assert!(t.consumes.values().all(|s| *s < r), "consume after revoke");
         // (2) Nothing was handed to an adapter after the revoke's commit.
         // A reservation journaled before the revoke but still waiting for a
-        // dispatch slot (per-principal dispatch cap) is resolved as failed,
+        // dispatch slot (per-domain dispatch cap) is resolved as failed,
         // never dispatched.
         assert!(t.dispatched.iter().all(|s| *s < r), "dispatch after revoke");
         assert!(t.dispatched.len() <= t.consumes.len());

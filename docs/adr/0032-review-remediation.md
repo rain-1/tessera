@@ -66,6 +66,10 @@ can therefore hold at most `max_dispatch_per_agent` workers per principal.
 Per-domain limits are not implemented (a domain of N principals can hold N ×
 the cap, bounded by `max_domain_agents`).
 
+> Amended by [ADR-0033](0033-orchestration-domain-quotas.md): the cap is now
+> `max_dispatch_per_domain`, per orchestration domain, and release is
+> round-robin across domains (re-review 2026-11-26).
+
 ## Evidence
 - Finding 1: `crates/broker/tests/workspace_isolation_e2e.rs` (real
   sandboxes from one profile; the corpus probes
