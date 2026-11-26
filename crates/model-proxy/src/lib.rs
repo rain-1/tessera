@@ -44,6 +44,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod body;
 pub mod budget;
 pub mod config;
 pub mod policy;

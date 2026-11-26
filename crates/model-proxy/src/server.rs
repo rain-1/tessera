@@ -7,11 +7,14 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
-use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderValue, UPGRADE};
+use http::header::{
+    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderValue, UPGRADE,
+};
 use http::{Method, Request, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
@@ -21,12 +24,13 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
-use crate::audit::{AuditRecord, AuditSink, hex, now_ms, sanitise};
+use crate::audit::{AuditRecord, AuditSink, EventLimiter, hex, sanitise};
+use crate::body::BodyPolicy;
 use crate::budget::Budget;
 use crate::config::{ConfigError, LimitsConfig, ProxyConfig, SandboxConfig, ms};
-use crate::policy::{Denial, HeaderPolicy, Route, origin_form, route_allows};
+use crate::policy::{Denial, HeaderPolicy, Route, find_route, origin_form};
 use crate::secret::{Credential, Redactor};
 use crate::upstream::{AbortOnDrop, Upstream, UpstreamError};
 
@@ -34,14 +38,18 @@ use crate::upstream::{AbortOnDrop, Upstream, UpstreamError};
 const MAX_CONNECTIONS_PER_SANDBOX: usize = 64;
 /// First byte of a TLS record carrying a handshake.
 const TLS_HANDSHAKE: u8 = 0x16;
+/// Response chunks buffered between a pump and the sandbox connection.
+const STREAM_CHANNEL_CHUNKS: usize = 8;
 
 struct Inner {
     upstream: Upstream,
     credential: Credential,
     routes: Vec<Route>,
     headers: HeaderPolicy,
+    body_policy: Option<BodyPolicy>,
     limits: LimitsConfig,
     audit: AuditSink,
+    next_id: AtomicU64,
 }
 
 /// The trusted model proxy. Cheap to clone.
@@ -101,6 +109,7 @@ impl ModelProxy {
             &cfg.strip_request_headers,
             cfg.forward_request_headers.as_deref(),
             &cfg.strip_response_headers,
+            &cfg.anthropic_beta_allow,
         )
         .map_err(ConfigError)?;
         Ok(Self {
@@ -109,8 +118,10 @@ impl ModelProxy {
                 credential,
                 routes: cfg.compile_routes()?,
                 headers,
+                body_policy: cfg.body_policy.as_ref().map(BodyPolicy::new),
                 limits: cfg.limits.clone(),
                 audit,
+                next_id: AtomicU64::new(1),
             }),
         })
     }
@@ -145,9 +156,23 @@ impl ModelProxy {
     /// Accept and serve connections forever.
     pub async fn serve(&self, l: SandboxListener) -> io::Result<()> {
         let conns = Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_SANDBOX));
-        let label: Arc<str> = Arc::from(l.label.as_str());
+        let limits = &self.inner.limits;
+        let ctx = Arc::new(SandboxCtx {
+            label: l.label.clone(),
+            budget: Arc::clone(&l.budget),
+            events: EventLimiter::new(limits.audit_denials_per_second, limits.audit_denials_burst),
+        });
+        let mut summary = tokio::time::interval(ms(limits.audit_summary_interval_ms));
+        summary.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let stream = match l.listener.accept().await {
+            let accepted = tokio::select! {
+                _ = summary.tick() => {
+                    self.flush_suppressed(&ctx);
+                    continue;
+                }
+                r = l.listener.accept() => r,
+            };
+            let stream = match accepted {
                 Ok((s, _)) => s,
                 Err(_) => {
                     // EMFILE and friends: back off instead of spinning.
@@ -160,130 +185,124 @@ impl ModelProxy {
                 .map(|c| l.peer_uids.contains(&c.uid()))
                 .unwrap_or(false);
             if !uid_ok {
-                self.local_event(&label, "denied:peer_uid");
+                self.local_event(&ctx, "denied:peer_uid");
                 continue;
             }
             let Ok(permit) = Arc::clone(&conns).try_acquire_owned() else {
-                self.local_event(&label, "denied:too_many_connections");
+                self.local_event(&ctx, "denied:too_many_connections");
                 continue;
             };
             let this = self.clone();
-            let budget = Arc::clone(&l.budget);
-            let label = Arc::clone(&label);
+            let ctx = Arc::clone(&ctx);
             tokio::spawn(async move {
-                this.connection(stream, label, budget).await;
+                this.connection(stream, ctx).await;
                 drop(permit);
             });
         }
     }
 
-    fn local_event(&self, label: &str, outcome: &str) {
-        (self.inner.audit)(&AuditRecord {
-            ts_ms: now_ms(),
-            sandbox: label.to_owned(),
-            method: "-".into(),
-            path: "-".into(),
-            query_len: 0,
-            status: 0,
-            outcome: outcome.into(),
-            request_bytes: 0,
-            request_sha256: String::new(),
-            response_bytes: 0,
-            response_sha256: String::new(),
-            upstream_peer: None,
-            redactions: 0,
-            duration_ms: 0,
-        });
+    /// Audit a locally refused connection or request, subject to the
+    /// sandbox's audit rate limit (review 2026-11-26, F-2).
+    fn audit_limited(&self, ctx: &SandboxCtx, rec: &AuditRecord) {
+        if ctx.events.allow(&rec.outcome) {
+            (self.inner.audit)(rec);
+        }
     }
 
-    async fn connection(&self, mut stream: UnixStream, label: Arc<str>, budget: Arc<Budget>) {
+    fn local_event(&self, ctx: &SandboxCtx, outcome: &str) {
+        self.audit_limited(ctx, &AuditRecord::event(&ctx.label, outcome.to_owned()));
+    }
+
+    /// Write one `suppressed:<outcome>` summary per outcome with lines
+    /// suppressed since the last summary.
+    fn flush_suppressed(&self, ctx: &SandboxCtx) {
+        for (outcome, n) in ctx.events.take_suppressed() {
+            let mut rec = AuditRecord::event(&ctx.label, format!("suppressed:{outcome}"));
+            rec.suppressed = n;
+            (self.inner.audit)(&rec);
+        }
+    }
+
+    async fn connection(&self, mut stream: UnixStream, ctx: Arc<SandboxCtx>) {
         let limits = &self.inner.limits;
-        let read_timeout = ms(limits.request_read_timeout_ms);
         let mut first = [0u8; 1];
-        match tokio::time::timeout(read_timeout, stream.read(&mut first)).await {
+        match tokio::time::timeout(
+            ms(limits.request_header_timeout_ms),
+            stream.read(&mut first),
+        )
+        .await
+        {
             Ok(Ok(1)) => {}
             _ => return,
         }
         if first[0] == TLS_HANDSHAKE {
             // The harness tried TLS over the socket; tell the operator how to
             // fix the configuration (e.g. ANTHROPIC_BASE_URL=http://localhost).
-            self.local_event(&label, "denied:tls_on_plain_http_socket");
+            self.local_event(&ctx, "denied:tls_on_plain_http_socket");
             return;
         }
         let io = TokioIo::new(Prefixed {
             first: Some(first[0]),
             inner: stream,
         });
+        // Signalled by a pump that gave up on a sandbox that stopped reading:
+        // the connection is then closed even though hyper is blocked writing.
+        let kill = Arc::new(Notify::new());
         let this = self.clone();
+        let svc_kill = Arc::clone(&kill);
         let svc = service_fn(move |req| {
             let this = this.clone();
-            let label = Arc::clone(&label);
-            let budget = Arc::clone(&budget);
-            async move { Ok::<_, Infallible>(this.handle(req, &label, &budget).await) }
+            let ctx = Arc::clone(&ctx);
+            let kill = Arc::clone(&svc_kill);
+            async move { Ok::<_, Infallible>(this.handle(req, &ctx, kill).await) }
         });
-        let _ = hyper::server::conn::http1::Builder::new()
+        let conn = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
-            .header_read_timeout(read_timeout)
+            .header_read_timeout(ms(limits.request_header_timeout_ms))
             .max_buf_size(limits.max_header_bytes.max(8192))
             .max_headers(limits.max_headers)
             .keep_alive(true)
-            .serve_connection(io, svc)
-            .await;
+            .serve_connection(io, svc);
+        tokio::select! {
+            _ = conn => {}
+            () = kill.notified() => {}
+        }
     }
 
     async fn handle(
         &self,
         req: Request<Incoming>,
-        label: &str,
-        budget: &Arc<Budget>,
+        ctx: &SandboxCtx,
+        kill: Arc<Notify>,
     ) -> Response<ProxyBody> {
         let start = Instant::now();
         let mut rec = AuditRecord {
-            ts_ms: now_ms(),
-            sandbox: label.to_owned(),
-            method: sanitise(req.method().as_str(), 16),
+            id: self.inner.next_id.fetch_add(1, Ordering::Relaxed),
             path: sanitise(req.uri().path(), 256),
+            method: sanitise(req.method().as_str(), 16),
             query_len: req.uri().query().map_or(0, str::len),
-            status: 0,
-            outcome: String::new(),
-            request_bytes: 0,
-            request_sha256: String::new(),
-            response_bytes: 0,
-            response_sha256: String::new(),
-            upstream_peer: None,
-            redactions: 0,
-            duration_ms: 0,
+            ..AuditRecord::event(&ctx.label, String::new())
         };
-        match self.forward(req, budget, &mut rec, start).await {
+        match self.forward(req, ctx, kill, &mut rec, start).await {
             Ok(resp) => resp,
             Err(Failure::Denied(d)) => {
-                let r = self.local_response(d.status(), "tessera_proxy_denied", &d.reason());
-                self.finish(
-                    &mut rec,
-                    start,
-                    d.status(),
-                    format!("denied:{}", d.reason()),
-                );
-                r
+                // Nothing reached the upstream: rate-limited audit (F-2).
+                rec.status = d.status();
+                rec.outcome = format!("denied:{}", d.reason());
+                rec.duration_ms = start.elapsed().as_millis() as u64;
+                self.audit_limited(ctx, &rec);
+                self.local_response(d.status(), "tessera_proxy_denied", &d.reason())
             }
             Err(Failure::Upstream(e)) => {
-                let r = self.local_response(e.status(), "api_error", &e.reason());
-                self.finish(
-                    &mut rec,
-                    start,
-                    e.status(),
-                    format!("upstream:{}", e.reason()),
-                );
-                r
+                // After admission: bounded by the request budget; always
+                // audited, with the detailed reason (S-3) only here.
+                rec.status = e.status();
+                rec.outcome = format!("upstream:{}", e.reason());
+                rec.duration_ms = start.elapsed().as_millis() as u64;
+                (self.inner.audit)(&rec);
+                self.local_response(e.status(), "api_error", &e.client_reason())
             }
         }
-    }
-
-    fn finish(&self, rec: &mut AuditRecord, start: Instant, status: u16, outcome: String) {
-        rec.status = status;
-        rec.outcome = outcome;
-        rec.duration_ms = start.elapsed().as_millis() as u64;
-        (self.inner.audit)(rec);
     }
 
     fn local_response(&self, status: u16, kind: &str, reason: &str) -> Response<ProxyBody> {
@@ -306,7 +325,8 @@ impl ModelProxy {
     async fn forward(
         &self,
         req: Request<Incoming>,
-        budget: &Arc<Budget>,
+        ctx: &SandboxCtx,
+        kill: Arc<Notify>,
         rec: &mut AuditRecord,
         start: Instant,
     ) -> Result<Response<ProxyBody>, Failure> {
@@ -316,8 +336,18 @@ impl ModelProxy {
         if method == Method::CONNECT || req.headers().contains_key(UPGRADE) {
             return Err(Denial::UpgradeNotAllowed.into());
         }
-        if !route_allows(&inner.routes, &method, &path, query.is_some()) {
-            return Err(Denial::RouteNotAllowed.into());
+        let route = find_route(&inner.routes, &method, &path, query.is_some())
+            .ok_or(Denial::RouteNotAllowed)?;
+        // F-5: a compressed body would be counted compressed by the byte
+        // budget and could not be inspected by the body policy.
+        for v in req.headers().get_all(CONTENT_ENCODING) {
+            let identity = v.to_str().is_ok_and(|v| {
+                v.split(',')
+                    .all(|t| t.trim().eq_ignore_ascii_case("identity"))
+            });
+            if !identity {
+                return Err(Denial::ContentEncoding.into());
+            }
         }
         let max_body = inner.limits.max_request_body;
         let declared = req
@@ -328,6 +358,10 @@ impl ModelProxy {
         if declared.is_some_and(|n| n > max_body) {
             return Err(Denial::BodyTooLarge.into());
         }
+        // F-1: take the in-flight slot before buffering the body, so
+        // `max_concurrent` bounds request memory per sandbox. The permit
+        // lives until the response is finished (pump) or this returns.
+        let permit = ctx.budget.acquire()?;
         let (parts, body) = req.into_parts();
         let limit = usize::try_from(max_body).unwrap_or(usize::MAX);
         let read = Limited::new(body, limit).collect();
@@ -342,7 +376,13 @@ impl ModelProxy {
         };
         rec.request_bytes = body.len() as u64;
         rec.request_sha256 = hex(&Sha256::digest(&body));
-        let permit = budget.admit(body.len() as u64)?;
+        // S-1 / S-2: optional JSON body policy.
+        if let Some(policy) = &inner.body_policy
+            && route.json_body
+        {
+            policy.check(&body, route.token_cap)?;
+        }
+        ctx.budget.charge(body.len() as u64)?;
 
         let target = match &query {
             Some(q) => format!("{path}?{q}"),
@@ -364,6 +404,12 @@ impl ModelProxy {
             inner.credential.header_name(),
             inner.credential.header_value(),
         );
+
+        // F-3: the request is on record before anything is sent upstream,
+        // whatever happens to the exchange afterwards.
+        rec.outcome = "forwarded".into();
+        rec.duration_ms = start.elapsed().as_millis() as u64;
+        (inner.audit)(rec);
 
         let deadline = tokio::time::Instant::from_std(start) + inner.upstream.max_duration;
         let mut conn = inner.upstream.connect().await?;
@@ -387,8 +433,12 @@ impl ModelProxy {
         }
         let secret = inner.credential.secret();
         let out_headers = inner.headers.filter_response(resp.headers(), secret);
-        let (tx, rx) = mpsc::channel(32);
-        let mut out = Response::new(ProxyBody::Stream(rx));
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CHUNKS);
+        let complete = Arc::new(AtomicBool::new(false));
+        let mut out = Response::new(ProxyBody(Inner_::Stream {
+            rx,
+            complete: Arc::clone(&complete),
+        }));
         *out.status_mut() = status;
         *out.headers_mut() = out_headers;
         rec.status = status.as_u16();
@@ -397,22 +447,25 @@ impl ModelProxy {
             proxy: self.clone(),
             body: resp.into_body(),
             tx,
+            complete,
+            kill,
             redactor: Redactor::new(secret),
-            budget: Arc::clone(budget),
-            _permit: permit,
-            _driver: conn.driver,
+            budget: Arc::clone(&ctx.budget),
+            permit,
+            driver: conn.driver,
             deadline,
             start,
         };
-        tokio::spawn(pump.run(std::mem::replace(
-            rec,
-            AuditRecord {
-                outcome: "handed_to_pump".into(),
-                ..rec.clone()
-            },
-        )));
+        tokio::spawn(pump.run(rec.clone()));
         Ok(out)
     }
+}
+
+/// Per-sandbox state shared by its connections.
+struct SandboxCtx {
+    label: String,
+    budget: Arc<Budget>,
+    events: EventLimiter,
 }
 
 enum Failure {
@@ -436,85 +489,124 @@ impl From<UpstreamError> for Failure {
 struct Pump {
     proxy: ModelProxy,
     body: Incoming,
-    tx: mpsc::Sender<Result<Bytes, io::Error>>,
+    tx: mpsc::Sender<Bytes>,
+    /// Set only when the whole body was delivered; otherwise the sandbox
+    /// sees an error instead of a clean end of the chunked body.
+    complete: Arc<AtomicBool>,
+    /// Closes the sandbox connection when the sandbox stopped reading.
+    kill: Arc<Notify>,
     redactor: Redactor,
     budget: Arc<Budget>,
-    _permit: OwnedSemaphorePermit,
-    _driver: AbortOnDrop,
+    permit: OwnedSemaphorePermit,
+    driver: AbortOnDrop,
     deadline: tokio::time::Instant,
     start: Instant,
 }
 
 impl Pump {
-    async fn run(mut self, mut rec: AuditRecord) {
-        let limits = self.proxy.inner.limits.clone();
-        let idle = self.proxy.inner.upstream.idle_timeout;
+    /// Every exit path is bounded by the idle timeout and the exchange's
+    /// `max_duration` deadline, on both the upstream read and the sandbox
+    /// send (review 2026-11-26, F-3); the permit, the upstream connection
+    /// and the completion record are released/written on every path.
+    async fn run(self, mut rec: AuditRecord) {
+        let Pump {
+            proxy,
+            mut body,
+            tx,
+            complete,
+            kill,
+            mut redactor,
+            budget,
+            permit,
+            driver,
+            deadline,
+            start,
+        } = self;
+        let max_response = proxy.inner.limits.max_response_body;
+        let idle = proxy.inner.upstream.idle_timeout;
+        let expired = |reason: &'static str| {
+            if tokio::time::Instant::now() >= deadline {
+                "aborted:max_duration"
+            } else {
+                reason
+            }
+        };
         let mut hasher = Sha256::new();
         let mut sent: u64 = 0;
-        let mut outcome: Option<String> = None;
-        loop {
-            let wait = self.deadline.min(tokio::time::Instant::now() + idle);
-            let (chunk, done) = match tokio::time::timeout_at(wait, self.body.frame()).await {
-                Err(_) => {
-                    outcome = Some("aborted:upstream_timeout".into());
-                    break;
-                }
-                Ok(None) => (self.redactor.finish(), true),
-                Ok(Some(Err(_))) => {
-                    outcome = Some("aborted:upstream_error".into());
-                    break;
-                }
+        let outcome: Option<&'static str> = loop {
+            let wait = deadline.min(tokio::time::Instant::now() + idle);
+            let frame = tokio::select! {
+                biased;
+                () = tx.closed() => break Some("aborted:client_gone"),
+                r = tokio::time::timeout_at(wait, body.frame()) => r,
+            };
+            let (chunk, last) = match frame {
+                Err(_) => break Some(expired("aborted:upstream_timeout")),
+                Ok(None) => (redactor.finish(), true),
+                Ok(Some(Err(_))) => break Some("aborted:upstream_error"),
                 Ok(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(data) => (self.redactor.feed(&data), false),
+                    Ok(data) => (redactor.feed(&data), false),
                     Err(_) => continue, // trailers are dropped
                 },
             };
             if !chunk.is_empty() {
                 let n = chunk.len() as u64;
-                if sent.saturating_add(n) > limits.max_response_body {
-                    outcome = Some("aborted:response_too_large".into());
-                    break;
+                if sent.saturating_add(n) > max_response {
+                    break Some("aborted:response_too_large");
                 }
-                if !self.budget.charge_response(n) {
-                    outcome = Some("aborted:budget_exhausted:response_bytes".into());
-                    break;
+                if !budget.charge_response(n) {
+                    break Some("aborted:budget_exhausted:response_bytes");
                 }
                 hasher.update(&chunk);
                 sent += n;
-                if self.tx.send(Ok(chunk)).await.is_err() {
-                    outcome = Some("aborted:client_gone".into());
-                    break;
+                let wait = deadline.min(tokio::time::Instant::now() + idle);
+                match tokio::time::timeout_at(wait, tx.send(chunk)).await {
+                    Err(_) => break Some(expired("aborted:client_stalled")),
+                    Ok(Err(_)) => break Some("aborted:client_gone"),
+                    Ok(Ok(())) => {}
                 }
             }
-            if done {
-                break;
+            if last {
+                break None;
             }
+        };
+        if outcome.is_none() {
+            complete.store(true, Ordering::Release);
         }
-        if let Some(reason) = &outcome {
-            // Terminate the chunked response abnormally so the client sees a
-            // truncated body rather than a clean end.
-            let _ = self.tx.send(Err(io::Error::other(reason.clone()))).await;
+        drop(tx);
+        drop(driver);
+        drop(permit);
+        if matches!(
+            outcome,
+            Some("aborted:client_stalled" | "aborted:max_duration")
+        ) {
+            kill.notify_one();
         }
         rec.response_bytes = sent;
         rec.response_sha256 = hex(&hasher.finalize());
-        rec.redactions = self.redactor.hits;
-        rec.outcome = outcome.unwrap_or_else(|| "ok".into());
-        rec.duration_ms = self.start.elapsed().as_millis() as u64;
-        (self.proxy.inner.audit)(&rec);
+        rec.redactions = redactor.hits;
+        rec.outcome = outcome.unwrap_or("ok").into();
+        rec.duration_ms = start.elapsed().as_millis() as u64;
+        (proxy.inner.audit)(&rec);
     }
 }
 
 /// Response body returned to the sandbox.
-pub enum ProxyBody {
+pub struct ProxyBody(Inner_);
+
+enum Inner_ {
     /// A complete local body.
     Full(Option<Bytes>),
     /// Streamed from the upstream by a pump task.
-    Stream(mpsc::Receiver<Result<Bytes, io::Error>>),
+    Stream {
+        rx: mpsc::Receiver<Bytes>,
+        complete: Arc<AtomicBool>,
+    },
 }
 
 impl ProxyBody {
     fn full(b: Bytes) -> Self {
-        Self::Full(Some(b))
+        Self(Inner_::Full(Some(b)))
     }
 }
 
@@ -526,21 +618,30 @@ impl Body for ProxyBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        match self.get_mut() {
-            Self::Full(b) => Poll::Ready(b.take().map(|b| Ok(Frame::data(b)))),
-            Self::Stream(rx) => rx.poll_recv(cx).map(|o| o.map(|r| r.map(Frame::data))),
+        match &mut self.get_mut().0 {
+            Inner_::Full(b) => Poll::Ready(b.take().map(|b| Ok(Frame::data(b)))),
+            Inner_::Stream { rx, complete } => match rx.poll_recv(cx) {
+                Poll::Ready(Some(b)) => Poll::Ready(Some(Ok(Frame::data(b)))),
+                // A pump that stopped early ends the body with an error so
+                // the chunked response is not terminated cleanly.
+                Poll::Ready(None) if complete.load(Ordering::Acquire) => Poll::Ready(None),
+                Poll::Ready(None) => {
+                    Poll::Ready(Some(Err(io::Error::other("upstream stream aborted"))))
+                }
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        matches!(self, Self::Full(None))
+        matches!(self.0, Inner_::Full(None))
     }
 
     fn size_hint(&self) -> SizeHint {
-        match self {
-            Self::Full(Some(b)) => SizeHint::with_exact(b.len() as u64),
-            Self::Full(None) => SizeHint::with_exact(0),
-            Self::Stream(_) => SizeHint::default(),
+        match &self.0 {
+            Inner_::Full(Some(b)) => SizeHint::with_exact(b.len() as u64),
+            Inner_::Full(None) => SizeHint::with_exact(0),
+            Inner_::Stream { .. } => SizeHint::default(),
         }
     }
 }

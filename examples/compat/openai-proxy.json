@@ -5,6 +5,14 @@
     { "method": "POST", "path": "/v1/responses" },
     { "method": "GET",  "path": "/v1/models", "match": "prefix" }
   ],
+  "forward_request_headers": [
+    "content-type", "accept", "user-agent",
+    "openai-beta", "originator", "version", "session_id", "conversation_id"
+  ],
+  "body_policy": {
+    "deny_keys": ["prompt", "web_search_options"],
+    "allowed_tool_types": ["function", "custom", "local_shell"]
+  },
   "audit_log": "/var/log/tessera/model-proxy-openai.jsonl",
   "sandboxes": [
     {

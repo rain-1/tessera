@@ -50,7 +50,17 @@ impl UpstreamError {
         if *self == Self::Timeout { 504 } else { 502 }
     }
 
-    /// Machine-readable reason.
+    /// Reason returned to the sandbox. Unlike [`Self::reason`] it never
+    /// carries the resolved address (review 2026-11-26, S-3).
+    pub fn client_reason(&self) -> String {
+        match self {
+            Self::DestinationForbidden(_) => "destination_forbidden".into(),
+            other => other.reason(),
+        }
+    }
+
+    /// Machine-readable reason for the host audit log (may include the
+    /// resolved address).
     pub fn reason(&self) -> String {
         match self {
             Self::ResolutionFailed => "resolution_failed".into(),

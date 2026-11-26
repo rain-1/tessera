@@ -10,14 +10,33 @@
   "credential": { "file": "/etc/tessera/anthropic-api-key", "inject": "x-api-key" },
   "routes": [
     { "method": "POST", "path": "/v1/messages" },
-    { "method": "POST", "path": "/v1/messages/count_tokens" },
+    { "method": "POST", "path": "/v1/messages/count_tokens", "token_cap": false },
     { "method": "GET",  "path": "/v1/models", "match": "prefix" }
   ],
+  "forward_request_headers": [
+    "content-type", "accept", "user-agent",
+    "anthropic-version", "anthropic-beta",
+    "x-app",
+    "x-stainless-lang", "x-stainless-package-version", "x-stainless-os",
+    "x-stainless-arch", "x-stainless-runtime", "x-stainless-runtime-version",
+    "x-stainless-retry-count", "x-stainless-timeout"
+  ],
+  "anthropic_beta_allow": [
+    "claude-code-20250219",
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14"
+  ],
+  "body_policy": {
+    "deny_keys": ["mcp_servers", "container"],
+    "allowed_tool_types": ["custom"],
+    "max_tokens": 64000
+  },
   "limits": {
-    "max_request_body": 33554432,
+    "max_request_body": 8388608,
     "max_response_body": 67108864,
     "max_header_bytes": 65536,
     "max_headers": 100,
+    "request_header_timeout_ms": 30000,
     "request_read_timeout_ms": 60000
   },
   "audit_log": "/var/log/tessera/model-proxy.jsonl",
