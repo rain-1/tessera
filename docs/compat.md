@@ -231,10 +231,18 @@ ChatGPT sign-in uses other hosts and is not routed.
 `LaunchProfile::model_route(ModelRoute { host_socket, loopback })` works as
 follows.
 
-1. **Socket checks.** The launcher canonicalises `host_socket` and requires
-   that it is a socket, owned by the launcher's uid, with
-   `mode & 0o077 == 0`, and is not `$SSH_AUTH_SOCK`. If any check fails,
-   the launch fails with `InvalidProfile`.
+1. **Socket checks.** Model routes need `LauncherConfig.model_socket_dir`,
+   an operator-chosen directory owned by the launcher's uid with mode
+   0700 that is not `$XDG_RUNTIME_DIR` or `$HOME` (or an ancestor of
+   either); the launcher refuses to start otherwise. The launcher
+   canonicalises `host_socket` and requires that it lies inside that
+   directory, is a socket owned by the launcher's uid with
+   `mode & 0o077 == 0`, is not `$SSH_AUTH_SOCK`, and has no path component
+   naming a credential agent (`gnupg`, `gpg`, `keyring(s)`, `ssh`,
+   `openssh`, split at non-alphanumerics). This keeps the GnuPG and SSH
+   agent sockets in `$XDG_RUNTIME_DIR` out of every sandbox (re-review
+   2026-11-26 N2). If any check fails, the launch fails with
+   `InvalidProfile`.
 2. **Binding.** bwrap binds the socket read-only at
    `/.tessera/model.sock`. Connecting to a socket on a read-only mount is
    allowed; unlinking or replacing it is not. The launcher sets
@@ -259,9 +267,12 @@ follows.
      is every non-loopback destination.
 4. **Launch record.** `LaunchRecord.model_route` records the route.
 
-`tessera-launch-run` exposes these as `--model-socket PATH`,
-`--model-port PORT` and `--netshim PATH`. In `tesserad`, `ProfileSpec`
-has `model_route: { socket, loopback_port?, netshim_path? }`.
+`tessera-launch-run` exposes these as `--model-socket-dir DIR`,
+`--model-socket PATH`, `--model-port PORT` and `--netshim PATH`. In
+`tesserad`, `ProfileSpec` has `model_route: { socket, loopback_port?,
+netshim_path? }` and `launcher.model_socket_dir` is required when any
+profile has one; every route is validated at start. The socket and
+netshim may not overlap a protected path or a profile workspace root.
 
 ## Evidence
 

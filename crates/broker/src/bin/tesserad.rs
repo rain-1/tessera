@@ -123,6 +123,7 @@ fn run() -> Result<(), String> {
         if let Some(p) = &cfg.launcher.init_path {
             lc.init_path = p.clone();
         }
+        lc.model_socket_dir = cfg.launcher.model_socket_dir.clone();
         lc.cgroup_group_name = cfg
             .launcher
             .cgroup_group
@@ -168,6 +169,16 @@ fn run() -> Result<(), String> {
             .unwrap_or(d.max_in_flight_per_agent),
         agent_rate_per_sec: l.agent_rate_per_sec.unwrap_or(d.agent_rate_per_sec),
         agent_rate_burst: l.agent_rate_burst.unwrap_or(d.agent_rate_burst),
+        approval_queue: l.approval_queue.unwrap_or(d.approval_queue),
+        max_pending_approvals_per_domain: l
+            .max_pending_approvals_per_domain
+            .unwrap_or(d.max_pending_approvals_per_domain),
+        approval_max_per_window: l
+            .approval_max_per_window
+            .unwrap_or(d.approval_max_per_window),
+        max_dispatch_per_domain: l
+            .max_dispatch_per_domain
+            .unwrap_or(d.max_dispatch_per_domain),
         ledger_quotas: l.ledger_quotas,
         ..d
     };

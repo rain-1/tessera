@@ -90,24 +90,30 @@ pub struct BrokerConfig {
     pub approval_timeout_ms: u64,
     /// Approval rate-limit window.
     pub approval_rate_window_ms: u64,
-    /// Approval prompts per principal per window.
+    /// Approval prompts per orchestration domain (an operator-created
+    /// principal and everything spawned under it) per window.
     pub approval_max_per_window: u32,
-    /// Grant requests queued behind the active one.
+    /// Grant requests queued behind the active one. Of these slots (plus
+    /// the active one), a domain may hold at most
+    /// `min(max_pending_approvals_per_domain, ceil(slots / live domains))`,
+    /// and a domain that already has a request pending may not take the
+    /// slots still needed for one request of every live domain that has
+    /// none (ADR-0033).
     pub approval_queue: usize,
-    /// Active and queued approval requests per principal.
-    pub max_pending_approvals_per_agent: usize,
+    /// Active and queued approval requests per orchestration domain.
+    pub max_pending_approvals_per_domain: usize,
     /// Require FIDO2 user verification (PIN) on every mint.
     pub require_user_verification: bool,
     /// Agent channel frame bound (bytes).
     pub agent_max_frame: usize,
     /// Adapter worker threads.
     pub dispatch_workers: usize,
-    /// Adapter jobs one principal may have on the workers at once; further
-    /// jobs of that principal wait in the broker (not yet marked
-    /// dispatched) and are released round-robin across principals. Keeps
-    /// one principal's slow endpoint from holding every worker. Values
-    /// below 1 count as 1.
-    pub max_dispatch_per_agent: usize,
+    /// Adapter jobs one orchestration domain may have on the workers at
+    /// once; further jobs of that domain wait in the broker (not yet
+    /// marked dispatched) and are released round-robin across domains
+    /// (and across principals within a domain). Keeps one domain's slow
+    /// endpoint from holding every worker. Values below 1 count as 1.
+    pub max_dispatch_per_domain: usize,
     /// Endpoints from the daemon configuration `(id, spec, secret header)`.
     pub endpoints: Vec<crate::entry::ConfiguredEndpoint>,
     /// Profiles agents may name in `Spawn`, by `LaunchProfileId` (§9.2).
@@ -155,11 +161,11 @@ impl Default for BrokerConfig {
             approval_rate_window_ms: 60 * 1000,
             approval_max_per_window: 30,
             approval_queue: 16,
-            max_pending_approvals_per_agent: 2,
+            max_pending_approvals_per_domain: 2,
             require_user_verification: false,
             agent_max_frame: 128 * 1024,
             dispatch_workers: 4,
-            max_dispatch_per_agent: 2,
+            max_dispatch_per_domain: 2,
             endpoints: Vec::new(),
             spawn_profiles: BTreeMap::new(),
             max_children_per_agent: 8,
@@ -297,6 +303,9 @@ struct OrchNode {
 struct PendingGrant {
     ticket: u64,
     agent: AgentId,
+    /// The requester's orchestration domain (queue share, round-robin and
+    /// rate window are per domain).
+    domain: AgentId,
     correlation: u64,
     /// Correlation ids of repeated identical requests attached to this one
     /// (the SDK retries with the same request id after a timeout).
@@ -325,6 +334,8 @@ struct GrantAsk {
 
 struct PendingDispatch {
     agent: AgentId,
+    /// Orchestration domain whose dispatch slot the job holds once released.
+    domain: AgentId,
     correlation: u64,
     request_id: RequestId,
     capability: CapabilityId,
@@ -373,12 +384,14 @@ pub(crate) struct Reactor<S: Storage> {
     bindings: HashMap<(AgentId, RequestId), ([u8; 32], BindingResult)>,
     dispatched: BTreeSet<ReservationId>,
     pending_dispatch: HashMap<ReservationId, PendingDispatch>,
-    /// Jobs per principal currently handed to the workers.
+    /// Jobs per orchestration domain currently handed to the workers.
     running_dispatch: HashMap<AgentId, usize>,
     /// Jobs per principal waiting for a worker slot (reserved, not marked).
     deferred_dispatch: BTreeMap<AgentId, VecDeque<DispatchJob>>,
-    /// Round-robin position among principals with deferred jobs.
+    /// Round-robin position among domains with deferred jobs.
     last_released: Option<AgentId>,
+    /// Round-robin position among the principals of each domain.
+    last_released_in: HashMap<AgentId, AgentId>,
     principals: BTreeSet<AgentId>,
     channels: HashMap<AgentId, ChannelHandle>,
     next_conn: u64,
@@ -389,7 +402,9 @@ pub(crate) struct Reactor<S: Storage> {
     session: Option<ap::ApprovalSession>,
     active: Option<PendingGrant>,
     queue: VecDeque<PendingGrant>,
-    last_approval_agent: Option<AgentId>,
+    /// Round-robin position among domains with queued grant requests.
+    last_approval_domain: Option<AgentId>,
+    /// Approval prompt start times per orchestration domain (rate window).
     approval_begins: HashMap<AgentId, VecDeque<u64>>,
     next_ticket: u64,
     inbox_tx: SyncSender<Inbox>,
@@ -397,6 +412,9 @@ pub(crate) struct Reactor<S: Storage> {
     spawner: Option<SpawnerThread>,
     orch: HashMap<AgentId, OrchNode>,
     domain_size: HashMap<AgentId, u32>,
+    /// An emergency stop ended the epoch; its records are compacted once
+    /// no job of that epoch is still on a worker (ADR-0031).
+    compaction_due: bool,
     spawned: HashMap<AgentId, u32>,
     spawning: HashMap<(AgentId, RequestId), SpawnWait>,
     denied: HashMap<AgentId, usize>,
@@ -630,6 +648,7 @@ impl<S: Storage> Reactor<S> {
             running_dispatch: HashMap::new(),
             deferred_dispatch: BTreeMap::new(),
             last_released: None,
+            last_released_in: HashMap::new(),
             principals,
             channels: HashMap::new(),
             next_conn: 0,
@@ -640,13 +659,14 @@ impl<S: Storage> Reactor<S> {
             session: None,
             active: None,
             queue: VecDeque::new(),
-            last_approval_agent: None,
+            last_approval_domain: None,
             approval_begins: HashMap::new(),
             next_ticket: 1,
             inbox_tx,
             jobs: None,
             orch: HashMap::new(),
             domain_size: HashMap::new(),
+            compaction_due: false,
             spawned: HashMap::new(),
             spawning: HashMap::new(),
             denied: HashMap::new(),
@@ -724,22 +744,7 @@ impl<S: Storage> Reactor<S> {
     /// prune them from the ledger. `CompactEpoch` is journaled before it is
     /// applied, like every other transition, so replay reproduces it.
     fn archive_and_compact(&mut self) -> Result<(), StartError> {
-        let epoch = self.state.epoch();
-        let old_caps: Vec<CapabilityId> = self
-            .state
-            .capabilities()
-            .filter(|c| c.owner().epoch() < epoch)
-            .map(|c| c.id())
-            .collect();
-        self.archived_caps = old_caps
-            .into_iter()
-            .filter_map(|id| self.cap_view(id))
-            .collect();
-        self.archived_reservations = self
-            .reservation_views(false)
-            .into_iter()
-            .filter(|r| r.owner.epoch() < epoch)
-            .collect();
+        self.archive_ended_epochs();
         let compact = AuthenticatedCommand::operator(AdminCommand::CompactEpoch);
         let tick = self.state.clock();
         validate_command(&self.state, &compact, tick)
@@ -758,6 +763,64 @@ impl<S: Storage> Reactor<S> {
         let effect = step(&mut self.state, compact, tick)
             .map_err(|d| StartError::Replay(format!("compaction: {d:?}")))?;
         check_invariant(&self.state).map_err(|v| StartError::Replay(format!("{v:?}")))?;
+        self.compacted(effect);
+        Ok(())
+    }
+
+    /// After an emergency stop: compact the ended epoch once none of its
+    /// jobs is still on a worker. Until then its reservations must stay in
+    /// the ledger, because a running job may still journal a file
+    /// replacement intent or an outcome for them. `CompactEpoch` is
+    /// journaled before it is applied (`commit`), as at startup.
+    fn compact_if_due(&mut self) -> Flow {
+        let epoch = self.state.epoch();
+        if !self.compaction_due
+            || self
+                .pending_dispatch
+                .values()
+                .any(|p| p.agent.epoch() < epoch)
+        {
+            return Ok(());
+        }
+        self.compaction_due = false;
+        self.archive_ended_epochs();
+        match self.commit(
+            AuthenticatedCommand::operator(AdminCommand::CompactEpoch),
+            None,
+            None,
+        )? {
+            Ok((effect, _)) => {
+                check_invariant(&self.state)
+                    .map_err(|v| Stop::Inconsistent(format!("after compaction: {v:?}")))?;
+                self.compacted(effect);
+            }
+            Err(d) => self.audit_error("epoch-compaction", &format!("{d:?}")),
+        }
+        Ok(())
+    }
+
+    /// Display views of every record of earlier epochs (about to be pruned).
+    fn archive_ended_epochs(&mut self) {
+        let epoch = self.state.epoch();
+        let old_caps: Vec<CapabilityId> = self
+            .state
+            .capabilities()
+            .filter(|c| c.owner().epoch() < epoch)
+            .map(|c| c.id())
+            .collect();
+        self.archived_caps = old_caps
+            .into_iter()
+            .filter_map(|id| self.cap_view(id))
+            .collect();
+        self.archived_reservations = self
+            .reservation_views(false)
+            .into_iter()
+            .filter(|r| r.owner.epoch() < epoch)
+            .collect();
+    }
+
+    /// Bookkeeping and audit after `CompactEpoch` was applied.
+    fn compacted(&mut self, effect: tessera_capability_core::Effect) {
         let epoch_now = self.state.epoch();
         self.dispatched.retain(|id| {
             self.state
@@ -793,7 +856,6 @@ impl<S: Storage> Reactor<S> {
                 ..self.ev()
             });
         }
-        Ok(())
     }
 
     fn restore_file(
@@ -1073,13 +1135,16 @@ impl<S: Storage> Reactor<S> {
         if let Err(d) = validate_command(&self.state, &command, now) {
             return Ok(Err(d));
         }
-        let charge = match self
-            .ledger_usage
-            .admit(self.cfg.ledger_quotas, &self.state, command)
-        {
-            Ok(charge) => charge,
-            Err(d) => return Ok(Err(d)),
-        };
+        let orch = &self.orch;
+        let charge =
+            match self
+                .ledger_usage
+                .admit(self.cfg.ledger_quotas, &self.state, command, |a| {
+                    domain_in(orch, a)
+                }) {
+                Ok(charge) => charge,
+                Err(d) => return Ok(Err(d)),
+            };
         let entry = Entry::Command {
             tick: now,
             command,
@@ -1816,10 +1881,12 @@ impl<S: Storage> Reactor<S> {
                 let root = reservation.root().to_raw();
                 self.record(ev);
                 self.fault(FaultPoint::AfterConsumeCommit)?;
+                let domain = self.domain_of(agent);
                 self.pending_dispatch.insert(
                     res_id,
                     PendingDispatch {
                         agent,
+                        domain,
                         correlation: corr,
                         request_id: rid,
                         capability: cap,
@@ -1830,7 +1897,7 @@ impl<S: Storage> Reactor<S> {
                     reservation,
                     operation: job_op,
                 };
-                if self.running_dispatch.get(&agent).copied().unwrap_or(0) < self.dispatch_cap() {
+                if self.running_dispatch.get(&domain).copied().unwrap_or(0) < self.dispatch_cap() {
                     self.release_job(agent, job)?;
                 } else {
                     self.deferred_dispatch
@@ -1862,7 +1929,11 @@ impl<S: Storage> Reactor<S> {
     }
 
     fn dispatch_cap(&self) -> usize {
-        self.cfg.max_dispatch_per_agent.max(1)
+        self.cfg.max_dispatch_per_domain.max(1)
+    }
+
+    fn domain_of(&self, agent: AgentId) -> AgentId {
+        domain_in(&self.orch, agent)
     }
 
     /// Durable dispatch-started marker, then hand the job to a worker.
@@ -1878,26 +1949,42 @@ impl<S: Storage> Reactor<S> {
             .map_err(journal_err)?;
         self.dispatched.insert(res_id);
         self.fault(FaultPoint::AfterDispatchMarker)?;
-        *self.running_dispatch.entry(agent).or_insert(0) += 1;
+        let domain = self
+            .pending_dispatch
+            .get(&res_id)
+            .map_or_else(|| self.domain_of(agent), |p| p.domain);
+        *self.running_dispatch.entry(domain).or_insert(0) += 1;
         if let Some(j) = &self.jobs {
             let _ = j.send(job);
         }
         Ok(())
     }
 
-    /// Release deferred jobs, one per principal per turn, round-robin in
-    /// principal order after the last one served, while slots are free.
+    /// Release deferred jobs while slots are free: one job per turn,
+    /// round-robin over the domains with a free slot (in domain order after
+    /// the last one served), and within a domain round-robin over its
+    /// principals.
     fn release_deferred(&mut self) -> Flow {
         let cap = self.dispatch_cap();
         loop {
-            let ready = |a: &AgentId| self.running_dispatch.get(a).copied().unwrap_or(0) < cap;
-            let next = self
+            let ready = |d: &AgentId| self.running_dispatch.get(d).copied().unwrap_or(0) < cap;
+            let Some(domain) = self
                 .deferred_dispatch
                 .keys()
-                .filter(|a| ready(a))
-                .min_by_key(|a| (Some(**a) <= self.last_released, **a))
-                .copied();
-            let Some(agent) = next else {
+                .map(|a| self.domain_of(*a))
+                .filter(ready)
+                .min_by_key(|d| (Some(*d) <= self.last_released, *d))
+            else {
+                return Ok(());
+            };
+            let last_in = self.last_released_in.get(&domain).copied();
+            let Some(agent) = self
+                .deferred_dispatch
+                .keys()
+                .filter(|a| self.domain_of(**a) == domain)
+                .min_by_key(|a| (Some(**a) <= last_in, **a))
+                .copied()
+            else {
                 return Ok(());
             };
             let Some(queue) = self.deferred_dispatch.get_mut(&agent) else {
@@ -1908,7 +1995,8 @@ impl<S: Storage> Reactor<S> {
                 self.deferred_dispatch.remove(&agent);
             }
             let Some(job) = job else { continue };
-            self.last_released = Some(agent);
+            self.last_released = Some(domain);
+            self.last_released_in.insert(domain, agent);
             // Revocation, expiry and termination also stop what is not yet
             // dispatched: a deferred job is released only while its
             // capability is still live, so no dispatch marker ever follows
@@ -1979,14 +2067,19 @@ impl<S: Storage> Reactor<S> {
     }
 
     fn on_dispatched(&mut self, reservation: ReservationId, result: ExecResult) -> Flow {
+        self.record_dispatched(reservation, result)?;
+        self.compact_if_due()
+    }
+
+    fn record_dispatched(&mut self, reservation: ReservationId, result: ExecResult) -> Flow {
         self.fault(FaultPoint::AfterDispatchBeforeOutcome)?;
         let pending = self.pending_dispatch.remove(&reservation);
         if let Some(p) = &pending
-            && let Some(n) = self.running_dispatch.get_mut(&p.agent)
+            && let Some(n) = self.running_dispatch.get_mut(&p.domain)
         {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                self.running_dispatch.remove(&p.agent);
+                self.running_dispatch.remove(&p.domain);
             }
         }
         let (outcome, effect, fid) = match &result {
@@ -2172,21 +2265,9 @@ impl<S: Storage> Reactor<S> {
                 "too many denied requests remembered for this principal",
             );
         }
-        if self.queue.len() >= self.cfg.approval_queue {
-            return deny(self, ErrorCode::RateLimited, "approval queue full");
-        }
-        let pending_for_agent = self
-            .active
-            .iter()
-            .chain(&self.queue)
-            .filter(|p| p.agent == agent)
-            .count();
-        if pending_for_agent >= self.cfg.max_pending_approvals_per_agent {
-            return deny(
-                self,
-                ErrorCode::RateLimited,
-                "too many pending approvals for this principal",
-            );
+        let domain = self.domain_of(agent);
+        if let Err(why) = self.approval_room(domain) {
+            return deny(self, ErrorCode::RateLimited, why);
         }
         let (Some(enrollment), true) = (self.enrollment.clone(), self.session.is_some()) else {
             return deny(
@@ -2289,6 +2370,7 @@ impl<S: Storage> Reactor<S> {
         self.queue.push_back(PendingGrant {
             ticket,
             agent,
+            domain,
             correlation: corr,
             waiters: Vec::new(),
             request_id: rid,
@@ -2299,15 +2381,59 @@ impl<S: Storage> Reactor<S> {
         self.activate_next();
     }
 
+    /// Whether orchestration domain `domain` may add one more pending grant
+    /// request (ADR-0033). The approval slots are the queue plus the active
+    /// request. A domain may hold at most `max_pending_approvals_per_domain`
+    /// of them and at most its fair share `ceil(slots / live domains)`; and
+    /// once it has one pending, it may not take a slot still needed for the
+    /// first request of another live domain that has none pending. So one
+    /// domain, however many principals it spawns, never holds more than its
+    /// share, and freed slots go first to domains with nothing pending.
+    fn approval_room(&self, domain: AgentId) -> Result<(), &'static str> {
+        let slots = self.cfg.approval_queue.saturating_add(1);
+        let mut pending: HashMap<AgentId, usize> = HashMap::new();
+        for p in self.active.iter().chain(&self.queue) {
+            *pending.entry(p.domain).or_default() += 1;
+        }
+        let total: usize = pending.values().sum();
+        if total >= slots || self.queue.len() >= self.cfg.approval_queue {
+            return Err("approval queue full");
+        }
+        let live: BTreeSet<AgentId> = self
+            .orch
+            .iter()
+            .filter(|(a, n)| {
+                n.parent.is_none() && self.state.principal(**a) == Some(PrincipalStatus::Active)
+            })
+            .map(|(a, _)| *a)
+            .chain(std::iter::once(domain))
+            .collect();
+        let mine = pending.get(&domain).copied().unwrap_or(0);
+        let share = slots.div_ceil(live.len());
+        if mine >= self.cfg.max_pending_approvals_per_domain.min(share) {
+            return Err("too many pending approvals for this orchestration domain");
+        }
+        if mine > 0 {
+            let waiting = live
+                .iter()
+                .filter(|d| **d != domain && !pending.contains_key(d))
+                .count();
+            if slots - total - 1 < waiting {
+                return Err("approval slots reserved for other orchestration domains");
+            }
+        }
+        Ok(())
+    }
+
     fn activate_next(&mut self) {
         while self.active.is_none() {
-            // Walk the principals in order, wrapping after the last prompt.
-            // Among requests for the same principal, serve the oldest first.
+            // Walk the orchestration domains in order, wrapping after the
+            // last prompt. Within a domain, serve the oldest request first.
             let next = self
                 .queue
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, p)| (Some(p.agent) <= self.last_approval_agent, p.agent))
+                .min_by_key(|(_, p)| (Some(p.domain) <= self.last_approval_domain, p.domain))
                 .map(|(i, _)| i);
             let Some(pg) = next.and_then(|i| self.queue.remove(i)) else {
                 return;
@@ -2326,7 +2452,7 @@ impl<S: Storage> Reactor<S> {
                 continue;
             };
             let window_start = now.0.saturating_sub(self.cfg.approval_rate_window_ms);
-            let begins = self.approval_begins.entry(pg.agent).or_default();
+            let begins = self.approval_begins.entry(pg.domain).or_default();
             while begins.front().is_some_and(|t| *t < window_start) {
                 begins.pop_front();
             }
@@ -2337,7 +2463,7 @@ impl<S: Storage> Reactor<S> {
             match session.begin(pg.request.clone(), now) {
                 Ok(_) => {
                     begins.push_back(now.0);
-                    self.last_approval_agent = Some(pg.agent);
+                    self.last_approval_domain = Some(pg.domain);
                     self.active = Some(pg);
                 }
                 Err(e) => self.fail_grant(pg, ErrorCode::ApprovalDenied, &e.to_string()),
@@ -2894,7 +3020,11 @@ impl<S: Storage> Reactor<S> {
             self.reset_session();
         }
         self.queue.retain(|p| p.agent != agent);
-        self.approval_begins.remove(&agent);
+        // The rate window belongs to the domain: it ends only with the
+        // domain's root (whose termination takes every member with it).
+        if self.domain_of(agent) == agent {
+            self.approval_begins.remove(&agent);
+        }
         self.fail_deferred(agent)?;
         // Pending spawns of this principal: their children are in `children`
         // already and are terminated below; drop the waiters.
@@ -3387,8 +3517,10 @@ impl<S: Storage> Reactor<S> {
         }
         self.active = None;
         self.queue.clear();
-        self.last_approval_agent = None;
+        self.last_approval_domain = None;
         self.approval_begins.clear();
+        self.last_released = None;
+        self.last_released_in.clear();
         let epoch = self.state.epoch();
         self.bindings.retain(|(a, _), _| a.epoch() == epoch);
         self.reset_session();
@@ -3400,7 +3532,10 @@ impl<S: Storage> Reactor<S> {
             ..self.ev()
         };
         self.record(ev);
-        Ok(())
+        // Free the record capacity the ended epoch held (ADR-0031), as at
+        // startup; deferred until its jobs still on a worker have finished.
+        self.compaction_due = true;
+        self.compact_if_due()
     }
 
     fn pending_views(&self) -> Vec<PendingView> {
@@ -3522,6 +3657,13 @@ impl<S: Storage> Reactor<S> {
             })
             .collect()
     }
+}
+
+/// The orchestration domain of `a`: the operator-created principal at the
+/// root of its spawn tree (itself for an operator-created principal, and for
+/// one without a node, which cannot have spawned anything).
+fn domain_in(orch: &HashMap<AgentId, OrchNode>, a: AgentId) -> AgentId {
+    orch.get(&a).map_or(a, |n| n.domain)
 }
 
 pub(crate) fn agent_str(a: AgentId) -> String {
@@ -3796,10 +3938,21 @@ mod tests {
             true
         });
         assert!(matches!(result, ExecResult::Completed { .. }));
-        r.on_dispatched(job.id(), result).unwrap();
+        // The stop abandoned the reservation; once the job finished, the
+        // ended epoch was compacted and the record survives as a view.
         assert_eq!(
             r.state.reservation(job.id()).unwrap().status(),
             ReservationStatus::Abandoned
+        );
+        assert!(r.compaction_due);
+        r.on_dispatched(job.id(), result).unwrap();
+        assert!(!r.compaction_due);
+        assert!(r.state.reservation(job.id()).is_none());
+        assert!(
+            r.archived_reservations
+                .iter()
+                .any(|v| v.id == job.id().to_raw()
+                    && v.status == "unknown-dispatched-before-restart")
         );
         drop(r);
         let r = open(root.path(), storage);
@@ -4024,9 +4177,12 @@ mod tests {
         );
 
         r.emergency_stop().unwrap();
-        assert_eq!(
-            r.state.reservation(reservation.id()).unwrap().status(),
-            ReservationStatus::Failed
+        // Nothing was on a worker: the ended epoch is compacted at once.
+        assert!(r.state.reservation(reservation.id()).is_none());
+        assert!(
+            r.archived_reservations
+                .iter()
+                .any(|v| v.id == reservation.id().to_raw() && v.status == "failed")
         );
         let new_agent = principal(&mut r);
         let new_cap = baseline(

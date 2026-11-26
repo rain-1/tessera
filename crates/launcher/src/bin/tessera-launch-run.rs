@@ -4,9 +4,12 @@
 //! tessera-launch-run [--agent LABEL] [--workspace DIR] [--ro-bind HOST:DEST]...
 //!     [--env K=V]... [--landlock required|best_effort|disabled]
 //!     [--allow-no-cgroup REASON] [--init PATH] [--record] [--broker-echo]
-//!     [--model-socket PATH [--model-port PORT --netshim PATH]]
+//!     [--model-socket-dir DIR --model-socket PATH [--model-port PORT --netshim PATH]]
 //!     -- PROGRAM [ARGS]...
 //! ```
+//!
+//! `--model-socket-dir` is the operator's private (0700) directory of model
+//! proxy sockets; `--model-socket` must lie inside it.
 //!
 //! Exits with the workload's exit code (128+signal if killed), 2 on usage
 //! errors, 3 if the launch was refused because a mandatory control is
@@ -76,6 +79,9 @@ fn main() {
                 }
             }
             Some("--init") => config.init_path = str_arg(it.next(), "--init").into(),
+            Some("--model-socket-dir") => {
+                config.model_socket_dir = Some(str_arg(it.next(), "--model-socket-dir").into())
+            }
             Some("--model-socket") => {
                 model_socket = Some(str_arg(it.next(), "--model-socket").into())
             }

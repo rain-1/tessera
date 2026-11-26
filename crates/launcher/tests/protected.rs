@@ -14,9 +14,14 @@ use tessera_launcher::{
 const INIT: &str = env!("CARGO_BIN_EXE_tessera-sandbox-init");
 
 fn launcher(protected: Vec<PathBuf>) -> Option<Launcher> {
+    launcher_with(protected, None)
+}
+
+fn launcher_with(protected: Vec<PathBuf>, model_socket_dir: Option<PathBuf>) -> Option<Launcher> {
     match Launcher::new(LauncherConfig {
         init_path: INIT.into(),
         protected_host_paths: protected,
+        model_socket_dir,
         ..LauncherConfig::default()
     }) {
         Ok(l) => Some(l),
@@ -101,7 +106,10 @@ fn model_route_cannot_point_into_protected_paths() {
     // admin socket (protected): refused.
     let (admin_sock, _a) = private_socket(&admin);
     let (free_sock, _f) = private_socket(&free);
-    let Some(l) = launcher(vec![admin.clone()]) else {
+    // Both sockets lie inside the model socket directory; only the
+    // protected-path check tells them apart.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Some(l) = launcher_with(vec![admin.clone()], Some(root.clone())) else {
         return;
     };
     let route = |s: &Path| ModelRoute {

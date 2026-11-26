@@ -69,6 +69,7 @@ status=0
     --agent claude-1 \
     --workspace "$WORKSPACE" \
     --ro-bind "$CLAUDE_BIN:/opt/claude/claude" \
+    --model-socket-dir "$(dirname "$MODEL_SOCKET")" \
     --model-socket "$MODEL_SOCKET" \
     --env ANTHROPIC_UNIX_SOCKET=/.tessera/model.sock \
     --env ANTHROPIC_BASE_URL=http://localhost \

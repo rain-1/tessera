@@ -50,6 +50,13 @@ pub struct LauncherConfig {
     /// Canonical host paths that must stay outside sandbox mounts. A socket
     /// path may be supplied before the socket is bound.
     pub protected_host_paths: Vec<PathBuf>,
+    /// Directory that holds the model proxy sockets (compatibility mode).
+    /// A [`ModelRoute`] socket must lie inside it; without it every model
+    /// route is refused. It must be a directory owned by the launcher's uid
+    /// with mode 0700, and may not be `$XDG_RUNTIME_DIR` or `$HOME` (or an
+    /// ancestor of either), where host agent sockets such as the GnuPG and
+    /// SSH agents live.
+    pub model_socket_dir: Option<PathBuf>,
 }
 
 impl Default for LauncherConfig {
@@ -65,6 +72,7 @@ impl Default for LauncherConfig {
             landlock: LandlockRequirement::Required,
             cgroup_group_name: "tessera.launcher".to_string(),
             protected_host_paths: Vec::new(),
+            model_socket_dir: None,
         }
     }
 }

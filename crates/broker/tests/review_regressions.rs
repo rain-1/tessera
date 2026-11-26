@@ -158,7 +158,7 @@ fn finding4_one_agent_cannot_fill_the_approval_queue() {
             r => assert_eq!(code(&r), Some(ErrorCode::RateLimited)),
         }
     }
-    assert_eq!(pending, h.config.max_pending_approvals_per_agent);
+    assert_eq!(pending, h.config.max_pending_approvals_per_domain);
     victim.send(grant_req(1, obj));
     assert!(matches!(
         victim.recv_any().unwrap().response,
@@ -442,10 +442,10 @@ fn slow_principal_cannot_hold_every_dispatch_worker() {
     let h = Harness::new();
     let config = tessera_broker::BrokerConfig {
         dispatch_workers: 4,
-        max_dispatch_per_agent: 2,
+        max_dispatch_per_domain: 2,
         ..tessera_broker::BrokerConfig::default()
     };
-    assert!(config.max_dispatch_per_agent < config.dispatch_workers);
+    assert!(config.max_dispatch_per_domain < config.dispatch_workers);
     let gate = Arc::new(Gate {
         inner: tessera_broker::AdapterExecutor::new(Some(h.root.path())).unwrap(),
         slow: std::sync::Mutex::new(None),
@@ -526,7 +526,7 @@ fn terminating_a_principal_fails_its_undispatched_jobs() {
     let b = tessera_broker::Broker::start(
         journal,
         tessera_broker::BrokerConfig {
-            max_dispatch_per_agent: 1,
+            max_dispatch_per_domain: 1,
             ..tessera_broker::BrokerConfig::default()
         },
         tessera_broker::Services {

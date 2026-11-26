@@ -39,6 +39,7 @@ Nothing here is implemented or verified unless the ADR says so.
 | [0030](0030-compatibility-mode-model-proxy.md) | Compatibility mode: host model proxy, Unix-socket route, loopback shim with one Landlock port | §3.1, §10.1, §12.3, WP6 | Accepted, implemented (tested) |
 | [0031](0031-epoch-compaction.md) | Ledger compaction at the epoch boundary (`CompactEpoch`), retired-pool accounting, archived admin views | §4.4, §6.1, §11; review finding 3 | Accepted, implemented (tested; outside the Verus mirror) |
 | [0032](0032-review-remediation.md) | Review remediation: per-principal workspace retention, explicit `"unlimited"` limits, approval-screen escaping, HTTPS path rules, per-principal dispatch fairness | §8.1, §9.1, §9.4, §11; review findings 1, 2, 5 | Accepted, implemented (tested) |
+| [0033](0033-orchestration-domain-quotas.md) | Admission limits per orchestration domain: approval slots with fair share and reservation, domain rate window and round-robin, domain dispatch cap, domain ledger quotas; compaction on emergency stop | §9.2, §9.4, §11; re-review 2026-11-26 N1 | Accepted, implemented (tested) |
 
 ## Specification inconsistencies and gaps found in WP0
 
