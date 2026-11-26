@@ -21,7 +21,11 @@
 //!   "agent_spawn_profiles": { "1": { "profile": "shell", "baseline": [] } },
 //!   "limits": { "max_children_per_agent": 8, "max_spawn_depth": 2,
 //!               "max_domain_agents": 16, "max_in_flight_per_agent": 64,
-//!               "agent_rate_per_sec": 100, "agent_rate_burst": 200 },
+//!               "agent_rate_per_sec": 100, "agent_rate_burst": 200,
+//!               "approval_queue": 16, "max_pending_approvals_per_domain": 2,
+//!               "approval_max_per_window": 30, "max_dispatch_per_domain": 2,
+//!               "ledger_quotas": { "derived_per_domain": 2048,
+//!                                  "reservations_per_domain": 16384 } },
 //!   "audit_fsync": "every-event",
 //!   "launcher": { "init_path": "/usr/libexec/tessera/tessera-sandbox-init",
 //!                 "protected_paths": ["/etc/tessera/anthropic-api-key"],
@@ -119,6 +123,14 @@ pub struct LimitsSection {
     pub agent_rate_per_sec: Option<u32>,
     /// Burst per principal.
     pub agent_rate_burst: Option<u32>,
+    /// Grant requests queued behind the active approval.
+    pub approval_queue: Option<usize>,
+    /// Active and queued approval requests per orchestration domain.
+    pub max_pending_approvals_per_domain: Option<usize>,
+    /// Approval prompts per orchestration domain per rate window.
+    pub approval_max_per_window: Option<u32>,
+    /// Adapter jobs one orchestration domain may have on the workers.
+    pub max_dispatch_per_domain: Option<usize>,
     /// Limits on ledger records allocated by agents.
     #[serde(default)]
     pub ledger_quotas: crate::LedgerQuotas,
@@ -272,6 +284,23 @@ mod tests {
         assert_eq!(
             c.limits.ledger_quotas.reservations_per_root,
             crate::LedgerQuotas::default().reservations_per_root
+        );
+    }
+
+    #[test]
+    fn domain_limits_parse() {
+        let c = parse(
+            r#"{"state_dir": "/s", "admin_socket": "/a",
+            "limits": {"max_pending_approvals_per_domain": 3, "max_dispatch_per_domain": 1,
+                       "ledger_quotas": {"derived_per_domain": 7}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.limits.max_pending_approvals_per_domain, Some(3));
+        assert_eq!(c.limits.max_dispatch_per_domain, Some(1));
+        assert_eq!(c.limits.ledger_quotas.derived_per_domain, 7);
+        assert_eq!(
+            c.limits.ledger_quotas.reservations_per_domain,
+            crate::LedgerQuotas::default().reservations_per_domain
         );
     }
 }
