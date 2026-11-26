@@ -11,10 +11,13 @@
 //! small rights bitsets. Different resource kinds are never comparable.
 
 use serde::{Deserialize, Serialize};
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
 
 use crate::ids::{EndpointId, ObjectId};
 
 /// One file right.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_derive))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileRight {
     /// One bounded snapshot read (§9.3).
@@ -23,7 +26,9 @@ pub enum FileRight {
     Replace,
 }
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 impl FileRight {
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.bit_spec()))]
     const fn bit(self) -> u8 {
         match self {
             FileRight::Read => FileRights::READ.0,
@@ -34,14 +39,18 @@ impl FileRight {
 
 /// Set of [`FileRight`]s. Only defined bits are representable; decoding
 /// rejects unknown bits.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_derive))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 pub struct FileRights(u8);
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 impl FileRights {
     /// Read snapshot.
+    #[cfg_attr(verus_keep_ghost, verus_spec(ensures Self::READ.raw() == 1u8))]
     pub const READ: FileRights = FileRights(0b01);
     /// Replace content.
+    #[cfg_attr(verus_keep_ghost, verus_spec(ensures Self::REPLACE.raw() == 2u8))]
     pub const REPLACE: FileRights = FileRights(0b10);
     const ALL_BITS: u8 = 0b11;
 
@@ -51,6 +60,7 @@ impl FileRights {
     }
 
     /// Decode, rejecting undefined bits.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r matches Some(f) ==> f.wf() && f.raw() == bits, r is None <==> bits & !3u8 != 0))]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         if bits & !Self::ALL_BITS == 0 {
             Some(FileRights(bits))
@@ -70,16 +80,19 @@ impl FileRights {
     }
 
     /// `other ⊆ self`.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.contains_all_spec(other)))]
     pub const fn contains_all(self, other: FileRights) -> bool {
         self.0 & other.0 == other.0
     }
 
     /// Membership of one right.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.has_spec(right)))]
     pub const fn has(self, right: FileRight) -> bool {
         self.0 & right.bit() != 0
     }
 
     /// No rights.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == (self.raw() == 0)))]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -99,6 +112,7 @@ impl From<FileRights> for u8 {
 }
 
 /// One HTTP method.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_derive))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HttpMethod {
     /// GET
@@ -115,7 +129,9 @@ pub enum HttpMethod {
     Delete,
 }
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 impl HttpMethod {
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.bit_spec()))]
     const fn bit(self) -> u8 {
         match self {
             HttpMethod::Get => 1 << 0,
@@ -129,10 +145,12 @@ impl HttpMethod {
 }
 
 /// Set of [`HttpMethod`]s. Only defined bits are representable.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_derive))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 pub struct MethodSet(u8);
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 impl MethodSet {
     const ALL_BITS: u8 = 0b11_1111;
 
@@ -142,6 +160,7 @@ impl MethodSet {
     }
 
     /// Decode, rejecting undefined bits.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r matches Some(f) ==> f.wf() && f.raw() == bits, r is None <==> bits & !0x3fu8 != 0))]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         if bits & !Self::ALL_BITS == 0 {
             Some(MethodSet(bits))
@@ -166,16 +185,19 @@ impl MethodSet {
     }
 
     /// Membership.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.has_spec(m)))]
     pub const fn has(self, m: HttpMethod) -> bool {
         self.0 & m.bit() != 0
     }
 
     /// `other ⊆ self`.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.contains_all_spec(other)))]
     pub const fn contains_all(self, other: MethodSet) -> bool {
         self.0 & other.0 == other.0
     }
 
     /// No methods.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == (self.raw() == 0)))]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -197,6 +219,7 @@ impl From<MethodSet> for u8 {
 /// A concrete permission: denotes a set of canonical [`Operation`]s.
 ///
 /// `Scope` is a *description*, not authority, so it is `Copy`.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_derive))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Scope {
     /// Rights on exactly one registered file object.
@@ -217,9 +240,11 @@ pub enum Scope {
     },
 }
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 impl Scope {
     /// A grantable scope must permit at least one operation. Scopes with an
     /// empty rights/method set are rejected at every issuance point.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.is_well_formed_spec()))]
     pub const fn is_well_formed(&self) -> bool {
         match self {
             Scope::File { rights, .. } => !rights.is_empty(),
@@ -230,6 +255,7 @@ impl Scope {
 
 /// A canonical protected operation (element of the universe O, §4.1). Each
 /// costs exactly one budget unit in the MVP.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_derive))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Operation {
     /// One file operation on a registered object.
@@ -253,6 +279,7 @@ pub enum Operation {
 /// Does `scope` permit `op`?
 ///
 /// ensures: result ==> same resource kind and identical object/endpoint.
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == permits_spec(*scope, *op)))]
 pub const fn permits(scope: &Scope, op: &Operation) -> bool {
     match (scope, op) {
         (Scope::File { object, rights }, Operation::File { object: o, right }) => {
@@ -283,6 +310,7 @@ pub const fn permits(scope: &Scope, op: &Operation) -> bool {
 /// ensures (soundness): `is_subset(c, p) && permits(c, o) ==> permits(p, o)`.
 /// Also reflexive and transitive. Mismatched resource kinds are never
 /// subsets.
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == is_subset_spec(*child, *parent)))]
 pub const fn is_subset(child: &Scope, parent: &Scope) -> bool {
     match (child, parent) {
         (
@@ -310,3 +338,6 @@ pub const fn is_subset(child: &Scope, parent: &Scope) -> bool {
         _ => false,
     }
 }
+
+#[cfg(verus_keep_ghost)]
+include!("scope_verus.rs");

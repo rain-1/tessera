@@ -6,22 +6,32 @@
 //! the [`crate::State`] ledger, bound to an authenticated owner.
 
 use serde::{Deserialize, Serialize};
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
 
 macro_rules! opaque_id {
     ($(#[$meta:meta])* $name:ident, $raw:ty) => {
         $(#[$meta])*
+        #[cfg_attr(verus_keep_ghost, verus_verify(external_derive))]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name($raw);
 
+        #[cfg(verus_keep_ghost)]
+        verus! { impl $name { /// The wrapped raw value (spec only).
+            pub closed spec fn raw(self) -> $raw { self.0 } } }
+
+        #[cfg_attr(verus_keep_ghost, verus_verify)]
         impl $name {
             /// Wrap a raw value (e.g. decoded from the wire or the journal).
             /// Constructing an id grants nothing.
+            #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r.raw() == raw))]
             pub const fn from_raw(raw: $raw) -> Self {
                 Self(raw)
             }
 
             /// The raw value, for encoding.
+            #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.raw()))]
             pub const fn to_raw(self) -> $raw {
                 self.0
             }
