@@ -303,6 +303,17 @@ mod tests {
     }
 
     #[test]
+    fn model_routes_need_a_model_socket_dir() {
+        let without = r#"{"state_dir": "/s", "admin_socket": "/a",
+            "profiles": {"c": {"program": "/x", "model_route": {"socket": "/m/model.sock"}}}}"#;
+        assert!(parse(without).unwrap().check().is_err());
+        let with = r#"{"state_dir": "/s", "admin_socket": "/a",
+            "launcher": {"model_socket_dir": "/m"},
+            "profiles": {"c": {"program": "/x", "model_route": {"socket": "/m/model.sock"}}}}"#;
+        parse(with).unwrap().check().unwrap();
+    }
+
+    #[test]
     fn domain_limits_parse() {
         let c = parse(
             r#"{"state_dir": "/s", "admin_socket": "/a",

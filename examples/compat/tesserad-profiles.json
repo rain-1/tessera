@@ -1,4 +1,5 @@
 {
+  "launcher": { "model_socket_dir": "/run/user/1000/tessera" },
   "profiles": {
     "claude": {
       "program": "/opt/claude/claude",

@@ -50,10 +50,15 @@ fn init_binary() -> PathBuf {
     dir.join("tessera-sandbox-init")
 }
 
-fn launcher(landlock: LandlockRequirement) -> Option<Launcher> {
+/// `model_socket_dir`: the private directory holding the proxy socket
+/// (model sockets outside it are refused).
+fn launcher(landlock: LandlockRequirement, model_socket_dir: &Path) -> Option<Launcher> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(model_socket_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let cfg = LauncherConfig {
         init_path: init_binary(),
         landlock,
+        model_socket_dir: Some(model_socket_dir.to_path_buf()),
         ..LauncherConfig::default()
     };
     match Launcher::new(cfg) {
@@ -83,9 +88,9 @@ fn route(socket: &Path) -> ModelRoute {
 }
 
 fn run_stub(mode: &str) -> Option<(Output, Harness)> {
-    let l = launcher(LandlockRequirement::Required)?;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let h = rt.block_on(start(|_| {}));
+    let l = launcher(LandlockRequirement::Required, h.socket.parent().unwrap())?;
     let ws = tempfile::tempdir().unwrap();
     let profile = LaunchProfile::new(
         AgentLabel::new(format!("compat-{mode}")).unwrap(),
@@ -183,11 +188,11 @@ fn compromised_harness_stays_contained() {
 
 #[test]
 fn loopback_port_requires_required_landlock() {
-    let Some(l) = launcher(LandlockRequirement::BestEffort) else {
-        return;
-    };
     let rt = tokio::runtime::Runtime::new().unwrap();
     let h = rt.block_on(start(|_| {}));
+    let Some(l) = launcher(LandlockRequirement::BestEffort, h.socket.parent().unwrap()) else {
+        return;
+    };
     let p = LaunchProfile::new(AgentLabel::new("compat-weak").unwrap(), "/bin/true")
         .model_route(route(&h.socket));
     match l.spawn(&p) {
@@ -198,10 +203,10 @@ fn loopback_port_requires_required_landlock() {
 
 #[test]
 fn model_socket_must_be_private_socket() {
-    let Some(l) = launcher(LandlockRequirement::Required) else {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(l) = launcher(LandlockRequirement::Required, dir.path()) else {
         return;
     };
-    let dir = tempfile::tempdir().unwrap();
     // A regular file.
     let f = dir.path().join("not-a-socket");
     std::fs::write(&f, b"x").unwrap();
