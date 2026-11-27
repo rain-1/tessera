@@ -43,6 +43,45 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+# Audible cue for hardware touches (best effort; never fails the demo): a short,
+# distinctive three-note chime, repeated a few times while the token waits and
+# stopped as soon as the call returns.
+cue_pid=""
+cue_wav() {
+    [ -f "$work/cue.wav" ] && return 0
+    command -v python3 >/dev/null || return 1
+    python3 -I - "$work/cue.wav" <<'PY'
+import math, struct, sys, wave
+rate = 44100
+notes = [(659.25, 0.16), (987.77, 0.16), (1318.51, 0.34)]   # E5 B5 E6
+frames = bytearray()
+for freq, dur in notes:
+    n = int(rate * dur)
+    for i in range(n):
+        t = i / rate
+        env = min(1.0, i / 400) * math.exp(-4.0 * t / dur)
+        v = 0.35 * env * (math.sin(2 * math.pi * freq * t) + 0.3 * math.sin(4 * math.pi * freq * t))
+        frames += struct.pack("<h", int(max(-1.0, min(1.0, v)) * 32767))
+with wave.open(sys.argv[1], "wb") as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(bytes(frames))
+PY
+}
+touch_cue() {
+    echo "touch the token to $1" >&2
+    if command -v paplay >/dev/null && cue_wav 2>/dev/null; then
+        ( for _ in 1 2 3 4 5; do paplay "$work/cue.wav" 2>/dev/null || break; sleep 2; done ) &
+        cue_pid=$!
+    else
+        printf '\a' >&2 || true
+    fi
+}
+cue_stop() {
+    [ -n "$cue_pid" ] || return 0
+    kill "$cue_pid" 2>/dev/null || true          # stop the loop first, then any playback
+    pkill -P "$cue_pid" 2>/dev/null || true
+    wait "$cue_pid" 2>/dev/null || true
+    cue_pid=""
+}
 admin() { echo "\$ tessera-admin $*" >&2; "$bin/tessera-admin" --socket "$work/run/admin.sock" "$@"; }
 
 mkdir -m 700 -p "$work/state" "$work/run" "$work/files" "$work/ws" "$work/agent"
@@ -111,9 +150,10 @@ start_daemon
 admin status
 
 step "enroll an operator credential (software key: DEVELOPMENT ONLY)"
-if [ -n "${FIDO2_DEVICE:-}" ]; then auth=(--fido2 "$FIDO2_DEVICE"); echo "touch the token to enroll" >&2
+if [ -n "${FIDO2_DEVICE:-}" ]; then auth=(--fido2 "$FIDO2_DEVICE"); touch_cue enroll
 else auth=(--key "$work/operator.key"); fi
-admin enroll "${auth[@]}"
+admin enroll "${auth[@]}" || { cue_stop; exit 1; }
+cue_stop
 
 step "register the file slot notes.txt"
 obj=$(admin register-file notes.txt --max-read 4096 --max-write 0 | sed -n 's/^id //p')
@@ -135,8 +175,9 @@ for _ in $(seq 200); do
 done
 [ -n "$ticket" ] || { echo "no approval request arrived" >&2; cat "$work/tesserad.log" >&2; exit 1; }
 admin pending
-[ -n "${FIDO2_DEVICE:-}" ] && echo "touch the token to approve" >&2
-admin approve "$ticket" "${auth[@]}" --yes
+[ -n "${FIDO2_DEVICE:-}" ] && touch_cue approve
+admin approve "$ticket" "${auth[@]}" --yes || { cue_stop; exit 1; }
+cue_stop
 
 for _ in $(seq 200); do [ -e "$ws/done" ] && break; sleep 0.1; done
 [ -e "$ws/done" ] || { echo "agent did not finish" >&2; exit 1; }

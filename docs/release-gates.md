@@ -7,13 +7,32 @@ development host:
 2. An independent human review must be done.
 
 This page says how to complete each one and where to record the result.
-Until both are recorded below, Tessera is **not release-ready**. The rest of
+Until the open checks and the human review are recorded below, Tessera is
+**not release-ready**. The rest of
 the evidence is in the [README](../README.md#what-has-been-verified) and
 [release engineering](release.md).
 
 ## Gate H1: hardware approval (WP4)
 
-**Status: NOT RUN.** No authenticator was attached to the development host.
+**Status: core flow PASSED on 2026-11-27. Three manual checks are still open (see below).**
+
+Run on the development host, with the operator present and touching the key:
+
+- **Key:** YubiKey 5 (FIDO+CCID), firmware 5.7.4, AAGUID `d7781e5d-e353-46aa-afe2-3ca49f13332a`
+- **libfido2:** 1.15.0 (Debian `fido2-tools`)
+- **Command:** `FIDO2_DEVICE=/dev/hidraw7 scripts/demo.sh`, with `tessera-admin` built with `--features fido2-cli`
+
+| Check | Result |
+|---|---|
+| Enroll through `fido2-cred` with a physical touch | **Pass.** The audit log records `enroll … alg=Es256` |
+| An agent in a real sandbox requests a one-use read; the approval screen shows exactly that request (`file:1[read]`, budget 1, depth 0); touching the key mints it | **Pass.** The audit log records `mint … evidence=54d834e5… uv=false narrowed=false` |
+| The agent's first read succeeds and its second is denied | **Pass.** First read returns 17 bytes; second returns `InsufficientBudget` |
+| Revoke, emergency stop and restart after a hardware-minted grant | **Pass.** Epoch went 1 → 2 → 3, and the grant is dead |
+| No touch within the key's presence window (about 28 s), at enroll and at approve | **Pass.** `FIDO_ERR_OPERATION_DENIED` from the key; no enrollment and no mint (seen on four earlier runs) |
+| Inside a sandbox, the key is not present | **Pass.** No `/dev/hidraw*` and no `/sys` |
+| Approve with a second key that wasn't enrolled | **Open.** No second key was available |
+| Re-run `approve` on a ticket that was already approved | **Open** on hardware. Covered by the software-authenticator tests (`approval` session and broker reuse tests) |
+| `require_user_verification: true` without a PIN | **Open** on hardware. Covered by the software-authenticator tests (UV required but absent → reject) |
 
 Prerequisites:
 
@@ -41,8 +60,8 @@ To pass, also check by hand:
 | With `require_user_verification: true`, approve without a PIN | Refused (UV absent) |
 | Inside the sandbox, `ls /dev/hidraw*` and access to the key | Not present |
 
-Record the result here: date, key model and firmware, libfido2 version,
-outcome, and the operator's name.
+Record further results here: date, key model and firmware, libfido2
+version, outcome, and the operator's name.
 
 ## Gate H2: independent security review (WP8)
 
