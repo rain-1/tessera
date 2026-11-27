@@ -14,7 +14,7 @@ the evidence is in the [README](../README.md#what-has-been-verified) and
 
 ## Gate H1: hardware approval (WP4)
 
-**Status: core flow PASSED on 2026-11-27. Two manual checks are still open: a second unenrolled key, and user verification (PIN) on hardware (see below).**
+**Status: core flow PASSED on 2026-11-27. Still open: a test with a second unenrolled key. Deferred by the owner: user verification (PIN) on hardware. See below.**
 
 Run on the development host, with the operator present and touching the key:
 
@@ -32,7 +32,7 @@ Run on the development host, with the operator present and touching the key:
 | Inside a sandbox, the key is not present | **Pass.** No `/dev/hidraw*` and no `/sys` |
 | Approve with a second key that wasn't enrolled | **Open.** No second key was available |
 | Re-run `approve` on a ticket that was already approved | **Pass** (2026-11-27, hardware). `tessera-admin: ticket 1 is not active`; the key isn't asked for a touch; `tessera-admin tree` shows exactly one approved root. `scripts/demo.sh` now checks this on every run |
-| `require_user_verification: true` without a PIN | **Open** on hardware. It needs the operator to type the PIN in a terminal: `FIDO2_DEVICE=/dev/hidrawN REQUIRE_UV=true scripts/demo.sh` (expect `uv=true` on the mint), then rerun and give no PIN (expect no mint). Covered by the software-authenticator tests (UV required but absent → reject) |
+| `require_user_verification: true` without a PIN | **Deferred by the owner (2026-11-27)** on hardware; not run. It needs the operator to type the PIN in a terminal: `FIDO2_DEVICE=/dev/hidrawN REQUIRE_UV=true scripts/demo.sh` (expect `uv=true` on the mint), then rerun and give no PIN (expect no mint). Covered by the software-authenticator tests (UV required but absent → reject) |
 
 Prerequisites:
 
