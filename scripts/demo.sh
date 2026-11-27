@@ -17,6 +17,9 @@
 #   FIDO2_DEVICE=/dev/hidrawN       use a real FIDO2 token (libfido2 tools
 #                                   fido2-cred/fido2-assert must be installed);
 #                                   you will be asked to touch it twice
+#   REQUIRE_UV=true                 require FIDO2 user verification (PIN) on
+#                                   every mint; run from a terminal so
+#                                   fido2-assert can ask for the PIN
 # Exit status: 0 success, 3 sandbox controls missing on this host, 1 failure.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -112,7 +115,7 @@ cat > "$work/tesserad.json" <<EOF
   "state_dir": "$work/state",
   "admin_socket": "$work/run/admin.sock",
   "file_root": "$work/files",
-  "require_user_verification": false,
+  "require_user_verification": ${REQUIRE_UV:-false},
   "profiles": {
     "demo": {
       "program": "/bin/sh",
@@ -179,6 +182,12 @@ admin pending
 admin approve "$ticket" "${auth[@]}" --yes || { cue_stop; exit 1; }
 cue_stop
 
+step "re-approving the same ticket must be refused (no second root)"
+if admin approve "$ticket" "${auth[@]}" --yes 2>"$work/reapprove.err"; then
+    echo "FAIL: ticket $ticket was approved twice" >&2; exit 1
+fi
+echo "refused: $(tail -1 "$work/reapprove.err")"
+
 for _ in $(seq 200); do [ -e "$ws/done" ] && break; sleep 0.1; done
 [ -e "$ws/done" ] || { echo "agent did not finish" >&2; exit 1; }
 step "agent results"
@@ -191,7 +200,9 @@ grep -q InsufficientBudget "$ws/read2.json"
 cap=$(sed -n 's/.*"cap_id":"\([0-9a-f]*\)".*/\1/p' "$ws/request.json")
 
 step "inspect authority and audit"
-admin tree
+admin tree | tee "$work/tree.txt"
+roots=$(grep -c 'approved root' "$work/tree.txt" || true)
+[ "$roots" = 1 ] || { echo "FAIL: expected exactly one approved root, found $roots" >&2; exit 1; }
 admin accounts
 admin audit --limit 50
 
