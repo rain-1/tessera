@@ -363,9 +363,10 @@ tests require the kernel controls reported by the launcher probe.
   reaches its model provider only through a host-side proxy that holds the credential.
   That channel is unlimited-use, and anything the agent can read can be sent to the
   provider. [Compatibility mode](docs/compat.md)
-- **Not release-ready yet.** The core hardware-key approval test passed with a
-  YubiKey 5. A few manual hardware checks and an independent human security review are
-  still outstanding. [Release gates](docs/release-gates.md)
+- **Development complete; release deferred.** The core hardware-key approval test
+  passed with a YubiKey 5. The owner has deferred the remaining manual hardware checks
+  and an independent human security review, so Tessera isn't release-ready until they
+  are done. [Release gates](docs/release-gates.md)
 - **A key touch authenticates presence.** The operator's understanding of the grant
   depends on the trusted display and the terms they review.
 - **The active enforcement path is broker-only.** The BPF LSM direct-grant prototype is

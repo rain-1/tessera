@@ -7,14 +7,15 @@ development host:
 2. An independent human review must be done.
 
 This page says how to complete each one and where to record the result.
-Until the open checks and the human review are recorded below, Tessera is
-**not release-ready**. The rest of
+The owner has deferred the remaining checks and the human review (2026-11-27).
+Development is complete, but Tessera is **not release-ready** until they are
+done and recorded below. The rest of
 the evidence is in the [README](../README.md#what-has-been-verified) and
 [release engineering](release.md).
 
 ## Gate H1: hardware approval (WP4)
 
-**Status: core flow PASSED on 2026-11-27. Still open: a test with a second unenrolled key. Deferred by the owner: user verification (PIN) on hardware. See below.**
+**Status: core flow PASSED on 2026-11-27. Deferred by the owner, not run: a test with a second unenrolled key and user verification (PIN) on hardware. See below.**
 
 Run on the development host, with the operator present and touching the key:
 
@@ -30,7 +31,7 @@ Run on the development host, with the operator present and touching the key:
 | Revoke, emergency stop and restart after a hardware-minted grant | **Pass.** Epoch went 1 → 2 → 3, and the grant is dead |
 | No touch within the key's presence window (about 28 s), at enroll and at approve | **Pass.** `FIDO_ERR_OPERATION_DENIED` from the key; no enrollment and no mint (seen on four earlier runs) |
 | Inside a sandbox, the key is not present | **Pass.** No `/dev/hidraw*` and no `/sys` |
-| Approve with a second key that wasn't enrolled | **Open.** No second key was available |
+| Approve with a second key that wasn't enrolled | **Deferred by the owner (2026-11-27)**; not run. No second key was available |
 | Re-run `approve` on a ticket that was already approved | **Pass** (2026-11-27, hardware). `tessera-admin: ticket 1 is not active`; the key isn't asked for a touch; `tessera-admin tree` shows exactly one approved root. `scripts/demo.sh` now checks this on every run |
 | `require_user_verification: true` without a PIN | **Deferred by the owner (2026-11-27)** on hardware; not run. It needs the operator to type the PIN in a terminal: `FIDO2_DEVICE=/dev/hidrawN REQUIRE_UV=true scripts/demo.sh` (expect `uv=true` on the mint), then rerun and give no PIN (expect no mint). Covered by the software-authenticator tests (UV required but absent → reject) |
 
@@ -65,7 +66,7 @@ version, outcome, and the operator's name.
 
 ## Gate H2: independent security review (WP8)
 
-**Status: NOT DONE by a human reviewer.** Model-assisted reviews ran on
+**Status: deferred by the owner (2026-11-27); not done by a human reviewer.** Model-assisted reviews ran on
 2026-11-25 and 2026-11-26. Every finding is fixed with a regression test
 ([review](security-review-2026-11-25.md),
 [model-proxy review](security-review-2026-11-26-model-proxy.md)). They don't
